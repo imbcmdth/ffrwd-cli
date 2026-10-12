@@ -2087,6 +2087,7 @@ impl gpu_ext::ffrwd::gpu::nn::Host for Host {
                 wit::Fit::Stretch => Fit::Stretch,
                 wit::Fit::Letterbox => Fit::Letterbox,
             },
+            pad: options.pad,
             scale: options.scale,
             mean: [options.mean.0, options.mean.1, options.mean.2],
             std: [options.std.0, options.std.1, options.std.2],

@@ -67,6 +67,8 @@ pub struct TensorSpec {
     pub layout: Layout,
     pub order: Order,
     pub fit: Fit,
+    /// What a letterbox's bars hold in every channel, 0 to 1.
+    pub pad: f32,
     /// Each channel, 0 to 1, becomes `(value * scale - mean) / std`.
     pub scale: f32,
     pub mean: [f32; 3],
@@ -231,7 +233,7 @@ pub fn host_tensor(
     for oy in 0..spec.height {
         for ox in 0..spec.width {
             let inside = ox >= left && oy >= top && ox < left + box_w && oy < top + box_h;
-            let mut rgb = [0f32; 3];
+            let mut rgb = [spec.pad; 3];
             if inside {
                 let x = ((ox - left) as f32 + 0.5) * width as f32 / box_w as f32 - 0.5;
                 let y = ((oy - top) as f32 + 0.5) * height as f32 / box_h as f32 - 0.5;
@@ -281,7 +283,7 @@ struct Params {
     chroma_w: u32, chroma_h: u32, box_x: u32, box_y: u32,
     box_w: u32, box_h: u32, kind: u32, nhwc: u32,
     bgr: u32, full: u32, kr: f32, kb: f32,
-    scale: f32, pad0: f32, pad1: f32, pad2: f32,
+    scale: f32, fill: f32, pad1: f32, pad2: f32,
     mean: vec4<f32>,
     deviation: vec4<f32>,
 }
@@ -359,7 +361,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= p.out_w || id.y >= p.out_h) {
         return;
     }
-    var rgb = vec3<f32>(0.0);
+    var rgb = vec3<f32>(p.fill);
     let inside = id.x >= p.box_x && id.y >= p.box_y
         && id.x < p.box_x + p.box_w && id.y < p.box_y + p.box_h;
     if (inside) {
@@ -451,7 +453,7 @@ fn params(spec: &TensorSpec, source: Source, planes: &[Plane]) -> [u8; PARAMS_LE
         kr.to_bits(),
         kb.to_bits(),
         spec.scale.to_bits(),
-        0,
+        spec.pad.to_bits(),
         0,
         0,
     ];
@@ -997,6 +999,7 @@ mod tests {
             layout,
             order: Order::Rgb,
             fit,
+            pad: 0.0,
             scale: 1.0,
             mean: [0.0; 3],
             std: [1.0; 3],
@@ -1056,6 +1059,7 @@ mod tests {
             for fit in [Fit::Stretch, Fit::Letterbox] {
                 let mut s = spec(16, 12, layout, fit);
                 s.order = Order::Bgr;
+                s.pad = 114.0 / 255.0;
                 s.mean = [0.485, 0.456, 0.406];
                 s.std = [0.229, 0.224, 0.225];
                 cases.push(s);

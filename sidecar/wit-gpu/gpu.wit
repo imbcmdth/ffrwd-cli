@@ -106,7 +106,7 @@ interface nn {
   /// How the frame is fitted to the tensor's size: `stretch` scales each
   /// side on its own; `letterbox` scales both by the same factor, the
   /// largest that fits, centres the picture, and fills the rest with
-  /// black (0 before `scale`, `mean` and `std` are applied).
+  /// `pad`.
   enum fit {
     stretch,
     letterbox,
@@ -124,6 +124,10 @@ interface nn {
     layout: tensor-layout,
     order: channel-order,
     fit: fit,
+    /// What a letterbox's bars hold in every channel, read as 0 to 1 like
+    /// the picture: 0 is black, 114/255 the grey YOLO models are trained
+    /// on.
+    pad: f32,
     /// Each channel is read as 0 to 1 (the stream's YUV made RGB with its
     /// own matrix and range), then becomes `(value * scale - mean) / std`:
     /// `scale` 1, `mean` 0 and `std` 1 leave 0 to 1, and `scale` 255

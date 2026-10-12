@@ -55,7 +55,7 @@ use wasi::webgpu::webgpu::{
     GpuTexelCopyBufferInfo, GpuTexelCopyTextureInfo, GpuTexture,
 };
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"model":{"type":"string"},"input":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"layout":{"type":"string","enum":["nchw","nhwc"]},"order":{"type":"string","enum":["rgb","bgr"]},"fit":{"type":"string","enum":["stretch","letterbox"]},"scale":{"type":"number"},"mean":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"std":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"texture":{"type":"string"},"texture_width":{"type":"integer","minimum":1},"texture_height":{"type":"integer","minimum":1}},"required":["model"],"additionalProperties":false}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"model":{"type":"string"},"input":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"layout":{"type":"string","enum":["nchw","nhwc"]},"order":{"type":"string","enum":["rgb","bgr"]},"fit":{"type":"string","enum":["stretch","letterbox"]},"pad":{"type":"number"},"scale":{"type":"number"},"mean":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"std":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"texture":{"type":"string"},"texture_width":{"type":"integer","minimum":1},"texture_height":{"type":"integer","minimum":1}},"required":["model"],"additionalProperties":false}"#;
 
 /// An output with this many values or fewer is written whole.
 const WHOLE: usize = 16;
@@ -79,6 +79,8 @@ struct Params {
     order: String,
     #[serde(default = "stretch")]
     fit: String,
+    #[serde(default)]
+    pad: f32,
     #[serde(default = "one")]
     scale: f32,
     #[serde(default)]
@@ -153,6 +155,7 @@ impl Params {
                 "letterbox" => Fit::Letterbox,
                 other => return Err(format!("fit is stretch or letterbox, not '{other}'")),
             },
+            pad: self.pad,
             scale: self.scale,
             mean: (self.mean[0], self.mean[1], self.mean[2]),
             std: (self.std[0], self.std[1], self.std[2]),
