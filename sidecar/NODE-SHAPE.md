@@ -349,6 +349,11 @@ when it resizes:
 write the same bytes. `{"w":"pad"}` adds a second input, `w`, that
 follows `v`, and `{"w":"port","port":N}` feeds it on a port.
 
+A module that runs a model on its frames includes `ffrwd:gpu/gpu-nn-module`
+instead and asks `ffrwd:gpu/nn.frame-tensor` for a frame as the model's
+input tensor; `NN-EDGE.md`, "Inputs from the pool", has how the host
+makes it and the routes it takes to the session.
+
 ## Modules of older worlds
 
 `--shape` on a module of an older world prints the shape the host runs

@@ -1255,6 +1255,118 @@ What was learned:
   still starts the background fetch, since resolve keeps uncalled
   declarations; the download is then joined at the end of the run.
 
+**Items 2 to 4 on CUDA, Windows (2026-10-12, owner's machine):** a
+module asks the host for a frame as its model's input, and on a CUDA
+session the tensor is the pool's memory, bound in place.
+
+- The interface is `ffrwd:gpu/nn` rather than an `ffrwd:av/gpu-nn`:
+  `frame-tensor(id, index, options)` addresses a frame by the tick's
+  numbering, as `frames.planes` does, and means something only beside a
+  port `ports.memory` holds, so it belongs with them, and the node world
+  stays unchanged, which is what the companion package is for. A module
+  includes the new world `gpu-nn-module` and imports the `wasi:nn`
+  interfaces it calls; the options are the tensor's size, NCHW or NHWC,
+  RGB or BGR, stretch or letterbox, and `(value * scale - mean) / std`.
+  The answer is an ordinary `wasi:nn` tensor. `ffrwd:gpu` stays 0.1.0,
+  since it has not been released; its staged deps now carry `wasi:nn`.
+- Preprocessing is one compute pass on the shared device
+  (`runtime/src/gpu/tensor.rs`): bilinear from pixel centres, the
+  stream's matrix and range, fp32 out, reading the planes as held (a
+  decoder's NV12 included, so no repack runs first), cached on the frame
+  per spec like the other conversions. The same arithmetic on the CPU
+  makes the tensor of a frame in host memory; the two agree to within
+  1e-4 (a unit test compares them on rgba and yuv420p, both layouts,
+  both fits).
+- What CUDA imports is the pass's output buffer, not the decoder's
+  texture: the model reads only the pass's output, so only that buffer is
+  made on a shared heap (`D3D12_HEAP_FLAG_SHARED`, handed to wgpu with
+  `create_buffer_from_hal`), and the decoder's pictures stay as libav
+  allocates them. It is imported as a dedicated D3D12 resource
+  (`cudaImportExternalMemory`, `cudaExternalMemoryGetMappedBuffer`); no
+  mipmapped array was needed. The buffers come from a pool and each is
+  imported once, the first time a CUDA session binds it, and kept. The
+  queue signals one shared D3D12 sync object after each pass; CUDA
+  imports it once as an external semaphore, and before the session runs
+  the wait is queued on a stream of its own and that stream is waited
+  for, so the CPU waits for the pass. The CUDA runtime is loaded at run
+  time from where the CUDA provider's preflight found `cudart64_12.dll`
+  (`runtime/src/nn/cuda.rs`); the CUDA device is the one whose LUID is the
+  D3D12 adapter's, and has to be device 0, the CUDA provider's.
+- The vendored backend: a `Tensor` may carry a handle to device memory
+  (`DeviceInput`: a CUDA pointer, a wait for its writer, a read back),
+  so the wasi-nn tensor itself stays bytes or nothing. When any input
+  carries one, `compute` binds every input (that one through
+  `TensorRefMut::from_raw`, the rest as CPU tensors), binds every output
+  to host memory, and runs the binding; otherwise it runs as before.
+- The fallbacks: a DirectML, CPU or CoreML session gets the pass's
+  output read back once, a frame in host memory is made on the CPU, and
+  one line per model says which: `[nn] <model>: input from the pool,
+  bound on CUDA`, `input downloaded, DIRECTML takes host memory (the
+  pinned ort cannot hand a D3D12 buffer to a DirectML session)`, `input
+  downloaded, CPU takes host memory`, `input in host memory, made on the
+  CPU`. A CUDA session whose import fails takes the downloaded route and
+  says why. `FFRWD_NN_BIND=off` forces the downloaded route, to compare
+  the two on one session.
+- Tests: `modules/nn-frames`, a sink running a graph of each channel's
+  mean and largest value (`model/channel-means.onnx` and its NHWC twin,
+  made by `model/make-channel-means.py`), and two cases in
+  `ffrwd-wasm/tests/nn.rs`: the CPU, downloaded and bound routes give the
+  same rows within 1e-4, the bound route counts no `download` bytes and
+  the downloaded one exactly the tensors' bytes, each line names its
+  route, over uploaded frames and over pictures `d3d12va` decoded into
+  the pool. Both pass here, with nothing skipped.
+
+Measured on the 4090, release build, h264 decoded into the pool, the
+tensor 518x518 letterboxed, 240 frames, median per frame of the time
+inside the module for `frame-tensor` and `compute` together (the pass
+and the bind, or the pass and the read back; then the run):
+
+| model | input | bound on CUDA | downloaded, CUDA session |
+|---|---|---|---|
+| channel-means | 1080p | 1.33 ms (0.10 + 1.19) | 6.74 ms (0.74 + 6.00) |
+| channel-means | 4K | 1.41 ms (0.08 + 1.32) | 7.41 ms (0.76 + 6.60) |
+| Depth Anything V2 small | 1080p | 29.4 ms, again 29.5 | 34.2 ms, again 38.4 |
+| Depth Anything V2 small | 4K | 30.7 ms | 40.3 ms |
+
+The input's size barely moves the bound route, since the pass reads only
+the pixels it samples; the downloaded route pays about 5 ms a frame for a
+3.2 MB tensor (the read back, the conversion into a CPU tensor, and
+ONNX Runtime's copy to the device). The depth model's outputs differ
+between routes by up to 0.002 on values of 1.4 to 6.3, as much as two
+bound runs differ from each other, so that is the CUDA session's own
+run-to-run variation. A DirectML session over the same 1080p input, on
+the downloaded route: 6.8 ms for channel-means.
+
+What was learned:
+
+- `cudaExternalSemaphoreWaitParams`'s keyed-mutex member is a u64 and a
+  u32, so it carries four bytes of padding; a layout without them put
+  every later field four bytes early, and the runtime, reading a reserved
+  word past the end of the struct, refused the wait with "invalid
+  argument" in release builds only. The struct sizes are now asserted.
+- In a debug build with `-nn-target directml`, the shared device opened
+  on the Microsoft Basic Render Driver and the DirectML session's run
+  then failed; a release build opens the 4090 and runs. A debug build's
+  wgpu turns the D3D12 debug layer on, after the DirectML session has
+  made its device, which is the likely cause; not confirmed.
+- The CPU waits for the pass before the run because the CUDA provider's
+  stream is its own; rc.10's `CUDAExecutionProvider::with_compute_stream`
+  would put the session on the stream the wait is queued in, given the
+  stream at session build.
+
+What waits:
+
+- DirectML binding the D3D12 buffer: rc.10 has no `OrtDmlApi` and its
+  DirectML provider takes only a device id, so it waits on hand-written
+  FFI over `GetExecutionProviderApi("DML", ...)` (with the session
+  created on the shared device and queue) or on an `ort` that carries it.
+- Item 5, outputs bound to device buffers and read as textures, and the
+  depth and segment modules moved onto `frame-tensor`: outputs still come
+  back to host memory through `compute`.
+- Linux: the pool is on Vulkan there, and the import of its memory and
+  timeline semaphore into CUDA is not written; a CUDA session there takes
+  the downloaded route and says so.
+
 ### Wave 5: two candidates to measure
 
 Neither is in the design yet; each is a measurement on the GPU tier that

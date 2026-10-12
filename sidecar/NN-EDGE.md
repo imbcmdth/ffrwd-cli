@@ -326,6 +326,98 @@ before instantiation rather than as a link failure:
 A name the guest asks for that was never bound comes back through the
 interface as the spec's own `not-found`, not as a trap.
 
+## Inputs from the pool
+
+A node module that holds its video on the GPU (`ffrwd:gpu`, see
+`NODE-SHAPE.md`, "Frames on the GPU") can have the host make a frame into
+its model's input tensor, so the module never fetches the frame's bytes. It
+includes `ffrwd:gpu/gpu-nn-module` beside the node world, imports the
+`wasi:nn` interfaces it calls, and asks:
+
+    frame-tensor: func(id: u32, index: u32, options: frame-tensor-options)
+        -> result<tensor, string>;
+
+    record frame-tensor-options {
+      model: string,                    // the -nn name
+      width: u32, height: u32,          // the tensor's picture size
+      layout: tensor-layout,            // nchw or nhwc
+      order: channel-order,             // rgb or bgr
+      fit: fit,                         // stretch or letterbox
+      scale: f32,                       // (value * scale - mean) / std
+      mean: tuple<f32, f32, f32>,
+      std: tuple<f32, f32, f32>,
+    }
+
+The answer is an ordinary `wasi:nn` tensor, fp32, which the module passes
+to `compute` like any other. `id` and `index` are the tick's, as
+`frames.planes` takes them. The frame is resized bilinearly from pixel
+centres (the chroma of a subsampled frame sited at the centre of the pixels
+it covers), its YUV made RGB with the stream's matrix and range, and each
+channel, read as 0 to 1, becomes `(value * scale - mean) / std`. A
+letterbox fills the bars with 0 before the normalisation.
+
+How the tensor reaches the session depends on where the frame is and on the
+provider the model's session engaged. The host says which, once per model:
+
+| frame | session | route | line |
+|---|---|---|---|
+| on the GPU (D3D12) | CUDA, Windows | a compute pass on the shared device writes the tensor into a buffer on a shared heap, which CUDA imported once; the session is handed that memory through an `IoBinding` | `[nn] depth: input from the pool, bound on CUDA` |
+| on the GPU | DirectML | the same pass, read back once | `[nn] depth: input downloaded, DIRECTML takes host memory (the pinned ort cannot hand a D3D12 buffer to a DirectML session)` |
+| on the GPU | CPU, CoreML | the same pass, read back once | `[nn] depth: input downloaded, CPU takes host memory` |
+| on the GPU | CUDA where the import failed | the same pass, read back once | `[nn] depth: input downloaded, CUDA could not reach the pool's memory (<why>)` |
+| in host memory | any | the same arithmetic on the CPU, from the frame's bytes | `[nn] depth: input in host memory, made on the CPU` |
+
+On the bound route the queue signals a shared D3D12 sync object after the
+pass, CUDA imports that sync object as an external semaphore, and the wait
+on it is queued and finished before the session runs. Neither the frame nor
+the tensor crosses to host memory: a `-profile` run counts no `download`
+bytes. On the
+downloaded route each frame costs one read back of the tensor, never of the
+frame, and the profile's `download` counts the tensor's bytes.
+`FFRWD_NN_BIND=off` takes the downloaded route where the bound one would be
+taken (`input downloaded, FFRWD_NN_BIND is off`), so the two can be
+compared on one session.
+
+DirectML cannot be bound with the pinned `ort` 2.0.0-rc.10: it carries none
+of DirectML's interop API (`OrtDmlApi`,
+`CreateGPUAllocationFromD3DResource`), and its DirectML provider takes a
+device id, never the caller's D3D12 device, so a DirectML session cannot be
+handed a buffer of the shared device. Linux has no bound route yet: the
+pool is on Vulkan there, and the Vulkan import is not written.
+
+Outputs come back as before: `compute` returns them in host memory.
+
+The CUDA runtime the binding uses is the one the CUDA provider loaded
+(`cudart64_12.dll`, where the provider's preflight found it), loaded at run
+time and never linked. The CUDA device is the one whose LUID is the shared
+D3D12 adapter's, and it has to be device 0, the one the CUDA provider runs
+every session on.
+
+`modules/nn-frames` is the test module: a sink that runs a model on each
+frame through `frame-tensor` and writes each output as rows, its values when
+there are 16 or fewer, else their count, mean, least and greatest. Its
+graphs, `model/channel-means.onnx` (NCHW) and `channel-means-nhwc.onnx`,
+return each channel's mean and largest value; `model/make-channel-means.py`
+regenerates them. The same frames give the same rows on every route, to
+within float rounding.
+
+    ffrwd-wasm -nn means=modules/nn-frames/model/channel-means.onnx \
+      -nn-runtime <dir> -nn-target cuda -gpu nn_frames.wasm \
+      -f nut -i in.nut -m nn_frames=nn_frames.wasm \
+      -filter_complex "[0:v]decode=format=yuv420p:hw=d3d12va[d];[v=d]nn_frames=model=means:memory=gpu:width=518:height=518[@rows=r]" \
+      -map [r] -f ndjson rows.ndjson
+
+On the RTX 4090, release build, h264 decoded on the device into the pool,
+the tensor 518x518 letterboxed, median per frame over 230 frames, the time
+inside the module for `frame-tensor` and `compute` together:
+
+| model | input | bound on CUDA | downloaded, CUDA session |
+|---|---|---|---|
+| channel-means | 1080p | 1.33 ms | 6.74 ms |
+| channel-means | 4K | 1.41 ms | 7.41 ms |
+| Depth Anything V2 small | 1080p | 29.4 ms | 34.2 ms |
+| Depth Anything V2 small | 4K | 30.7 ms | 40.3 ms |
+
 ## The probe module
 
 `modules/nn-probe` is the fixture: it exports the value interface and imports

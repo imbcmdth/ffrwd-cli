@@ -42,7 +42,7 @@ type FnGetErrorString = unsafe extern "C" fn(CudaError) -> *const c_char;
 const MEMORY_D3D12_RESOURCE: c_int = 5;
 /// `cudaExternalMemoryDedicated`: the handle is a committed resource.
 const MEMORY_DEDICATED: c_uint = 1;
-/// `cudaExternalSemaphoreHandleTypeD3D12Fence`.
+/// The handle type of a D3D12 sync object (4).
 const SEMAPHORE_D3D12: c_int = 4;
 /// `cudaStreamNonBlocking`.
 const STREAM_NON_BLOCKING: c_uint = 1;
@@ -93,13 +93,13 @@ struct SemaphoreHandleDesc {
 }
 
 /// `cudaExternalSemaphoreWaitParams`, the layout the `_v2` entry point
-/// takes: a D3D12 sync object waits for `fence_value`. The keyed-mutex
+/// takes: a D3D12 sync object waits for `value`. The keyed-mutex
 /// member is a struct of a u64 and a u32, so it ends in four bytes of
 /// padding, written out here so every later field lands where C has it;
 /// the runtime refuses a wait whose reserved words are not zero.
 #[repr(C)]
 struct WaitParams {
-    fence_value: u64,
+    value: u64,
     nv_sci_sync: u64,
     keyed_mutex_key: u64,
     keyed_mutex_timeout_ms: c_uint,
@@ -395,7 +395,7 @@ impl CudaSemaphore {
     pub fn wait(&self, value: u64) -> Result<()> {
         self.cuda.current()?;
         let params = WaitParams {
-            fence_value: value,
+            value,
             nv_sci_sync: 0,
             keyed_mutex_key: 0,
             keyed_mutex_timeout_ms: 0,
