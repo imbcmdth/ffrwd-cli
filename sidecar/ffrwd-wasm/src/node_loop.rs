@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ffrwd_wasm_runtime::node::{Node, Payload, Tick, TickFrame, TickStream};
+use ffrwd_wasm_runtime::profile::PROFILE;
 use ffrwd_wasm_runtime::runtime::{Message, Packet, TimeBase};
 
 use crate::tick::DataDrive;
@@ -278,7 +279,9 @@ impl Run {
 
     fn call(&mut self, tick: Tick) -> Result<ffrwd_wasm_runtime::node::Emitted> {
         let last = tick.last;
+        let started = Instant::now();
         let result = self.node.process(tick);
+        PROFILE.process.add(0, started);
         let Some(doing) = self.doing else {
             return result;
         };

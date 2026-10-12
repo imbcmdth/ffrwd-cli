@@ -34,6 +34,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm_runtime::node::{
     self as model, Emitted, Node, NodeShape, Payload, Tick, TickFrame, TickStream,
 };
+use ffrwd_wasm_runtime::profile::PROFILE;
 use ffrwd_wasm_runtime::runtime::{Frame, Message, TimeBase};
 
 use crate::adapters::frames_tick;
@@ -394,6 +395,9 @@ impl State {
                         continue;
                     }
                     let item = lane.resident(stream, &item)?;
+                    if let Item::Frame(frame) = &item {
+                        PROFILE.held.count(frame.data.len());
+                    }
                     match &mut lane.intake {
                         LaneIntake::Assembled(a) => a.arrive(stream, item)?,
                         LaneIntake::Host { events, .. } => {
@@ -1419,7 +1423,10 @@ fn worker(shared: &Shared) {
         let (pts, last) = (tick.pts, tick.last);
         let (runner, done) = match opened {
             Ok(mut runner) => {
-                let result = runner.process(tick).map(|emitted| Done {
+                let started = Instant::now();
+                let result = runner.process(tick);
+                PROFILE.process.add(0, started);
+                let result = result.map(|emitted| Done {
                     emitted,
                     pts,
                     end,

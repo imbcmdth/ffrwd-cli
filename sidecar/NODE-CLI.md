@@ -353,12 +353,13 @@ run ends, whatever its outcome:
 
     {"kind":"profile","read":{"bytes":N,"calls":N,"time_s":S},"held":{...},"fetch":{...},"process":{...},"emit":{...},"upload":{...},"download":{...},"write":{...}}
 
-`read` is the input pipes; `held` the frames placed in ticks; `fetch` the
-bytes modules asked for; `process` the time inside modules' `process`
-calls, with no bytes of its own; `emit` the frames modules handed back;
-`upload` and `download` the frames put on the GPU and read back from it;
-`write` the output pipes. The row is the run's total, the same at any
-`-jobs`.
+`read` is the input pipes; `held` the frames placed in ticks, once per
+node reading them; `fetch` the bytes handed to modules, whether asked for
+through `fetch` or handed whole to an older world; `process` the time
+inside nodes' `process` calls, the host's own nodes included, with no
+bytes of its own; `emit` the frames modules handed back; `upload` and
+`download` the frames put on the GPU and read back from it; `write` the
+output pipes. The row is the run's total, the same at any `-jobs`.
 
 ## The recipes
 

@@ -404,7 +404,6 @@ fn feed(reader: &mut Input, input: usize, format: &Format, scheduler: &Scheduler
             return Ok(());
         };
         check_frame(format, &buf, index)?;
-        PROFILE.held.count(buf.len());
         index += 1;
         let frame = TickFrame {
             pts,

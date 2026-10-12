@@ -19,7 +19,6 @@ use ffrwd_wasm_runtime::node::{
     Binding as PortBinding, BoundStream, Clock, FrameMemory, Node, NodeShape, OutputFormat,
     Pairing, PortKind, Rational, RowsUse, StreamFormat, StreamHint, TickFrame,
 };
-use ffrwd_wasm_runtime::profile::PROFILE;
 use ffrwd_wasm_runtime::runtime::{
     self, AudioFormat, Format, FormatOf, Media, Message, Packet, RenditionMeta, StreamInfo,
     TimeBase, VideoFormat, Wants, WitNode,
@@ -403,7 +402,6 @@ fn pump(
                         carried
                             .bytes
                             .fetch_add(payload.len() as u64, Ordering::Relaxed);
-                        PROFILE.held.count(payload.len());
                         TickFrame {
                             pts: packet.pts,
                             duration: None,

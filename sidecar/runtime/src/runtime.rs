@@ -88,6 +88,7 @@ use wasmtime_wasi_nn::wit::{WasiNnCtx, WasiNnView};
 use crate::egress::{self, NetPolicy};
 use crate::gpu::{self, StoreGpu};
 use crate::nn;
+use crate::profile::PROFILE;
 
 /// The wit package versions this host loads, newest first. A component is
 /// matched against them in that order, so a module built against the current
@@ -2640,13 +2641,17 @@ macro_rules! video_adapter {
                         height: video.height,
                         time: format.time_base.seconds(frame.pts),
                     };
+                    PROFILE.fetch.count(frame.data.len());
                     let outcome = self
                         .0
                         .ffrwd_av_filter()
                         .call_process(&mut *store, info, &frame.data)
                         .map_err(wasm_err)?;
                     let data = match outcome.output {
-                        Output::Frame(produced) => Arc::new(produced),
+                        Output::Frame(produced) => {
+                            PROFILE.emit.count(produced.len());
+                            Arc::new(produced)
+                        }
                         Output::Passthrough => frame.data.clone(),
                     };
                     out.push(Frame {
@@ -2740,13 +2745,17 @@ macro_rules! meta_adapter {
                         height: video.height,
                         time: format.time_base.seconds(frame.pts),
                     };
+                    PROFILE.fetch.count(frame.data.len());
                     let outcome = self
                         .0
                         .ffrwd_av_meta_filter()
                         .call_process_meta(&mut *store, info, &frame.data, &frame.rows)
                         .map_err(wasm_err)?;
                     let data = match outcome.output {
-                        Output::Frame(produced) => Arc::new(produced),
+                        Output::Frame(produced) => {
+                            PROFILE.emit.count(produced.len());
+                            Arc::new(produced)
+                        }
                         Output::Passthrough => frame.data.clone(),
                     };
                     out.push(Frame {
@@ -2911,7 +2920,10 @@ macro_rules! kind_bearing_window_adapter {
                     .map(|f| InFrame {
                         pts: f.pts,
                         // The one copy left: into the guest-call payload.
-                        frame: f.data.as_ref().clone(),
+                        frame: {
+                            PROFILE.fetch.count(f.data.len());
+                            f.data.as_ref().clone()
+                        },
                         rows: f.rows.clone(),
                     })
                     .collect();
@@ -3339,7 +3351,10 @@ macro_rules! resolve_frames {
                 .into_iter()
                 .map(|frame| {
                     let data = match frame.frame {
-                        FramePayload::New(data) => Arc::new(data),
+                        FramePayload::New(data) => {
+                            PROFILE.emit.count(data.len());
+                            Arc::new(data)
+                        }
                         FramePayload::Same => unchanged(frames, frame.pts, same)?,
                     };
                     Ok(Frame {

@@ -648,13 +648,11 @@ impl Node for WitNode {
             .map_err(|e| anyhow!("entering a tick into the resource table: {e}"))?;
         let handle = Resource::new_borrow(entry.rep());
         self.store.data_mut().gpu_tick = Some(entry.rep());
-        let started = Instant::now();
         let produced = self
             .instance
             .ffrwd_av_node()
             .call_process(&mut self.store, handle)
             .map_err(wasm_err);
-        PROFILE.process.add(0, started);
         let host = self.store.data_mut();
         host.gpu_tick = None;
         let handed = std::mem::take(&mut host.gpu_emitted);

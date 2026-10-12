@@ -9,7 +9,6 @@
 //! its clock, a packet filter's output per input stream.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm_runtime::node::{
@@ -17,7 +16,6 @@ use ffrwd_wasm_runtime::node::{
     Interval, LikeInput, Node, NodeShape, OutFrame, OutputFormat, OutputPort, Pairing, Payload,
     PortKind, Rational, RowsUse, StreamFormat, Tick, TickStream,
 };
-use ffrwd_wasm_runtime::profile::PROFILE;
 use ffrwd_wasm_runtime::runtime::{
     self, Arity, Catalog, CodedFormat, CodedStream, DataFilter, DataPad, Filter, Format, Frame,
     Kind, Message, Packet, PacketFilter, PacketSink, PacketSource, PadKind, RowsModule, SinkInput,
@@ -516,28 +514,18 @@ impl Node for FilterNode {
                 frames.push(frame_of(frame)?);
             }
         }
-        // An older world is handed its frames whole: each one crosses as
-        // `fetch` would hand it, and each one back as `emit` lifts it.
-        for frame in &frames {
-            PROFILE.fetch.count(frame.data.len());
-        }
-        let started = Instant::now();
         let processed = self.filter.process_window(&frames, &trailing, tick.last)?;
-        PROFILE.process.add(0, started);
         let mut items: Vec<Emission> = processed
             .frames
             .into_iter()
-            .map(|f| {
-                PROFILE.emit.count(f.data.len());
-                Emission {
-                    port: 0,
-                    payload: Payload::Frame(OutFrame {
-                        pts: f.pts,
-                        duration: None,
-                        data: f.data.into(),
-                        rows: f.rows,
-                    }),
-                }
+            .map(|f| Emission {
+                port: 0,
+                payload: Payload::Frame(OutFrame {
+                    pts: f.pts,
+                    duration: None,
+                    data: f.data.into(),
+                    rows: f.rows,
+                }),
             })
             .collect();
         if !processed.trailing.is_empty() {
