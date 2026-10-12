@@ -9,39 +9,39 @@
   },
   "platforms": {
     "macos-aarch64": {
-      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.1.0/ffrwd-av-v1.1.0-macos-aarch64.tar.gz",
-      "sha256": "1f81ce6d8c7d6e7ef0ac3ec8e93115c186f261162da851ca0a1ef32a10c59ca5",
-      "bytes": 2521930
+      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.2.0/ffrwd-av-v1.2.0-macos-aarch64.tar.gz",
+      "sha256": "82c76058598570595eb54762c321d56dcdb62748365fa9aa7ee5fd49c40b2e3a",
+      "bytes": 2584687
     },
     "manylinux-aarch64": {
-      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.1.0/ffrwd-av-v1.1.0-manylinux-aarch64.tar.gz",
-      "sha256": "d574cf2160d1a499602cde770106f0a6df0ce1c8fd3ba2176def45469923ce3e",
-      "bytes": 3426928
+      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.2.0/ffrwd-av-v1.2.0-manylinux-aarch64.tar.gz",
+      "sha256": "c42818f254d0826e0efdf11d7e9173e17763f1b19a2f03a084fbf2482e0d731b",
+      "bytes": 3713206
     },
     "manylinux-x86_64": {
-      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.1.0/ffrwd-av-v1.1.0-manylinux-x86_64.tar.gz",
-      "sha256": "a320f8d4398a229e4a6bc4636a29616d178ec9fed3c54e5fbac694e339bca67f",
-      "bytes": 3709176
+      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.2.0/ffrwd-av-v1.2.0-manylinux-x86_64.tar.gz",
+      "sha256": "19f04b109418ce616202f2eb237e78b65211496cd8d02ba0fcb5cee7a36705c0",
+      "bytes": 3989548
     },
     "musllinux-aarch64": {
-      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.1.0/ffrwd-av-v1.1.0-musllinux-aarch64.tar.gz",
-      "sha256": "cf509cecd6d9e0a12047b568ec9fbe96b67631aeadc3b0b8f18061b2837d6fb5",
-      "bytes": 3291283
+      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.2.0/ffrwd-av-v1.2.0-musllinux-aarch64.tar.gz",
+      "sha256": "a5dc2bd08e15551ed78d4a3075129ce811c7a981401dd648475009887ffb2c08",
+      "bytes": 3360235
     },
     "musllinux-x86_64": {
-      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.1.0/ffrwd-av-v1.1.0-musllinux-x86_64.tar.gz",
-      "sha256": "036a86cd5052682ca1ab4b41c1b2e68eed2710cc32c3c82b2c8163eef5b91a8c",
-      "bytes": 3571042
+      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.2.0/ffrwd-av-v1.2.0-musllinux-x86_64.tar.gz",
+      "sha256": "137c47811c4785e07c807200cbddd54b4aa8cf5febef4605da0d6b6d435ec420",
+      "bytes": 3636000
     },
     "windows-aarch64": {
-      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.1.0/ffrwd-av-v1.1.0-windows-aarch64.tar.gz",
-      "sha256": "2aa4f65d6b4dbfe80dec5210030b91da3c7d7031cb37c2a553adaae158738b3c",
-      "bytes": 2834977
+      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.2.0/ffrwd-av-v1.2.0-windows-aarch64.tar.gz",
+      "sha256": "15a7e8300b0beac2f1713fc115ec6c48d3a88fb0302cf7f4b9b470993c7584aa",
+      "bytes": 2920003
     },
     "windows-x86_64": {
-      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.1.0/ffrwd-av-v1.1.0-windows-x86_64.tar.gz",
-      "sha256": "7baaf682c037d201c59c71a32bcd44156a4246d3e08c52e64c86d93c8237b2dc",
-      "bytes": 3940698
+      "url": "https://github.com/imbcmdth/ffrwd-av/releases/download/v1.2.0/ffrwd-av-v1.2.0-windows-x86_64.tar.gz",
+      "sha256": "4b0312e6c2a9db8d2e3bf511cac792f0b41257c8ba30774fe010362dfaf34b64",
+      "bytes": 4032971
     }
   }
 }
