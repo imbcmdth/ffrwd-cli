@@ -13,7 +13,8 @@
 // with bytes (a download, done once per frame), and `same` still passes a
 // frame through. What `frames` adds is the planes as textures and a way to
 // emit a texture; what `nn` adds is a frame made into a model's input
-// tensor without the module fetching its bytes.
+// tensor without the module fetching its bytes, and a model's output held
+// as a texture without the module reading it back.
 
 package ffrwd:gpu@0.1.0;
 
@@ -75,15 +76,17 @@ interface frames {
   emit: func(port: string, pts: s64, duration: option<s64>, texture: gpu-texture) -> result<_, string>;
 }
 
-/// Inference inputs made from the tick's frames, for a module that runs a
-/// model through `wasi:nn`. A frame held on the GPU is made into the model's
-/// input on the device, and where the model's session can read the
-/// device's memory the tensor is that memory, bound to the session with no
-/// copy; elsewhere the tensor is made the same way and read back once. A
-/// frame in host memory is made into a tensor on the CPU, the same way.
-/// Whichever way it went, the tensor is an ordinary `wasi:nn` tensor the
-/// module passes to `compute`, and the host says on stderr, once per model,
-/// which way that was.
+/// Inference inputs made from the tick's frames, and outputs held as
+/// textures, for a module that runs a model through `wasi:nn`. A frame held
+/// on the GPU is made into the model's input on the device, and where the
+/// model's session can read the device's memory the tensor is that memory,
+/// bound to the session with no copy; elsewhere the tensor is made the same
+/// way and read back once. A frame in host memory is made into a tensor on
+/// the CPU, the same way. Whichever way it went, the tensor is an ordinary
+/// `wasi:nn` tensor the module passes to `compute`, and the host says on
+/// stderr, once per model, which way that was. An output bound to a texture
+/// is written there by every `compute`, by the session itself where it can
+/// write the device's memory, and the host says which way that was too.
 interface nn {
   use wasi:nn/tensor@0.2.0-rc-2024-10-28.{tensor};
   use wasi:nn/inference@0.2.0-rc-2024-10-28.{graph-execution-context};
@@ -183,7 +186,8 @@ world gpu-module {
   export ports;
 }
 
-/// `gpu-module`, and inference inputs made from frames. The module imports
+/// `gpu-module`, and inference inputs made from frames and outputs held as
+/// textures. The module imports
 /// the `wasi:nn` interfaces it calls (`graph`, `inference`, `errors`)
 /// itself.
 world gpu-nn-module {

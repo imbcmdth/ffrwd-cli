@@ -343,6 +343,7 @@ includes `ffrwd:gpu/gpu-nn-module` beside the node world, imports the
       layout: tensor-layout,            // nchw or nhwc
       order: channel-order,             // rgb or bgr
       fit: fit,                         // stretch or letterbox
+      pad: f32,                         // what a letterbox's bars hold, 0 to 1
       scale: f32,                       // (value * scale - mean) / std
       mean: tuple<f32, f32, f32>,
       std: tuple<f32, f32, f32>,
@@ -354,7 +355,8 @@ to `compute` like any other. `id` and `index` are the tick's, as
 centres (the chroma of a subsampled frame sited at the centre of the pixels
 it covers), its YUV made RGB with the stream's matrix and range, and each
 channel, read as 0 to 1, becomes `(value * scale - mean) / std`. A
-letterbox fills the bars with 0 before the normalisation.
+letterbox fills the bars with `pad` before the normalisation: 0 is black,
+114/255 the grey YOLO models are trained on.
 
 How the tensor reaches the session depends on where the frame is and on the
 provider the model's session engaged. The host says which, once per model:
@@ -362,30 +364,89 @@ provider the model's session engaged. The host says which, once per model:
 | frame | session | route | line |
 |---|---|---|---|
 | on the GPU (D3D12) | CUDA, Windows | a compute pass on the shared device writes the tensor into a buffer on a shared heap, which CUDA imported once; the session is handed that memory through an `IoBinding` | `[nn] depth: input from the pool, bound on CUDA` |
-| on the GPU | DirectML | the same pass, read back once | `[nn] depth: input downloaded, DIRECTML takes host memory (the pinned ort cannot hand a D3D12 buffer to a DirectML session)` |
+| on the GPU (D3D12) | DirectML | the same pass; the buffer is handed to the session as a DirectML allocation | `[nn] depth: input from the pool, bound on DIRECTML` |
+| on the GPU | DirectML on a device of its own | the same pass, read back once | `[nn] depth: input downloaded, DIRECTML takes host memory (its session runs on a device of its own, not the pool's)` |
 | on the GPU | CPU, CoreML | the same pass, read back once | `[nn] depth: input downloaded, CPU takes host memory` |
 | on the GPU | CUDA where the import failed | the same pass, read back once | `[nn] depth: input downloaded, CUDA could not reach the pool's memory (<why>)` |
 | in host memory | any | the same arithmetic on the CPU, from the frame's bytes | `[nn] depth: input in host memory, made on the CPU` |
 
-On the bound route the queue signals a shared D3D12 sync object after the
-pass, CUDA imports that sync object as an external semaphore, and the wait
-on it is queued and finished before the session runs. Neither the frame nor
-the tensor crosses to host memory: a `-profile` run counts no `download`
-bytes. On the
-downloaded route each frame costs one read back of the tensor, never of the
-frame, and the profile's `download` counts the tensor's bytes.
-`FFRWD_NN_BIND=off` takes the downloaded route where the bound one would be
-taken (`input downloaded, FFRWD_NN_BIND is off`), so the two can be
+On the CUDA route every CUDA session runs on a stream the host made
+(`user_compute_stream`). The queue signals a shared D3D12 sync object after
+the pass, CUDA imports that sync object as an external semaphore, and the
+wait on it is queued in the session's stream ahead of the run, so the GPU
+orders the pass and the run and the CPU waits for neither. Where the stream
+cannot be made, CUDA is registered with its own stream and the CPU waits for
+the pass before each run, and stderr says so once. On the DirectML route the
+session runs on the queue every module and the host submit to, so the pass,
+given to the queue first, runs first, and nothing waits. Neither the frame
+nor the tensor crosses to host memory: a `-profile` run counts no `download`
+bytes. On the downloaded route each frame costs one read back of the tensor,
+never of the frame, and the profile's `download` counts the tensor's bytes.
+`FFRWD_NN_BIND=off` takes the downloaded route where a bound one would be
+taken (`input downloaded, FFRWD_NN_BIND is off`), so the routes can be
 compared on one session.
 
-DirectML cannot be bound with the pinned `ort` 2.0.0-rc.10: it carries none
-of DirectML's interop API (`OrtDmlApi`,
-`CreateGPUAllocationFromD3DResource`), and its DirectML provider takes a
-device id, never the caller's D3D12 device, so a DirectML session cannot be
-handed a buffer of the shared device. Linux has no bound route yet: the
-pool is on Vulkan there, and the Vulkan import is not written.
+### DirectML's route
 
-Outputs come back as before: `compute` returns them in host memory.
+The pinned `ort` 2.0.0-rc.10 carries none of DirectML's own API, and its
+DirectML provider takes a device id, so its session would make a D3D12
+device of its own that no buffer of the pool belongs to. The host declares
+the API itself (`runtime/src/nn/directml.rs`): the `OrtDmlApi` table of
+ONNX Runtime 1.22.0's `dml_provider_factory.h`, reached through
+`GetExecutionProviderApi("DML", ...)` on the DirectML build of the runtime.
+Where some module is granted `-gpu` and the shared device is D3D12, every
+DirectML session is registered with `SessionOptionsAppendExecutionProvider_DML1`
+over an `IDMLDevice` that `DMLCreateDevice` (from the `DirectML.dll` the
+provider loads) made on the shared `ID3D12Device`, and the shared queue.
+A buffer of that device becomes a DirectML allocation through
+`CreateGPUAllocationFromD3DResource`, made once per buffer and kept, and a
+tensor over it with the `DML` memory info is bound like any other. Where
+that registration cannot be made, DirectML is registered by device id as
+before, stderr says so once, and inputs take the downloaded route.
+
+Since the session runs on the shared device, a debug build's D3D12 debug
+layer no longer leaves DirectML and the shared device on different
+adapters.
+
+### Outputs on the device
+
+An output that is a picture (a depth map, a mask) can stay on the device:
+the module binds it to a texture of the shared device and reads that
+texture through `ffrwd:gpu` like any other.
+
+    record output-texture-options {
+      output: string,               // the graph's name for the output
+      width: u32, height: u32,      // the texture's size
+    }
+
+    output-texture: func(context: borrow<graph-execution-context>,
+        options: output-texture-options) -> result<gpu-texture, string>;
+
+The texture is `r32float`, one fp32 element a texel, row by row, so the
+output has `width * height` elements; its dynamic dimensions are taken as
+the last the width, the one before it the height, and any others 1. From
+the next `compute` of that context on, each writes the output into the
+texture before it returns, as far as the device can tell: a pass the module
+submits afterwards reads what that `compute` wrote. `compute` still lists
+the output, and its `data` reads the elements back. Every other output
+comes back in host memory, as before. The interface is the two calls and
+the size and no more: an output's elements are fp32 whatever the model, so
+the format is fixed rather than asked for, and a module that wants the map
+in another format makes it in its own pass, as `modules/depth` does.
+
+| session | route | line |
+|---|---|---|
+| CUDA, Windows | the session writes a buffer on a shared heap CUDA imported; its stream signals a shared sync object the queue waits on, and a pass copies the buffer into the texture; before the next run the stream waits for that pass | `[nn] depth: output predicted_depth to a texture, bound on CUDA` |
+| DirectML on the shared device | the session writes a buffer of the device, as a DirectML allocation, and a pass copies it into the texture; the queue orders the two | `[nn] depth: output predicted_depth to a texture, bound on DIRECTML` |
+| CPU, CoreML, DirectML on a device of its own | the output comes back to host memory and is uploaded into the texture once | `[nn] depth: output predicted_depth uploaded to a texture, CPU writes host memory` |
+| CUDA where the import failed | the same | `... uploaded to a texture, CUDA could not reach the device's memory (<why>)` |
+
+On the bound routes a `-profile` run counts no `download` and no `upload`
+bytes for the output; the uploaded route counts the output's bytes as
+`upload`. `FFRWD_NN_BIND=off` takes the uploaded route here too.
+
+Linux has no bound route yet, for inputs or outputs: the pool is on Vulkan
+there, and the Vulkan import is not written.
 
 The CUDA runtime the binding uses is the one the CUDA provider loaded
 (`cudart64_12.dll`, where the provider's preflight found it), loaded at run
@@ -395,9 +456,11 @@ every session on.
 
 `modules/nn-frames` is the test module: a sink that runs a model on each
 frame through `frame-tensor` and writes each output as rows, its values when
-there are 16 or fewer, else their count, mean, least and greatest. Its
-graphs, `model/channel-means.onnx` (NCHW) and `channel-means-nhwc.onnx`,
-return each channel's mean and largest value; `model/make-channel-means.py`
+there are 16 or fewer, else their count, mean, least and greatest. With
+`texture=<output>:texture_width=<w>:texture_height=<h>` it binds that output
+to a texture and reads its values from there. Its graphs,
+`model/channel-means.onnx` (NCHW) and `channel-means-nhwc.onnx`, return
+each channel's mean and largest value; `model/make-channel-means.py`
 regenerates them. The same frames give the same rows on every route, to
 within float rounding.
 
@@ -409,14 +472,25 @@ within float rounding.
 
 On the RTX 4090, release build, h264 decoded on the device into the pool,
 the tensor 518x518 letterboxed, median per frame over 230 frames, the time
-inside the module for `frame-tensor` and `compute` together:
+inside the module for `frame-tensor` and `compute` together, and on the
+bound routes the output bound to a texture and then read back from it
+(`output_ms`; a module that uses the texture on the device reads nothing
+back). The parts are medians of their own, so they need not sum to the
+whole:
 
-| model | input | bound on CUDA | downloaded, CUDA session |
-|---|---|---|---|
-| channel-means | 1080p | 1.33 ms | 6.74 ms |
-| channel-means | 4K | 1.41 ms | 7.41 ms |
-| Depth Anything V2 small | 1080p | 29.4 ms | 34.2 ms |
-| Depth Anything V2 small | 4K | 30.7 ms | 40.3 ms |
+| model | input | CUDA, bound | CUDA, downloaded | DirectML, bound | DirectML, downloaded |
+|---|---|---|---|---|---|
+| channel-means | 1080p | 1.61 ms (1.34 + 0.34) | 6.57 ms | 0.74 ms (0.59 + 0.13) | 6.54 ms |
+| channel-means | 4K | 1.80 ms (1.43 + 0.36) | 6.82 ms | 0.87 ms (0.71 + 0.14) | 6.63 ms |
+| Depth Anything V2 small | 1080p | 28.6 ms (27.8 + 0.89) | 34.8 ms | 28.2 ms (18.7 + 9.45) | 61.1 ms |
+| Depth Anything V2 small | 4K | 28.9 ms (28.0 + 0.87) | 36.3 ms | 28.3 ms (18.7 + 9.49) | 63.2 ms |
+
+A DirectML run on bound memory returns before the device has finished, so
+its time is in the read back; the sum is what a frame costs. Without the
+texture, a CUDA session on the host's stream takes 0.80 ms for
+channel-means at 1080p and 0.82 to 0.89 ms at 4K, where the CPU waiting for
+the pass took 1.25 to 1.36 ms; Depth Anything at 4K takes 29.1 to 29.3 ms
+against 28.1 to 28.6 ms, so for it the run, not the wait, is the cost.
 
 ## The probe module
 
@@ -433,9 +507,9 @@ that needs python.
 
 ## The depth module
 
-`modules/depth` is the one that ships. It exports the stream interface rather
-than the value one, so frames reach it the way they reach any module, and it
-asks for the name **`depth`**:
+`modules/depth` is the one that ships. It is a node of the node world beside
+`ffrwd:gpu`, so it is granted the device (`-gpu`) even where its frames stay
+in host memory, and it asks for the name **`depth`**:
 
     -nn depth=modules/depth/model/model.onnx
 
@@ -445,14 +519,16 @@ sha256. Unlike transcribe the module does not compile it in, so nothing is
 rebuilt after a fetch.
 
 It runs the graph at 518x518 - the size the model's own preprocessing uses -
-takes `pixel_values` as a planar fp32 tensor and reads `predicted_depth` back.
+on a tensor the host makes with `frame-tensor`, letterboxed and normalised
+the way the model was trained, and reads `predicted_depth` back. `memory`
+says where its frames are held. On `host`, the default, the tensor is made
+on the CPU and the map comes back as bytes; the frame leaves in the input's
+pixel format, yuv420p or rgba. On `gpu`, the input is held on the device,
+the map is bound to a texture with `output-texture`, and two passes on the
+device find its range over the frame and paint the frame, which leaves as an
+rgba texture. The two paths paint the same frames to within a level.
 
-    ffrwd-wasm -f nut -i in.nut \
-      -nn depth=modules/depth/model/model.onnx \
-      -nn-runtime <dir> -nn-target gpu \
-      -m depth=depth.wasm -m blur_mask=blur_mask.wasm \
-      -filter_complex "[0:v]depth[n1];[0:v][n1]blur_mask[out0]" \
-      -map [out0] -f nut out.nut
+    ffrwd-wasm -f nut -i in.nut       -nn depth=modules/depth/model/model.onnx       -nn-runtime <dir> -nn-target gpu -gpu depth.wasm       -m depth=depth.wasm -m blur_mask=blur_mask.wasm       -filter_complex "[v=0:v]depth[out=n1];[0:v][n1]blur_mask[out0]"       -map [out0] -f nut out.nut
 
 On an RTX 4090, 64x64 frames, the graph itself is what the time goes on:
 178 ms a frame on the CPU provider against 20 ms on CUDA, after a fixed

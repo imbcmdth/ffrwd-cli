@@ -1508,6 +1508,144 @@ What waits:
   timeline semaphore into CUDA is not written; a CUDA session there takes
   the downloaded route and says so.
 
+**The GPU orders the pass, outputs on the device, DirectML bound, depth
+on frame-tensor (2026-10-12, owner's machine):**
+
+- The CPU no longer waits for the preprocessing pass on CUDA. Every CUDA
+  session is registered by the host on a stream it made (rc.10's
+  `CUDAExecutionProvider::with_compute_stream`, through a registrar the
+  vendored backend now takes per provider), and the wait on the shared
+  sync object is queued in that stream ahead of the run. Where the stream
+  cannot be made, CUDA is registered as before and the CPU waits, and
+  stderr says so once.
+- Item 5: `ffrwd:gpu/nn.output-texture(context, {output, width, height})`
+  binds an output of a graph-execution context to an `r32float` texture of
+  the shared device, one fp32 element a texel, which the module reads
+  through `ffrwd:gpu` like any texture; every later `compute` writes it.
+  The format is not asked for, since an output's elements are fp32
+  whatever the model; a module wanting another format makes it in its own
+  pass. On CUDA the session writes a buffer on a shared heap CUDA imported
+  (`IoBinding::bind_output` with a value over the CUDA pointer); the
+  session's stream signals a second shared sync object, which CUDA imported
+  as an external semaphore and the queue waits on; a pass copies the buffer
+  into the texture; the queue signals the first sync object after it, and
+  the next run's stream waits for that before writing the buffer again.
+  Elsewhere the output comes back to host memory and is uploaded once,
+  `[nn] <model>: output <name> uploaded to a texture, <why>`. `compute`
+  still lists a bound output, as a tensor on the device whose `data` reads
+  it back.
+- Item 3 on DirectML, through hand-written FFI over
+  `GetExecutionProviderApi("DML", 22, ...)`: the `OrtDmlApi` table as
+  1.22.0's `dml_provider_factory.h` lays it out
+  (`runtime/src/nn/directml.rs`). Where a module is granted `-gpu` and the
+  shared device is D3D12, every DirectML session is registered with
+  `SessionOptionsAppendExecutionProvider_DML1` over an `IDMLDevice` that
+  `DMLCreateDevice` made on the shared `ID3D12Device`, and wgpu's own
+  queue. A buffer of that device becomes a DirectML allocation through
+  `CreateGPUAllocationFromD3DResource`, once per buffer, and binds as a
+  tensor with the `DML` memory info, inputs and outputs alike. Nothing in
+  the pinned runtime refused: the provider takes a device and queue it did
+  not make, and the allocation binds. The session submits to the queue the
+  pass was given to, so nothing waits on either side. A debug build no
+  longer has DirectML and the shared device on different adapters, since
+  they are one device.
+- `frame-tensor-options` gains `pad`, what a letterbox's bars hold (0 to
+  1 before the normalisation), since YOLO models are trained on grey bars
+  (114/255) and a marginal detection at the edge turns on it.
+- `modules/depth` is a node of the node world beside `ffrwd:gpu`, reading
+  through `frame-tensor`, with `memory=host` the default. On `memory=gpu`
+  the map is bound to a texture and two passes on the device find its
+  range over the frame and paint it into an rgba texture that leaves as
+  the frame; nothing crosses to host memory on CUDA or DirectML. The two
+  paths paint within one level of each other on CUDA, DirectML and the CPU.
+  It imports `wasi:webgpu`, so the compiler now grants it `-gpu` and a
+  build without the `gpu` feature cannot run it, even on the host path.
+  Recipe 93's pin is the compiler's again; the run makes 60 frames.
+- A node's video output like an input, in that input's pixel format, now
+  keeps the input's colour tags: without them an older two-stream filter
+  reading it beside the input (`blur_mask` in recipe 93) refused the pair.
+- Tests: in `ffrwd-wasm/tests/nn.rs`, the depth chain as the compiler
+  wires it, depth on the device against the host path (within a level),
+  and an output bound to a texture against the CPU's rows on the CPU
+  (uploaded), CUDA and DirectML (bound, input and output, no `download`
+  bytes). All pass here with nothing skipped, in debug and release.
+
+Measured on the 4090, release build, h264 decoded on the device into the
+pool, the tensor 518x518 letterboxed, median per frame over 230 frames.
+The machine was checked quiet first (no cargo, rustc, ffmpeg or other
+ffrwd-wasm at work, CPU load 2 %, GPU 4 %). First the stream, against the
+build before it, CUDA bound, no output texture, two rounds each:
+
+| model | input | CPU waits for the pass | the stream orders it |
+|---|---|---|---|
+| channel-means | 1080p | 1.25, 1.36 ms | 0.80, 0.80 ms |
+| channel-means | 4K | 1.28, 1.36 ms | 0.89, 0.82 ms |
+| Depth Anything V2 small | 4K | 28.1, 28.6 ms | 29.3, 29.1 ms |
+
+The half millisecond the CPU spent waiting is gone where the run is short;
+where the run is long it is not what a frame costs, and the run on the
+host's stream came out about 0.7 ms slower in both rounds, which is not
+explained.
+
+Then each route: `frame-tensor` plus `compute`, plus on the bound routes
+the output bound to a texture and read back from it by the module (a
+module that uses the texture on the device reads nothing back), each part
+its own median:
+
+| model | input | CUDA, bound | CUDA, downloaded | DirectML, bound | DirectML, downloaded |
+|---|---|---|---|---|---|
+| channel-means | 1080p | 1.61 ms (1.34 + 0.34) | 6.57 ms | 0.74 ms (0.59 + 0.13) | 6.54 ms |
+| channel-means | 4K | 1.80 ms (1.43 + 0.36) | 6.82 ms | 0.87 ms (0.71 + 0.14) | 6.63 ms |
+| Depth Anything V2 small | 1080p | 28.6 ms (27.8 + 0.89) | 34.8 ms | 28.2 ms (18.7 + 9.45) | 61.1 ms |
+| Depth Anything V2 small | 4K | 28.9 ms (28.0 + 0.87) | 36.3 ms | 28.3 ms (18.7 + 9.49) | 63.2 ms |
+
+A DirectML run on bound memory returns before the device is done, so its
+time shows in the read back. The output's binding costs CUDA about 0.35 ms
+a frame on channel-means (the signal, the queue's wait and the copy pass
+handed over). DirectML on downloaded memory and the shared device takes
+61 ms a frame for Depth Anything, twice CUDA's; not looked into.
+
+What was learned:
+
+- A CUDA run still synchronizes its stream before it returns, so the CPU
+  waits for the inference itself; the run option
+  `disable_synchronize_execution_providers` would let a run whose outputs
+  are all on the device return at once, which the output's signal already
+  orders. Not done.
+- The segment module is not moved onto `frame-tensor`. Ported to the node
+  world, its map and its rows leave on two ports, and recipe 94 no longer
+  compiles: as written, `UNSUPPORTED_SQL: segment() returns
+  STRUCT(map video_stream, objects STRUCT(...)[]), and a struct is not a
+  stream (hint: read one output off the call: it writes .map, .objects)`;
+  with the call in a `WITH` and `unnest(s.objects)`, `ARRAY(subquery) needs
+  a branch with no row source of its own to read rows from`; and handing
+  `s.objects` to `mask_select` directly, `UDF_ARG_TYPE: mask_select() takes
+  the annotation column 'objects', and its argument produces none`. A
+  node's data output cannot reach an older module's annotation column
+  through the compiler, so segment stays a window filter until it can, or
+  until `mask_select` is a node.
+
+What waits:
+
+- Segment on `frame-tensor`, behind the compiler above.
+- Linux: the pool is on Vulkan there, and nothing is imported into CUDA. It
+  needs, on the L4 (the one Linux machine with an NVIDIA card to run it
+  on): the device opened with `VK_KHR_external_memory_fd` and
+  `VK_KHR_external_semaphore_fd` (and timeline semaphores) beside wgpu's
+  own extensions; the tensor and output buffers made as `VkBuffer`s on
+  dedicated memory allocated with `VkExportMemoryAllocateInfo` for
+  `OPAQUE_FD`, handed to wgpu as hal buffers and exported with
+  `vkGetMemoryFdKHR`; a timeline semaphore exported as an opaque fd,
+  signalled after the pass by a raw submit on wgpu's queue and waited on
+  before the copy pass the same way; on the CUDA side
+  `cudaImportExternalMemory` with `cudaExternalMemoryHandleTypeOpaqueFd`
+  and `cudaImportExternalSemaphore` with
+  `cudaExternalSemaphoreHandleTypeTimelineSemaphoreFd`, from
+  `libcudart.so.12` where the preflight found it; and the CUDA device
+  matched by UUID (`VkPhysicalDeviceIDProperties::deviceUUID` against
+  `cudaDeviceProp::uuid`), since Linux has no LUID. Until then a CUDA
+  session there takes the downloaded and uploaded routes and says so.
+
 ### Wave 5: two candidates to measure
 
 Neither is in the design yet; each is a measurement on the GPU tier that
