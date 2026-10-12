@@ -496,11 +496,10 @@ published crates, and the lbar recipe renders on the GPU path with frames
 within tolerance of the CPU path.
 
 **Shipped (2026-10-11):** `wgpu-wasi-webgpu` is a repository of its own
-(`E:/wgpu-wasi-webgpu` on the owner's machine, version 29.0.0, pinned to
-wgpu 29, with its own copy of the wit under `wit/deps` and a script that
-checks it against ffrwd-cli's), moved out of blitz's `bench-compose-4k60`
-branch, which keeps the bench and depends on the crate by path until it is
-published. Every `todo!()` is gone: render bundles, indirect draws, the
+(github.com/imbcmdth/wgpu-wasi-webgpu, version 29.0.0 at tag `v29.0.0`,
+pinned to wgpu 29, with its own copy of the wit under `wit/deps` and a
+script that checks it against ffrwd-cli's), moved out of blitz's
+`bench-compose-4k60` branch, which keeps the bench. Every `todo!()` is gone: render bundles, indirect draws, the
 compressed texture formats and the WGSL language features are implemented
 over the wit, and what the 0.0.1 interface cannot express (surfaces,
 acceleration structures, mesh shaders, binding arrays, pipeline caches,
@@ -552,9 +551,9 @@ moves to `auto` with wave 3. Two costs to carry into wave 0 and wave 3:
 the compiler grants `-gpu` to this module whatever `renderer` says and
 caps the sidecar at two workers (`GPU_JOBS`), which leaves the CPU path a
 third slower at 1080p and 40% slower at 4K than a run on every core, so
-lifting the cap (wave 0, item 5) matters before the release; and the
-module depends on `wgpu-wasi-webgpu` by path until that crate is on
-GitHub and pinned by tag, so blitz's CI cannot build it until then.
+lifting the cap (wave 0, item 5) matters before the release. The crate
+is github.com/imbcmdth/wgpu-wasi-webgpu, and blitz pins it by tag
+(`v29.0.0`).
 
 ### Wave 2: libavcodec in the sidecar, packets on the wire
 
