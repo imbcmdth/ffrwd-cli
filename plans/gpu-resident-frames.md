@@ -2154,9 +2154,13 @@ today's chain, with its age model on CUDA:
 
 | size | baseline, fps | all on the GPU, `h264_d3d12va`, fps | all on the GPU, libx264, fps |
 |---|---|---|---|
-| 720p | 20.7 | 23.0 | 21.8 |
-| 1080p | 18.2 | 21.8 | 21.4 |
-| 4K | 12.0 | 21.1 | 18.0 |
+| 720p | 20.7 | 23.3 | 22.8 |
+| 1080p | 18.2 | 23.3 | 21.7 |
+| 4K | 12.0 | 22.6 | 18.4 |
+
+The two GPU columns were measured again with the machine idle; the three
+runs of each size are within 1% of each other. The baseline was measured
+once, while the machine was in use, so it may be slightly low.
 
 With `h264_d3d12va` the run is one sidecar region from the decoder to the
 encoder: `upload`, `download` and `fetch` are 0 bytes, and ffmpeg only
