@@ -33,7 +33,7 @@ use std::sync::OnceLock;
 
 pub use decode::{
     ComDevice, D3d12Picture, DecodedFormat, DecodedFrame, Decoder, DeviceFrame, Hw, Received,
-    Shared,
+    Shared, ON_DEVICE,
 };
 pub use encode::{EncodedPacket, Encoder};
 pub use error::{Error, Result, INSTALL_HINT};

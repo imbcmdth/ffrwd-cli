@@ -79,6 +79,9 @@ pub struct Profile {
     pub upload: Stage,
     /// GPU frames read back.
     pub download: Stage,
+    /// Frames converted on the GPU (another layout, another size), counted
+    /// in the bytes of what they became.
+    pub convert: Stage,
     /// Bytes written to the output pipes.
     pub write: Stage,
 }
@@ -92,11 +95,12 @@ pub static PROFILE: Profile = Profile {
     emit: Stage::new("emit"),
     upload: Stage::new("upload"),
     download: Stage::new("download"),
+    convert: Stage::new("convert"),
     write: Stage::new("write"),
 };
 
 impl Profile {
-    fn stages(&self) -> [&Stage; 8] {
+    fn stages(&self) -> [&Stage; 9] {
         [
             &self.read,
             &self.held,
@@ -105,6 +109,7 @@ impl Profile {
             &self.emit,
             &self.upload,
             &self.download,
+            &self.convert,
             &self.write,
         ]
     }
@@ -136,7 +141,7 @@ mod tests {
             serde_json::from_str(&PROFILE.row()).expect("the row is one JSON object");
         assert_eq!(row["kind"], "profile");
         for name in [
-            "read", "held", "fetch", "process", "emit", "upload", "download", "write",
+            "read", "held", "fetch", "process", "emit", "upload", "download", "convert", "write",
         ] {
             assert!(row[name]["bytes"].is_u64(), "{name} in {row}");
             assert!(row[name]["calls"].is_u64(), "{name} in {row}");

@@ -9,6 +9,11 @@ use super::ffi::{
 use super::picture::{self, WIRE_PIX_FMTS};
 use super::Color;
 
+/// The wire formats a decoder opened on the caller's device leaves its
+/// `nv12` pictures there for: yuv420p, an exact repacking of them, and
+/// rgba, which the caller converts on the device.
+pub const ON_DEVICE: &[&str] = &["yuv420p", "rgba"];
+
 /// Where a decoder runs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Hw {
@@ -382,9 +387,9 @@ impl Decoder {
     /// A decoder on `device`, a device the caller already works on, so the
     /// pictures it writes are that device's resources and
     /// [`receive_any`](Decoder::receive_any) can hand them over where they
-    /// are. Only a picture the wire's `want` is an exact repacking of stays
-    /// there (`nv12` for `yuv420p`); any other is copied back and converted
-    /// as [`open`](Decoder::open)'s are.
+    /// are. An `nv12` picture stays there for a `want` the caller makes of
+    /// it on the device ([`ON_DEVICE`]); any other is copied back and
+    /// converted as [`open`](Decoder::open)'s are.
     ///
     /// Says on stderr, once: `[av] decode h264: d3d12va, on the host's
     /// device`. A decoder or device that refuses is a refusal, and the
@@ -563,9 +568,9 @@ impl Decoder {
     }
 
     /// The format a picture just received stays on the device in, where
-    /// it does: an `nv12` D3D12 picture, wanted as `yuv420p`.
+    /// it does: an `nv12` D3D12 picture, wanted as one of [`ON_DEVICE`].
     fn held_as(&self) -> Option<&'static str> {
-        if !self.shared || self.want != "yuv420p" {
+        if !self.shared || !ON_DEVICE.contains(&self.want) {
             return None;
         }
         self.frame.d3d12()?;

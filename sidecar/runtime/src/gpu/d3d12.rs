@@ -39,7 +39,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Direct3D12::ID3D12Fence as SyncObject;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::frames::{GpuFrame, Plane, Yuv};
+use super::frames::{GpuFrame, Layout, Plane, Target, Yuv};
 use super::{shared, shared_device};
 use crate::av::{self, DeviceFrame};
 
@@ -674,7 +674,7 @@ pub enum Copied {
 impl EncoderFeed {
     /// Copies `frame` into `picture`, a picture of an encoder's pool on the
     /// process's device: as it is held for a decoder's picture, else made
-    /// NV12 first ([`GpuFrame::nv12_planes`], an rgba frame with `yuv`).
+    /// NV12 first ([`GpuFrame::converted`], an rgba frame with `yuv`).
     /// The queue every module submits to runs the copy after what it has
     /// already been given, then signals the picture's sync object, and the
     /// picture says the value it waits for. The frame is kept until the
@@ -695,11 +695,16 @@ impl EncoderFeed {
                 frame.backend()
             );
         }
-        let planes = frame.nv12_planes(yuv)?;
-        let [y, uv] = planes.as_slice() else {
+        let nv12 = frame.converted(Target::new(
+            Layout::Nv12,
+            frame.width(),
+            frame.height(),
+            yuv,
+        ))?;
+        let [y, uv] = nv12.planes() else {
             bail!(
                 "an NV12 frame has two planes, and this one has {}",
-                planes.len()
+                nv12.planes().len()
             );
         };
         let raw = picture
@@ -837,6 +842,7 @@ impl EncoderFeed {
             }
         };
         recorder.held.push(Arc::clone(frame));
+        recorder.held.push(nv12);
         copier.submit(&queue, recorder)?;
         let next = raw.sync_value + 1;
         // SAFETY: COM calls on live objects.

@@ -14,7 +14,9 @@
 //! A `decode` whose pictures are read by an input held on the GPU, or by an
 //! encoder that reads D3D12 pictures, decodes on the process's own device
 //! where it can (`d3d12va` on Windows), and hands its pictures on as frames
-//! on that device, so nothing is copied to host memory and back.
+//! on that device, so nothing is copied to host memory and back. Asked for
+//! rgba, it still leaves the decoder's NV12 there, and a reader of the
+//! frames is handed rgba converted on the device once per picture.
 //!
 //! An `encode` whose encoder reads D3D12 pictures (`h264_d3d12va`,
 //! `hevc_d3d12va`, `av1_d3d12va`) and whose frames arrive on the process's
@@ -131,10 +133,11 @@ fn open_decoder(
     extradata: &[u8],
     hw: Hw,
     want: &'static str,
+    yuv: Option<Yuv>,
     on_gpu: bool,
 ) -> av::Result<(Decoder, Option<OnDevice>)> {
     if on_gpu {
-        if let Some(opened) = open_on_shared_device(codec, extradata, &hw, want) {
+        if let Some(opened) = open_on_shared_device(codec, extradata, &hw, want, yuv) {
             return Ok(opened);
         }
     }
@@ -147,16 +150,39 @@ type OnDevice = ffrwd_wasm_runtime::gpu::frames::DecodedPictures;
 #[cfg(not(feature = "gpu"))]
 type OnDevice = std::convert::Infallible;
 
+/// The colour a picture's YUV is read in when it is made rgba on the
+/// device.
+#[cfg(feature = "gpu")]
+type Yuv = ffrwd_wasm_runtime::gpu::frames::Yuv;
+#[cfg(not(feature = "gpu"))]
+type Yuv = ();
+
+/// The colour a stream's YUV is read in as rgba, as libswscale reads it
+/// (an unknown matrix is BT.601); None for a matrix the device's
+/// conversion does not have.
+#[cfg(feature = "gpu")]
+fn read_as(color: Option<&ColorInfo>) -> Option<Yuv> {
+    let (space, range) = color.map_or(("unknown", "unknown"), |c| (c.space, c.range));
+    Yuv::read_as(space, range)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn read_as(_color: Option<&ColorInfo>) -> Option<Yuv> {
+    None
+}
+
 /// A decoder on the process's own device, where `hw` allows the device
-/// it is (`auto`, or that device by name), the wire's format is one a
-/// picture on it repacks to exactly (yuv420p), and the device opens. None,
-/// having said why on stderr where it is not obvious, otherwise.
+/// it is (`auto`, or that device by name), the wire's format is one its
+/// pictures are made on the device (yuv420p, or rgba in a matrix the
+/// conversion has: `yuv`), and the device opens. None, having said why on
+/// stderr where it is not obvious, otherwise.
 #[cfg(all(feature = "gpu", windows))]
 fn open_on_shared_device(
     codec: &str,
     extradata: &[u8],
     hw: &Hw,
     want: &'static str,
+    yuv: Option<Yuv>,
 ) -> Option<(Decoder, Option<OnDevice>)> {
     use ffrwd_wasm_runtime::gpu;
     const DEVICE: &str = "d3d12va";
@@ -168,10 +194,19 @@ fn open_on_shared_device(
     if !allowed {
         return None;
     }
-    if want != "yuv420p" {
+    if !av::ON_DEVICE.contains(&want) {
         eprintln!(
             "[gpu] decode {codec}: {want} pictures are put on the GPU by their reader; a \
-             decoder's own pictures stay there as yuv420p"
+             decoder's own pictures stay there as {}",
+            av::ON_DEVICE.join(" or ")
+        );
+        return None;
+    }
+    if want == "rgba" && yuv.is_none() {
+        eprintln!(
+            "[gpu] decode {codec}: the stream's matrix is not one rgba is made in on the \
+             device (BT.709 or BT.601), so its pictures are converted in host memory and put \
+             on the GPU by their reader"
         );
         return None;
     }
@@ -200,6 +235,7 @@ fn open_on_shared_device(
     _extradata: &[u8],
     _hw: &Hw,
     _want: &'static str,
+    _yuv: Option<Yuv>,
 ) -> Option<(Decoder, Option<OnDevice>)> {
     None
 }
@@ -215,6 +251,10 @@ pub struct Decode {
     on_device: Option<OnDevice>,
     /// The pictures as the stream's header declares them.
     format: VideoFormat,
+    /// The colour the decoder's YUV is read in when a reader is handed
+    /// rgba made on the device.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    yuv: Option<Yuv>,
     /// How long a picture lasts, where the frame rate says in whole ticks.
     duration: Option<i64>,
 }
@@ -285,11 +325,13 @@ impl Decode {
             unreachable!("matched as video above");
         };
         let codec = decoder_codec(coded, fourcc);
+        let yuv = read_as(color.as_ref());
         let (decoder, on_device) = open_decoder(
             &codec,
             &coded.extradata,
             hw.unwrap_or_default(),
             want,
+            yuv,
             on_gpu,
         )
         .map_err(|e| anyhow!("{DECODE} {spelling}: {e}"))?;
@@ -316,6 +358,7 @@ impl Decode {
             decoder,
             on_device,
             format,
+            yuv,
             duration: frame_ticks(frame_rate, base),
         })
     }
@@ -373,8 +416,9 @@ impl Decode {
                 self.name
             )
         })?;
+        let yuv = self.yuv.unwrap_or(Yuv::DEFAULT);
         let frame = pictures
-            .hold(picture, self.format.pix_fmt)
+            .hold(picture, self.format.pix_fmt, yuv)
             .map_err(|e| anyhow!("{}: {e:#}", self.name))?;
         Ok(FrameData::Gpu(frame))
     }
@@ -743,11 +787,11 @@ impl Encode {
         duration: Option<i64>,
     ) -> Result<bool> {
         use ffrwd_wasm_runtime::gpu::d3d12::Copied;
-        use ffrwd_wasm_runtime::gpu::frames::{Matrix, Yuv};
+        use ffrwd_wasm_runtime::gpu::frames::{Layout, Matrix};
         let (FrameData::Gpu(frame), Some(feed)) = (data, self.feed.as_mut()) else {
             return Ok(false);
         };
-        if !frame.has_nv12() {
+        if !frame.converts_to(Layout::Nv12) {
             return Ok(false);
         }
         let yuv = Yuv {
