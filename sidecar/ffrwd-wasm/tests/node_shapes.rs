@@ -1602,7 +1602,14 @@ fn every_worker_numbers_a_tick_by_its_ordinal_in_the_run() {
         .collect();
     write_nut(&dir.join("in.nut"), &[video(4, 4, TENTHS, (10, 1))], &items);
     let input = dir.join("in.nut").display().to_string();
-    let chain = format!("[v=0:v]shape_probe=port={}[spots=s]", free_port());
+    // Each tick takes 20 ms, longer than opening another instance, so at
+    // -jobs 4 the run's ticks are spread over instances: at a few
+    // microseconds a tick, one warm instance can take all forty while the
+    // others are still opening, which nothing promises against.
+    let chain = format!(
+        "[v=0:v]shape_probe=port={}:work_ms=20[spots=s]",
+        free_port()
+    );
     let mut runs = Vec::new();
     for jobs in ["1", "4"] {
         let spots = dir.join(format!("spots-{jobs}.ndjson"));

@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::Deserialize;
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"rate":{"type":"integer","minimum":1},"canvas":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]},"refuse":{"type":"string"},"port":{"type":"integer"},"fetch_size":{"type":"boolean"}},"additionalProperties":false}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"rate":{"type":"integer","minimum":1},"canvas":{"type":"object","properties":{"width":{"type":"integer"},"height":{"type":"integer"}},"required":["width","height"]},"refuse":{"type":"string"},"port":{"type":"integer"},"fetch_size":{"type":"boolean"},"work_ms":{"type":"integer","minimum":0}},"additionalProperties":false}"#;
 
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +55,10 @@ struct Params {
     port: Option<u32>,
     #[serde(default)]
     fetch_size: bool,
+    /// Milliseconds each call takes, so a tick costs more than opening
+    /// another instance does.
+    #[serde(default)]
+    work_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -328,6 +332,9 @@ thread_local! {
 /// Whether `process` fetches `size`'s frames, as `init` was told.
 static FETCH_SIZE: AtomicBool = AtomicBool::new(false);
 
+/// How long each call takes, as `init` was told.
+static WORK_MS: AtomicU64 = AtomicU64::new(0);
+
 impl Guest for ShapeProbe {
     fn describe() -> Meta {
         Meta {
@@ -359,7 +366,9 @@ impl Guest for ShapeProbe {
             .map(|r| format!(r#","hint":"{}/{}""#, r.num, r.den))
             .unwrap_or_default();
         HINT.with(|h| *h.borrow_mut() = hint);
-        FETCH_SIZE.store(params(&params_text)?.fetch_size, Ordering::Relaxed);
+        let p = params(&params_text)?;
+        FETCH_SIZE.store(p.fetch_size, Ordering::Relaxed);
+        WORK_MS.store(p.work_ms, Ordering::Relaxed);
         LATCHED_COPY.store(latched.iter().any(|l| l == "copy"), Ordering::Relaxed);
         let matte = bound
             .iter()
@@ -379,6 +388,10 @@ impl Guest for ShapeProbe {
     }
 
     fn process(tick: &Tick) -> Result<Emitted, String> {
+        let work = WORK_MS.load(Ordering::Relaxed);
+        if work > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(work));
+        }
         let mut items = Vec::new();
         if LATCHED_COPY.load(Ordering::Relaxed) {
             for id in tick.streams("v") {
