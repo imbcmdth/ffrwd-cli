@@ -2262,6 +2262,36 @@ def test_a_node_holding_its_picture_on_the_gpu_takes_coded_edges(
     assert not in_host.av
 
 
+def test_a_picture_held_on_the_gpu_is_encoded_in_its_region_for_a_packet_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A packet sink reading a picture held on the GPU, whose encoder the
+    sidecar hosts, has the picture encoded in the region with the sink's
+    options on the encoder; the ffmpeg between copies the packets. An
+    encoder the sidecar does not host stays in that ffmpeg."""
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    query = (
+        _PUBLISH + "COPY (SELECT box(f.video[1]) FROM input('f.mp4') f) "
+        "TO publish('https://relay', 'b') WITH (video_codec '{}', video_bitrate '6M')"
+    )
+    argv = _plan_argv(query.format("h264_nvenc"), monkeypatch, describe=_reporting("publish.wasm"))
+    (box,) = [words for words in argv.values() if any("box=" in w for w in words)]
+    network = box[box.index("-filter_complex") + 1]
+    assert network.endswith("[n1]encode=codec=h264_nvenc:b=6M[out0]")
+    (between,) = [
+        words for pid, words in argv.items() if pid.startswith("ffmpeg") and "-f" in words[:2]
+    ]
+    assert between[between.index("-c:0") + 1] == "copy" and "-b:0" not in between
+    argv = _plan_argv(query.format("libx264"), monkeypatch, describe=_reporting("publish.wasm"))
+    (box,) = [words for words in argv.values() if any("box=" in w for w in words)]
+    assert "encode=" not in box[box.index("-filter_complex") + 1]
+    encoders = [words for pid, words in argv.items() if pid.startswith("ffmpeg")]
+    assert any(words[words.index("-c:0") + 1] == "libx264" for words in encoders)
+
+
 def test_a_filter_between_pictures_on_the_device_runs_there_where_it_has_a_variant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

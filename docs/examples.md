@@ -1740,3 +1740,38 @@ $ ffrwd compile -f query.sql -v programme=tests/fixtures/testsrc.mp4 -v left=tes
 `compose` is blitz's own build, declared from a checkout of ffrwd-package-blitz beside this one, so the command names no path that only one machine has; a project that installs or links the package calls `ffrwd.blitz.compose` with the same arguments and reaches the same module. `renderer => 'gpu'` and `memory => 'gpu'` hold each call's pictures on the device, so the region takes each input's packets and decodes them there, as recipe 157's does. `c.v` is read twice, by `depth` and by the second `compose`, and is one node. The second `compose` holds the depth map as one of its `inputs` with `lead => 0`, so the map of frame N is drawn on frame N. The run needs a D3D12 adapter, which the decoder, both renderers, the model's session and the encoder share.
 
 What it costs, on an RTX 4090 with a 4K60 programme and two 1080p60 pictures in picture: 91 frames a second once running, with nothing crossing to host memory (`--profile` counts no `upload`, `download` or `fetch` bytes), after about 6 s of start-up. The same query with `renderer => 'cpu'`, the host build of `depth`, ffmpeg decoding and `h264_nvenc` encoding runs at 12 frames a second, moving 149 MB a frame into the modules.
+
+## 161. Encode in the region for a packet sink
+
+A packet sink reads the encoder's output, so the compiler puts an encoder in front of it. Where the picture comes from a region that holds it on the GPU and the sink's encoder is one the sidecar hosts, that encoder runs in the region, beside the module, and the sink's video options move onto it as they do for a file in recipe 157. `packet_stats` counts the groups of pictures it is handed:
+
+```pgsql
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+CREATE FUNCTION packet_stats(v video_stream) RETURNS sink
+  AS '../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm', 'packet_stats'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT gpu_box(f.video[1])
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO packet_stats() WITH (video_codec 'h264_nvenc', video_bitrate '6M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm -f \
+  nut -i pipe:0 -gpu ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];'\
+'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];[n1]encode=codec=h264_nvenc:b=6M[out0]' \
+  -bound 'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' \
+  -f nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 copy -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
+  ../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm -f ndjson pipe:1
+```
+
+The picture leaves the region as `h264_nvenc`'s packets and the ffmpeg between copies them, so it never comes back to host memory to be encoded. An encoder the sidecar does not host (`libx264`), a sink option the `encode` node has no name for, or a module holding its picture in host memory leaves the encoder in that ffmpeg, as before.

@@ -423,8 +423,12 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   behind writes `-c:v copy` when the destination names an encoder the
   sidecar hosts (the `_nvenc`, `_amf`, `_mf`, `_videotoolbox`, `_vaapi`
   and `_d3d12va` encoders, and ffv1, mpeg4, mpeg2video and mjpeg), with the
-  encoder's options moved into the sidecar's `encode` node. Anything
-  else on either side stays raw, as without the clause. `codec_params`
+  encoder's options moved into the sidecar's `encode` node. The same
+  holds for a packet sink or packet filter the region's picture goes to
+  unfiltered: an encoder the sidecar hosts runs in the region, the
+  sink's video options move onto it, and the ffmpeg between copies the
+  packets (recipe [161](examples.md#161-encode-in-the-region-for-a-packet-sink)).
+  Anything else on either side stays raw, as without the clause. `codec_params`
   has no spelling in the node and is refused beside a hosted encoder.
   The clause means nothing on a value function, a codec package's
   function, a packet sink or a data filter, and is refused there; so is

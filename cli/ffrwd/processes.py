@@ -4258,6 +4258,8 @@ class _Partitioner:
                     continue
                 found = self._encoded_write(edge)
                 if found is None:
+                    found = self._encoded_for_a_sink(edge)
+                if found is None:
                     continue
                 args, held = found
                 self.encodes.setdefault(sidecar.id, {})[edge.ref] = args
@@ -4356,6 +4358,55 @@ class _Partitioner:
         process.sinks = [
             replace(one, options=kept) if one is unit else one for one in process.sinks
         ]
+        return args, held
+
+    def _encoded_for_a_sink(self, edge: StreamEdge) -> tuple[dict[str, object], int] | None:
+        """The `encode` arguments for a picture `edge` hands the ffmpeg that
+        encodes it for one packet sink or filter, and the frames that encoder
+        holds back, or None.
+
+        That ffmpeg reads this one stream and writes it to the one consumer,
+        and nothing else. Its encoder is one the sidecar has, and every video
+        option the consumer's pad names moves onto the encoder; the ffmpeg
+        then copies the packets, and the edge into the consumer carries them
+        as they were coded.
+        """
+        stage = next((p for p in self.pending if p.id == edge.target), None)
+        if stage is None or stage.nodes or stage.sinks or stage.pipes != [edge.ref]:
+            return None
+        consumer = self.consumer_of.get(stage.id)
+        out = [e for e in self.edges if e.source == stage.id]
+        if consumer is None or len(out) != 1 or out[0].target != consumer:
+            return None
+        if any(
+            other is not edge and other.source == edge.source and other.ref == edge.ref
+            for other in self.edges
+        ):
+            return None
+        reader = self._reader(consumer, edge.ref)
+        pads = self.g.packet_sinks.get(reader) if reader is not None else None
+        if pads is None and reader is not None:
+            pads = self.g.packet_filters.get(reader)
+        if pads is None or reader is None:
+            return None
+        pad = dict(pads[self.g.nodes[reader].inputs.index(edge.ref)])
+        codec = pad.pop("video_codec", None)
+        if not isinstance(codec, str) or codec not in HOSTED_ENCODERS:
+            return None
+        args: dict[str, object] = {"codec": codec}
+        for name, value in pad.items():
+            if name in ("row", "rendition") or name in _COPY_KEEPS:
+                continue
+            if name not in ENCODE_OPTIONS or not isinstance(value, str | int | float):
+                return None
+            args[ENCODE_OPTIONS[name]] = value
+        wire = out[0].format
+        assert isinstance(wire, VideoFormat)  # a picture's encoder writes one
+        self.edges[self.edges.index(out[0])] = replace(
+            out[0], format=replace(wire, codec=COPY_CODEC, options=())
+        )
+        meta = self._origin_meta(edge.ref)
+        held = encoder_delay(codec, pad, meta.height if meta is not None else None)
         return args, held
 
     def _bundle_node_edges(self) -> None:
