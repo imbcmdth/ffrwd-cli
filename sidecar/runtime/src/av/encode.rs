@@ -39,7 +39,6 @@ pub struct Encoder {
     width: u32,
     height: u32,
     frame: Frame,
-    converted: Frame,
     scaler: Option<Scaler>,
     packet: Packet,
     extradata: Vec<u8>,
@@ -255,7 +254,6 @@ impl Encoder {
             width,
             height,
             frame: Frame::new(lib).map_err(call("av_frame_alloc", &name))?,
-            converted: Frame::new(lib).map_err(call("av_frame_alloc", &name))?,
             scaler: None,
             packet: Packet::new(lib).map_err(call("av_packet_alloc", &name))?,
             extradata: params.extradata,
@@ -330,41 +328,39 @@ impl Encoder {
             width,
             height,
             frame,
-            converted,
             scaler,
             ..
         } = self;
 
-        // A fresh buffer for every picture: the encoder may still hold the
-        // last one.
-        frame.set_video(*width, *height, *input_fmt);
-        frame.set_color(*input_color);
+        // A fresh buffer for every picture, in the encoder's own format: the
+        // encoder may still hold the last one. The picture crosses into it
+        // in one pass: copied in row by row where the input is already that
+        // format, else converted by libswscale straight from the input's
+        // planes.
+        frame.set_video(*width, *height, *pix_fmt);
+        frame.set_color(*color);
         frame.alloc().map_err(call("av_frame_get_buffer", name))?;
-        if !frame.fill(input, data) {
-            return Err(Error::Call {
-                call: "av_frame_get_buffer",
-                codec: name.clone(),
-                why: format!("the allocated picture is not laid out as {input}"),
-            });
-        }
-
-        let target: &mut Frame = if *pix_fmt == *input_fmt {
-            frame
+        let written = if *pix_fmt == *input_fmt {
+            frame.fill(input, data)
         } else {
-            converted.set_video(*width, *height, *pix_fmt);
-            converted.set_color(*color);
             if scaler.is_none() {
                 *scaler = Some(Scaler::new(lib).map_err(call("sws_alloc_context", name))?);
             }
             let sws = scaler.as_mut().expect("set just above");
-            sws.scale(converted, frame)
-                .map_err(call("sws_scale_frame", name))?;
-            converted
+            sws.scale_from_packed(frame, input, *width, *height, *input_color, data)
+                .map_err(call("sws_scale_frame", name))?
         };
-        target.set_timing(pts, duration);
+        if !written {
+            frame.unref();
+            return Err(Error::Call {
+                call: "av_frame_get_buffer",
+                codec: name.clone(),
+                why: format!("the picture is not laid out as {input}"),
+            });
+        }
+        frame.set_timing(pts, duration);
 
-        let status = ctx.send_frame(Some(target));
-        target.unref();
+        let status = ctx.send_frame(Some(frame));
         frame.unref();
         match status {
             Status::Done => Ok(()),

@@ -1420,16 +1420,28 @@ impl Drop for Packet {
 
 /// A libswscale context used through `sws_scale_frame`, which reads the
 /// geometry, format and colour of both frames and sets itself up to match.
+///
+/// One side of every conversion is a packed wire picture in a Rust buffer,
+/// read or written in place through `view`: a frame whose plane pointers
+/// and strides point into that buffer and which owns no buffers itself. So
+/// a conversion is the one pass over the picture, with no copy before or
+/// after it.
 pub(super) struct Scaler {
     ptr: *mut SwsContext,
+    view: Frame,
     lib: &'static Lib,
 }
 
 // SAFETY: as for `CodecCtx`.
 unsafe impl Send for Scaler {}
 
+/// Bytes reserved past the end of a picture libswscale writes into, so a
+/// write rounded up past the last row lands in memory the vector owns.
+const WRITE_SLACK: usize = 64;
+
 impl Scaler {
     pub fn new(lib: &'static Lib) -> std::result::Result<Scaler, AvErr> {
+        let view = Frame::new(lib)?;
         // SAFETY: null is checked.
         let ptr = unsafe { (lib.f.sws_alloc_context)() };
         if ptr.is_null() {
@@ -1438,18 +1450,136 @@ impl Scaler {
                 why: "sws_alloc_context allocated nothing".to_string(),
             });
         }
-        Ok(Scaler { ptr, lib })
+        Ok(Scaler { ptr, view, lib })
     }
 
-    /// Converts `src` into `dst`, which `Frame::set_video` described and
-    /// libswscale allocates.
-    pub fn scale(&mut self, dst: &mut Frame, src: &Frame) -> std::result::Result<(), AvErr> {
-        // SAFETY: a live context and two live frames.
-        let ret = unsafe { (self.lib.f.sws_scale_frame)(self.ptr, dst.ptr, src.ptr) };
+    /// Points `view` at a packed `pix_fmt` picture of `len` bytes at `base`,
+    /// planes one after another as the wire lays them out. False when the
+    /// format is not the wire's or the bytes are not one picture.
+    fn point_view(
+        &mut self,
+        pix_fmt: &str,
+        width: u32,
+        height: u32,
+        color: RawColor,
+        base: *mut u8,
+        len: usize,
+    ) -> bool {
+        let Some(format) = self.lib.wire_pix_fmt(pix_fmt) else {
+            return false;
+        };
+        let Some(planes) = picture::planes(pix_fmt, width, height) else {
+            return false;
+        };
+        let total: usize = planes.iter().map(|p| p.row_bytes * p.rows).sum();
+        if width == 0 || height == 0 || total != len {
+            return false;
+        }
+        let (Ok(w), Ok(h)) = (c_int::try_from(width), c_int::try_from(height)) else {
+            return false;
+        };
+        let mut strides = [0 as c_int; AV_NUM_DATA_POINTERS];
+        for (i, plane) in planes.iter().enumerate() {
+            match c_int::try_from(plane.row_bytes) {
+                Ok(stride) => strides[i] = stride,
+                Err(_) => return false,
+            }
+        }
+        self.view.unref();
+        self.view.set_color(color);
+        let f = self.view.get_mut();
+        f.width = w;
+        f.height = h;
+        f.format = format;
+        let mut at = 0;
+        for (i, plane) in planes.iter().enumerate() {
+            f.data[i] = base.wrapping_add(at);
+            f.linesize[i] = strides[i];
+            at += plane.row_bytes * plane.rows;
+        }
+        true
+    }
+
+    /// Lets go of the buffer `view` pointed into. The view owns no buffer,
+    /// so this frees nothing of it.
+    fn release_view(&mut self) {
+        let f = self.view.get_mut();
+        f.data = [ptr::null_mut(); AV_NUM_DATA_POINTERS];
+        f.linesize = [0; AV_NUM_DATA_POINTERS];
+        self.view.unref();
+    }
+
+    /// Converts `src` into a packed `pix_fmt` picture appended to `out`,
+    /// written there by libswscale directly. False, with nothing appended,
+    /// when `pix_fmt` is not one of the wire's.
+    pub fn scale_into_packed(
+        &mut self,
+        src: &Frame,
+        pix_fmt: &str,
+        color: RawColor,
+        out: &mut Vec<u8>,
+    ) -> std::result::Result<bool, AvErr> {
+        let (width, height) = (src.width(), src.height());
+        let Some(len) = picture::frame_len(pix_fmt, width, height) else {
+            return Ok(false);
+        };
+        let start = out.len();
+        out.reserve(len + WRITE_SLACK);
+        // The spare capacity after `start`, which is at least `len` bytes.
+        let base = out.spare_capacity_mut().as_mut_ptr() as *mut u8;
+        if !self.point_view(pix_fmt, width, height, color, base, len) {
+            return Ok(false);
+        }
+        // SAFETY: a live context and two live frames; the view's planes lie
+        // inside the vector's spare capacity, which nothing else touches
+        // until the call returns.
+        let ret = unsafe { (self.lib.f.sws_scale_frame)(self.ptr, self.view.ptr, src.ptr) };
+        let in_place = self.view.get().data[0] == base;
+        self.release_view();
         if ret < 0 {
             return Err(self.lib.err(ret));
         }
-        Ok(())
+        if !in_place {
+            return Err(AvErr {
+                code: 0,
+                why: "libswscale wrote the picture somewhere other than the buffer it was                       handed"
+                    .to_string(),
+            });
+        }
+        // SAFETY: libswscale wrote every row of every plane, and the planes
+        // are packed with no gaps, so all `len` bytes after `start` are
+        // initialised.
+        unsafe { out.set_len(start + len) };
+        Ok(true)
+    }
+
+    /// Converts a packed `pix_fmt` picture, read in place from `data`, into
+    /// `dst`, which is allocated (`Frame::set_video`, then `Frame::alloc`)
+    /// in the format, geometry and colour wanted. False, with nothing
+    /// written, when `data` is not one packed picture of that size.
+    pub fn scale_from_packed(
+        &mut self,
+        dst: &mut Frame,
+        pix_fmt: &str,
+        width: u32,
+        height: u32,
+        color: RawColor,
+        data: &[u8],
+    ) -> std::result::Result<bool, AvErr> {
+        // libswscale only reads its source, so the view's pointers being
+        // mutable is the struct's type, not a licence to write.
+        let base = data.as_ptr() as *mut u8;
+        if !self.point_view(pix_fmt, width, height, color, base, data.len()) {
+            return Ok(false);
+        }
+        // SAFETY: a live context and two live frames; `data` outlives the
+        // call and is only read.
+        let ret = unsafe { (self.lib.f.sws_scale_frame)(self.ptr, dst.ptr, self.view.ptr) };
+        self.release_view();
+        if ret < 0 {
+            return Err(self.lib.err(ret));
+        }
+        Ok(true)
     }
 }
 

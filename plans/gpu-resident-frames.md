@@ -536,6 +536,56 @@ Acceptance: the raw pipe is gone from a region that declares coded edges;
 copies per frame on that path at most four (decode output, fetch, lift,
 encode input).
 
+**Shipped (2026-10-11, on this branch):** the shim
+(`sidecar/runtime/src/av/`, `-av-runtime`, `--av-info`), the `decode` and
+`encode` host nodes with a port feed that arrives coded
+(`sidecar/ffrwd-wasm/src/av_nodes.rs`, `feeds.rs`), the compiler's
+partition over `SET ffrwd.edges = 'coded'` (`cli/ffrwd/av.py`,
+`processes.py`, `functions.py`, `lower.py`), the wheel packaging
+(`sidecar/ffrwd-wasm/fetch_av.py`, `av-pins.json`, the release workflow),
+the builds repository github.com/imbcmdth/ffrwd-av, and the docs
+(`sidecar/AV-EDGE.md`, `NODE-CLI.md`, `docs/dialect.md`, recipe 155).
+Recipe 155 ran on the owner's x86_64 machine: 60 h264 frames copied in,
+decoded in the sidecar, inverted, encoded by NVENC, copied into an mp4,
+timestamps intact.
+
+What was learned, for the waves after:
+
+- The pin is FFmpeg 9.0 (avutil 61, swresample 7, avcodec 63, swscale 10),
+  and libswscale is bundled: the decoder's native format and the wire's
+  differ for everything but yuv420p, and the encoder's input likewise.
+  The shim converts straight between the wire's packed buffer and the
+  codec's frame, so a format change costs no pass of its own.
+- The builds carry no VA-API: libavutil links libva at load time when it
+  is enabled, and a wheel cannot assume libva on the machine. Vulkan is
+  opened at run time and covers NVIDIA on Linux; the native av1 decoder
+  decodes only through a device, so there is no software AV1. The
+  musl and macOS archives carry software codecs and VideoToolbox.
+- The wire's own table names h264, hevc and av1; every other codec
+  travels under ffmpeg's riff tag and the shim maps the tag
+  (`av/fourcc.rs`). `encode` codes in `pix_fmt` else the encoder's first
+  format, so lossless ffv1 over rgba wants `pix_fmt=bgra`.
+- The declaration is per function (`SET ffrwd.edges = 'coded'`), and the
+  partition is a pass over the region's edges after the regions are built
+  (`_code_edges`), for old-world and node-world regions alike; the coded
+  input of a node region carries no colour pad, since the decoder has the
+  stream's. Wave 3's `memory` field replaces the clause.
+- The consuming ffmpeg loses `-copyts` on a coded exit: the packets keep
+  the clock their input had, and the region's decoder reads them as they
+  arrived. The hosted encoder's delay counts in the region's lookahead, but
+  `encoder_delay`'s table has no entry for a hosted encoder yet, so today
+  it counts zero.
+- The decode node's output header is settled before the first frame, so
+  its colour is what NUT carries (range and matrix); primaries and
+  transfer are unknown until `convert` reads them off the codec in wave 3.
+- `hw=auto` engaged d3d11va on the owner's machine with bytes identical to
+  the software decode; session caps were not measured, only the engaged
+  device is reported, so the compiler's capacity model still has no
+  numbers from this wave.
+- `av-pins.json` is empty until the builds repository's first tagged
+  release; a wheel platform without a pin ships without codecs and the
+  sidecar refuses `decode` and `encode` naming the directory it looked in.
+
 ### Wave 3: GPU frames
 
 Unblocked by the experiment; the first thing it buys is the output path,

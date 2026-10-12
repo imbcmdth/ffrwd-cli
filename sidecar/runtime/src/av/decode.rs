@@ -80,7 +80,6 @@ pub struct Decoder {
     format: Option<DecodedFormat>,
     frame: Frame,
     host: Frame,
-    out: Frame,
     packet: Packet,
     scaler: Option<Scaler>,
     last: Option<(i64, Option<i64>)>,
@@ -228,7 +227,6 @@ impl Decoder {
             format: None,
             frame: Frame::new(lib).map_err(call("av_frame_alloc", codec))?,
             host: Frame::new(lib).map_err(call("av_frame_alloc", codec))?,
-            out: Frame::new(lib).map_err(call("av_frame_alloc", codec))?,
             packet: Packet::new(lib).map_err(call("av_packet_alloc", codec))?,
             scaler: None,
             last: None,
@@ -339,7 +337,6 @@ impl Decoder {
             want_fmt,
             frame,
             host,
-            out,
             scaler,
             format,
             last,
@@ -371,25 +368,24 @@ impl Decoder {
             });
         }
 
-        let mut data = Vec::with_capacity(picture::frame_len(want, width, height).unwrap_or(0));
+        // One pass over the picture either way: copied out row by row where
+        // it is already the wanted format, else converted by libswscale
+        // straight into the packed vector.
+        let mut data = Vec::new();
         let packed = if source.format() == *want_fmt {
+            data.reserve_exact(picture::frame_len(want, width, height).unwrap_or(0));
             source.pack(want, &mut data)
         } else {
             let mut color = source.color();
             if picture::is_rgb(want) {
                 color = color.as_rgb();
             }
-            out.set_video(width, height, *want_fmt);
-            out.set_color(color);
             if scaler.is_none() {
                 *scaler = Some(Scaler::new(lib).map_err(call("sws_alloc_context", codec))?);
             }
             let sws = scaler.as_mut().expect("set just above");
-            sws.scale(out, source)
-                .map_err(call("sws_scale_frame", codec))?;
-            let packed = out.pack(want, &mut data);
-            out.unref();
-            packed
+            sws.scale_into_packed(source, want, color, &mut data)
+                .map_err(call("sws_scale_frame", codec))?
         };
         if !packed {
             return Err(Error::Call {
