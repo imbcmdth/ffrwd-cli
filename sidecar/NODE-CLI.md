@@ -178,10 +178,12 @@ of the host's own at `init`, in the port's format: the size and colour of
 the input it follows (`accepts.like`, or the clock input), in the first
 pixel or sample format the port accepts. The host listens on the port
 from the moment the run starts, and whatever connects and writes a NUT of
-raw video and PCM is the input's source for as long as it stays: its
-picture is conformed to that format on the way in (rgba and yuv420p, at
-any size), its sound to the port's sample format (s16 or f32; another rate
-or channel count is refused by name and the pictures are kept). A group of
+video and PCM is the input's source for as long as it stays: its picture
+is conformed to that format on the way in (rgba and yuv420p, at any size;
+a coded picture under a tag the sidecar's libavcodec knows, h264 say, is
+decoded in software first, see `AV-EDGE.md`), its sound to the port's
+sample format (s16 or f32; another rate or channel count is refused by
+name and the pictures are kept). A group of
 hold inputs (`hold.group`) shares one listener and one connection, its
 picture to the video port and its sound to the audio port.
 

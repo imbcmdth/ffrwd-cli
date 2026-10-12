@@ -20,7 +20,8 @@ libavcodec is loaded at run time, never linked. The sidecar loads
 in that order, from one directory. `libswscale` converts the decoder's
 native format to the wire's and the wire's to the encoder's; there is no
 `libavformat`, since the sidecar carries NUT itself and ffmpeg keeps every
-container. A run that holds neither node never loads any of it.
+container. A run that holds neither node, and serves no port feed whose
+picture arrives coded, never loads any of it.
 
 ## The argv
 
@@ -85,9 +86,11 @@ A library of another major is refused by version:
 
     libavcodec is version 62.3.100, and this build demands major 63
 
-A decoder or encoder the build does not have is refused by name, listing
-what the build has. An encoder option the encoder does not take is refused
-naming the option and the encoder.
+A decoder or encoder the build does not have is refused by name, pointing
+at `--av-info` for what the build has. An encoder option the encoder does
+not take is refused naming the option and the encoder. `encode` codes in
+the format `pix_fmt` names, else the encoder's first; an rgba picture
+into `ffv1` keeps every bit only with `pix_fmt=bgra`.
 
 ## Hardware
 
