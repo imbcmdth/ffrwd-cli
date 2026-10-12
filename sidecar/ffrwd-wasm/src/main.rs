@@ -1310,6 +1310,7 @@ fn open_input(path: &InputPath) -> Result<InputReader> {
 /// How big a pipe the run reads or writes is asked to be: the most Linux
 /// allows an ordinary process by default, so a frame's worth of bytes
 /// crosses in fewer reads and writes.
+#[cfg(target_os = "linux")]
 const PIPE_BUFFER: u32 = 1 << 20;
 
 /// Asks Linux for a `PIPE_BUFFER` buffer on `fd`, no more than
