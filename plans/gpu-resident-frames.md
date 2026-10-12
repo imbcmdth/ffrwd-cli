@@ -1300,6 +1300,172 @@ time with no filter at all, so the gap is the decode-and-encode path
 through the network, which wave 0's table already showed at 235 fps, not
 the filter.
 
+**The benchmark run (2026-10-12, owner's machine).** Recipe 160 is the
+end-to-end query: a 4K60 h264 programme and two 1080p60 h264 pictures in
+picture decoded on the device, composited by blitz's `compose` with
+`renderer => 'gpu'`, the composite run through `depth_gpu.wasm` with
+`memory => 'gpu'`, the depth map drawn into a corner of the composite by a
+second `compose`, and the result encoded by `h264_d3d12va` into an mp4. It
+compiled to one region as written: the three inputs are pads of the
+sidecar, not port feeds, each read as its packets and decoded with
+`d3d12va` on the shared device; both `compose` calls and `depth_gpu` are in
+the region, `encode` is at its exit, and every ffmpeg around it writes
+`-c:v copy`. The composite is read by `depth_gpu` and by the second
+`compose`, and stays one node. Nothing in the compiler, blitz's shape or
+depth's ports had to change for that. The cookbook declares `compose` from
+a blitz checkout beside ffrwd-cli rather than calling
+`ffrwd.blitz.compose`, since a linked or installed package's module path
+is the machine's own and no pin could hold it; the exec tier skips the
+recipe where that module is not built, as it does for any missing module.
+The runs below call `ffrwd.blitz.compose` through `ffrwd link`, which
+compiles to the same graph.
+
+The run (`ffrwd run --profile`, 5 s inputs): 300 frames of h264 Main,
+3840x2160, yuv420p, 60 fps. Frame 120 shows testsrc2's colour bars and
+moving line over the whole frame, testsrc's bars, circle and counter in a
+picture at top left, the mandelbrot at top right, and at bottom right a
+grey depth map of the composite in which the mandelbrot picture stands out
+as the nearest shape. The inset is the depth of its own frame: against
+`depth_gpu` run on the composite alone, frame N's inset is 47 dB from map
+N and 32 to 39 dB from maps N-1 and N+1. The profile row counts no
+`upload`, `download` or `fetch` bytes; `read` and `write` are the packets.
+stderr: `[av] decode h264: d3d12va, on the host's device` and `[gpu]
+decode h264: d3d12va, frames wrapped` for each input, `[gpu] convert nv12
+... to rgba` once per size, `[nn] depth: input from the pool, bound on
+DIRECTML` and `output predicted_depth to a texture, bound on DIRECTML`
+(the provider walk settles on DirectML here), `[av] encode h264_d3d12va:
+3840x2160 nv12, from the device`.
+
+Found and fixed on the way:
+
+- A self-clocked node (`decode`, `encode`, `filter`, a packet module) was
+  handed everything that had arrived in one call, and a file or an ffmpeg
+  copying packets delivers the whole input before the first call returns.
+  So `decode` decoded every picture before `encode` saw the first, the two
+  ran one after the other, and the decoder held every picture on the
+  device at once. A call now takes one picture or packet an input, and the
+  last call waits until it empties the queue (`tick.rs`,
+  `ARRIVALS_PER_CALL`).
+- `h264_d3d12va` and `hevc_d3d12va` keep 16 pictures in flight unless
+  `async_depth` is given (`av/encode.rs`). Each picture reaches them
+  through a copy on the direct queue, and at libavcodec's default of 2,
+  with the batching fixed, the chain still ran at two thirds of ffmpeg's
+  rate; at 16 it is within 16% at 1080p and 9% at 4K (table (e)). ffmpeg's
+  own command line gains nothing past 2.
+- A coded port feed into an input held on the GPU was decoded in software
+  and uploaded. It is now decoded with `d3d12va` on the shared device, as
+  `decode` is, and conformed there (`feeds.rs`). A lateral feeding such a
+  port copies its source's packets onto it (the compiler's
+  `connection.coded`), so an h264 ad by lateral no longer crosses host
+  memory. Elsewhere it is still decoded in software and uploaded once,
+  8.3 MB a 1080p rgba picture.
+- A port held on the GPU on a machine with no device was a run-time
+  failure at the first upload. The host now hands such a port its frames
+  in host memory and says so once (`node_graph.rs`), which is what lets
+  blitz default to `renderer => 'auto'`.
+
+Measured on the quiet machine (nothing else running, checked with
+`tasklist` and `nvidia-smi` before each run), release builds, the
+sidecar at its default workers. Frames a second are the 480 frames
+between a 2 s and a 10 s run of the same query over the difference of
+their wall times, so start-up (4.4 s for `compose` alone, 6 s with the
+model) is left out; the median of three. Per stage is the profile row of
+the 10 s run, per frame; `process` is summed over every node and worker.
+Inputs: lavfi testsrc2 at 4K60 (or 1080p60) as the programme, testsrc and
+a mandelbrot at 1080p60 as the pictures in picture, all h264 with
+B-frames from libx264 veryfast.
+
+(a) and (b), the full chain at 4K, recipe 160's query:
+
+| path | fps | `process` a frame | `convert` a frame | `fetch` a frame | `upload`, `download` |
+|---|---|---|---|---|---|
+| GPU: `d3d12va`, blitz `gpu`, `depth_gpu` `memory => 'gpu'` on DirectML, `h264_d3d12va` | 90.6 (93.1, 90.4, 88.6) | 39.9 ms | 0.73 ms | 0 | 0 |
+| CPU: ffmpeg decodes, blitz `cpu`, host `depth` on DirectML, `h264_nvenc` in ffmpeg | 12.3 (12.3, 12.3, 12.2) | 320 ms | - | 149 MB | 0 |
+
+On the CPU path the pipes carry 50 MB a frame in and 33 MB out, and the
+modules fetch 149 MB and emit 100 MB a frame.
+
+(c), blitz alone (the recipe's first `compose`), GPU texture path against
+the CPU path:
+
+| output | path | fps | `process` a frame | bytes to or from the host a frame |
+|---|---|---|---|---|
+| 1080p | GPU, `h264_d3d12va` | 266 (266, 272, 262) | 12.2 ms | 0 |
+| 1080p | GPU, `h264_nvenc` (one read back) | 147 (144, 146, 147) | 16.6 ms | 8.3 MB down, 3.3 ms |
+| 1080p | CPU, `h264_nvenc` in ffmpeg | 54 (53, 54, 55) | 60.1 ms | 24.9 MB fetched |
+| 4K | GPU, `h264_d3d12va` | 159 (155, 170, 159) | 21.8 ms | 0 |
+| 4K | GPU, `h264_nvenc` (one read back) | 39 (39, 39, 38) | 41.9 ms | 33.2 MB down, 11.8 ms |
+| 4K | CPU, `h264_nvenc` in ffmpeg | 23 (23, 23, 22) | 95.3 ms | 49.8 MB fetched |
+
+The texture path wins at both sizes, read back or not, so blitz's
+`renderer` now defaults to `'auto'` (gpu-compose branch; its README says
+why with these numbers). The read back is what a 4K frame costs most:
+it takes the GPU path from 159 to 39 frames a second.
+
+(d), blitz's `v` fed yuv420p against rgba, the same query:
+
+| path | first format | fps | `process` a frame | `fetch` a frame |
+|---|---|---|---|---|
+| CPU, 4K | rgba | 22.8 (22.8, 22.7, 23.9) | 95.1 ms | 49.8 MB |
+| CPU, 4K | yuv420p | 29.7 (30.0, 29.9, 29.6) | 131.6 ms | 18.7 MB |
+| GPU, 4K | rgba | 158.7 | 21.8 ms | 0 |
+| GPU, 4K | yuv420p | 149.6 (148.0, 151.5, 151.9) | 21.8 ms | 0 |
+
+At `-jobs 1` rgba was first because the module's own conversion is in its
+frame. At the default workers the module's conversion spreads over them,
+while ffmpeg's conversion of the 4K programme to rgba is one process that
+ran at 22 frames a second and held the whole run there. So blitz lists
+yuv420p first for `renderer => 'cpu'` and rgba first on the GPU, where the
+decoder's NV12 is made rgba in one pass.
+
+(e), decode to `h264_d3d12va` and nothing between, the sidecar alone
+(`ffrwd-wasm -f nut -i ... decode=format=yuv420p:hw=auto ... encode`)
+against ffmpeg's `-hwaccel d3d12va -hwaccel_output_format d3d12 ... -c:v
+h264_d3d12va -bf 0`; 1200 frames at 1080p60 and 600 at 4K60, the
+per-frame time from the full run less a 10-frame run, median of three:
+
+| chain | 1080p ms a frame | 4K ms a frame |
+|---|---|---|
+| sidecar before | 3.44 (291 fps) | 11.39 (88 fps) |
+| sidecar after | 1.84 (544 fps) | 5.97 (168 fps) |
+| ffmpeg | 1.59 (630 fps) | 5.50 (182 fps) |
+
+Where the time went, from timers in the two nodes: `decode` was handed
+the whole file's packets in one call and `encode` every picture in the
+next, so the two ran one after the other; and once they overlapped, the
+encoder's send took 2.2 ms a 1080p frame, waiting on each picture's copy
+at an async depth of 2, against 1.2 ms for the decoder's. The first fix
+brought 1080p to 2.5 ms, the second to 1.8 ms. What remains, 0.25 ms at
+1080p and 0.5 ms at 4K, is not broken down; the sidecar copies each
+picture into one of the encoder's own on the device, which ffmpeg does
+not.
+
+(f), wave 4's routes for Depth Anything V2 small retaken on the quiet
+machine with this branch's build: `nn_frames` over 240 frames of h264
+decoded with `d3d12va`, the tensor 518x518 letterboxed, the median per
+frame past the first 10 of `frame-tensor` plus `compute`, plus on the
+bound routes the output bound to a texture and read back by the module;
+the median of three runs, each run's median in brackets:
+
+| input | CUDA, bound | CUDA, downloaded | DirectML, bound | DirectML, downloaded |
+|---|---|---|---|---|
+| 1080p | 28.1 ms (28.1, 28.2, 28.1) | 34.4 ms (34.4, 34.2, 34.6) | 28.0 ms (27.9, 28.0, 27.9) | 59.4 ms (59.2, 59.5, 59.4) |
+| 4K | 28.5 ms (28.5, 28.9, 28.5) | 34.9 ms (34.8, 34.9, 35.0) | 28.1 ms (28.0, 28.1, 28.1) | 59.2 ms (58.7, 59.5, 59.2) |
+
+Within a millisecond of wave 4's table on the bound routes and on CUDA
+downloaded, and 2 to 4 ms under its DirectML downloaded figures; the
+bound routes move no `download` bytes, the downloaded ones 3.2 MB a frame.
+DirectML's bound time is 18.6 ms in `compute` and 9.4 ms in the read
+back, as before, since its run returns before the device is done.
+
+What it means for 4K60: on the 4090 the whole chain, three decodes, two
+blitz renders, Depth Anything and the encode, runs at 1.5 times 4K60 with
+no frame byte in host memory, and blitz alone at 2.6 times. Depth
+Anything takes 28 ms an inference, so at 91 frames a second two to three
+instances of `depth_gpu`, a pure node, run at once on the sidecar's
+workers. The same query on the CPU path runs at 12. The L4, where the
+acceptance line also asks for real time, is not measured.
+
 ### Wave 4: inference on the GPU
 
 1. **The provider is per model.** `NN-EDGE.md` has every model a process
