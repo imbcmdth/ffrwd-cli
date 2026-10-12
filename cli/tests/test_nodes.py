@@ -480,7 +480,7 @@ def test_a_runner_names_its_own_sidecar_and_onnx_runtime_in_place_of_the_coordin
         "-nn-target",
         "cpu",
         "-nn-exclude",
-        "dml",
+        "m=directml",
         "-nn",
         "m=/p/m.onnx",
     ]
@@ -495,7 +495,7 @@ def test_a_runner_names_its_own_sidecar_and_onnx_runtime_in_place_of_the_coordin
             "-nn-target",
             "cuda",
             "-nn-exclude",
-            "dml",
+            "m=directml",
             "-nn",
             "m=/p/m.onnx",
         ]

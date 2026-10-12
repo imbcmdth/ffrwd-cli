@@ -831,9 +831,11 @@ carries on.
 
 The graph's own pin may also carry `not_on`, a list of execution
 providers - `cuda`, `directml`, `coreml` - the model's graph cannot
-run on, measured rather than guessed; `ffrwd compile` passes every
-bound model's `not_on` to the sidecar as `-nn-exclude`, narrowing the
-`gpu` walk before it starts. A model of several files carries it on the
+run on, measured rather than guessed; `ffrwd compile` passes each
+bound model's `not_on` to the sidecar as `-nn-exclude <name>=<provider>`,
+one pair per provider, so that model's session keeps off it while the
+others on the same process take the provider the `gpu` walk settles
+(`sidecar/NN-EDGE.md`). A model of several files carries it on the
 first entry only, the graph itself.
 
 A query calls into an installed package one of two ways, always

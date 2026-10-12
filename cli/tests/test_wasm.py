@@ -915,25 +915,31 @@ def test_invoke_of_a_non_nn_module_gets_no_nn_flags(
     assert calls == [["ffrwd-wasm", "--invoke", MODULE, "fn", "{}"]]
 
 
-def test_nn_args_renders_nn_exclude_as_the_sorted_union_of_every_models_not_on() -> None:
-    """Every model on one process shares the one provider walk, so one
-    model's pin narrows it for the whole process, not for its own binding."""
+def test_nn_args_renders_one_nn_exclude_pair_per_model_and_provider() -> None:
+    """Each model's pin narrows only that model's provider walk, so each
+    denied provider is written against the name the model is bound by,
+    sorted by name then provider, and a model with no pin adds nothing."""
     argv = wasm._nn_args(
         (
-            ModelBinding(name="detect", path="detect.onnx", not_on=("cuda", "directml")),
             ModelBinding(name="transcribe", path="transcribe.onnx", not_on=("directml",)),
+            ModelBinding(name="detect", path="detect.onnx", not_on=("directml", "cuda")),
+            ModelBinding(name="embed", path="embed.onnx"),
         ),
         (),
     )
     assert argv == [
         "-nn-exclude",
-        "cuda",
+        "detect=cuda",
         "-nn-exclude",
-        "directml",
+        "detect=directml",
+        "-nn-exclude",
+        "transcribe=directml",
+        "-nn",
+        "transcribe=transcribe.onnx",
         "-nn",
         "detect=detect.onnx",
         "-nn",
-        "transcribe=transcribe.onnx",
+        "embed=embed.onnx",
     ]
 
 

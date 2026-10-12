@@ -1084,8 +1084,8 @@ class ModelBinding:
 
     `not_on` is what the model's own pin denies -- the execution providers
     read off its manifest at compile time, empty for a model pinned with no
-    ``not_on`` or bound outside any package. The union of every binding's
-    `not_on` on one process becomes that process's ``-nn-exclude`` argv.
+    ``not_on`` or bound outside any package. Each provider in it becomes one
+    ``-nn-exclude <name>=<provider>`` on the process that binds the model.
     """
 
     name: str

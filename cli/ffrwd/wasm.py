@@ -1941,22 +1941,24 @@ def _packet_rows(module: str, text: str) -> tuple[dict[str, object], ...]:
 
 
 def _nn_args(models: Sequence[ModelBinding], runtime: Sequence[str]) -> list[str]:
-    """The ``-nn-runtime``/``-nn-target`` pair, ``-nn-exclude`` per denied provider,
-    then one ``-nn name=path`` per model.
+    """The ``-nn-runtime``/``-nn-target`` pair, one ``-nn-exclude
+    <name>=<provider>`` per provider a model denies, then one ``-nn
+    name=path`` per model.
 
     Shared by a sidecar process's argv and a compile-time :func:`invoke` of a
     module that runs one -- both bind a model the same way. `runtime` is
-    written only when there is at least one model to bind. ``-nn-exclude`` is
-    the union of every bound model's own ``not_on``, sorted: every model on
-    one process shares the one provider walk, so one model's pin narrows it
-    for the process, not for its own binding alone.
+    written only when there is at least one model to bind. Each model's own
+    ``not_on`` narrows only that model's provider walk, so ``-nn-exclude``
+    names the model by the same name its ``-nn`` binds, sorted by name then
+    provider. The bare ``<provider>`` spelling, which denies it to every
+    model, is never written.
     """
     argv: list[str] = []
     if models:
         argv += list(runtime)
-    excluded: set[str] = {provider for model in models for provider in model.not_on}
-    for provider in sorted(excluded):
-        argv += [_NN_EXCLUDE_FLAG, provider]
+    excluded = {(model.name, provider) for model in models for provider in model.not_on}
+    for name, provider in sorted(excluded):
+        argv += [_NN_EXCLUDE_FLAG, f"{name}={provider}"]
     for model in models:
         argv += [_NN_FLAG, f"{model.name}={model.path}"]
     return argv
@@ -2005,8 +2007,9 @@ def _argv(
     module table: the host loads them before anything is instantiated.
     `runtime` is what it takes to load them -- the fetched runtime directory
     and the target to run on -- and is empty for a printed command, whose
-    reader has their own machine's. ``-nn-exclude`` names a provider a bound
-    model's own pin denies, ahead of the ``-nn`` table the same way.
+    reader has their own machine's. ``-nn-exclude <name>=<provider>`` names a
+    provider a bound model's own pin denies to that model, ahead of the
+    ``-nn`` table the same way.
     `av_runtime` is the ``-av-runtime`` a region decoding or encoding itself
     is told, and is empty for a printed command for the same reason.
 
