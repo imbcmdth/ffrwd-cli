@@ -1665,3 +1665,76 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f n
 ```
 
 `[n10][n2]` is the map and the rows, in that order: a data pad last in an older module's chain is the rows it reads. The WHERE narrows the rows on their own port, before they are paired. `memory => 'gpu'` holds the frames on the device and paints the map there from the mask prototypes, which never cross to host memory where the model's session writes the device's; the run then needs a GPU adapter, and the default, `'host'`, does not. Since `segment_gpu.wasm` imports the device's interface, it is granted `-gpu` either way, and a sidecar built without GPU support refuses it, where it runs recipe 94's `segment.wasm`.
+
+## 160. Compose and infer on the GPU, from packets to packets
+
+A 4K programme and two pictures in picture are composited by ffrwd/blitz's `compose` on the GPU, the composite is run through Depth Anything V2 on the GPU, and a second `compose` draws the depth map into a corner of the composite before `h264_d3d12va` encodes it. Every call holds its pictures on the sidecar's device, so the whole query is one region: the three ffmpegs in front copy packets onto the pipes, the sidecar decodes them on the device, and the ffmpeg behind copies packets into the file:
+
+```pgsql
+CREATE FUNCTION compose(v video_stream, inputs video_stream[] DEFAULT NULL,
+                        html text DEFAULT '', lead number DEFAULT 0.3,
+                        renderer text DEFAULT 'cpu')
+RETURNS video_stream
+  AS '../../ffrwd-package-blitz/target/wasm32-wasip2/release/compose.wasm', 'compose'
+  LANGUAGE wasm;
+
+CREATE FUNCTION depth(v video_stream, memory text DEFAULT 'host') RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/depth_gpu.wasm', 'depth' LANGUAGE wasm;
+
+COPY (
+  WITH c AS (
+    SELECT compose(p.video[1], ARRAY[a.video[1], b.video[1]],
+                   html => '<style>body{margin:0}img{position:absolute;top:4%;width:30%}</style>' ||
+                           '<img src="ffrwd:0" style="top:0;width:100%;height:100%">' ||
+                           '<img src="ffrwd:1" style="left:4%"><img src="ffrwd:2" style="right:4%">',
+                   lead => 0, renderer => 'gpu') AS v
+    FROM input(:'programme') p, input(:'left') a, input(:'right') b)
+  SELECT compose(c.v, ARRAY[depth(c.v, memory => 'gpu')],
+                 html => '<style>body{margin:0}img{position:absolute}</style>' ||
+                         '<img src="ffrwd:0" style="width:100%;height:100%">' ||
+                         '<img src="ffrwd:1" style="right:4%;bottom:4%;width:30%">',
+                 lead => 0, renderer => 'gpu')
+  FROM c
+) TO :'dest' WITH (video_codec 'h264_d3d12va', video_bitrate '40M')
+```
+
+```
+$ ffrwd compile -f query.sql -v programme=tests/fixtures/testsrc.mp4 -v left=tests/fixtures/smptebars.mp4 -v right=tests/fixtures/av.mp4 -v dest=composed.mp4
+# named pipes: sidecar0 reads ffmpeg1, ffmpeg2, ffmpeg3
+1. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
+  copy composed.mp4
+2. ffmpeg: ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -f nut \
+  '<named pipe ffmpeg1-sidecar0 src:p:v:0 write>'
+3. ffmpeg: ffmpeg -i tests/fixtures/smptebars.mp4 -map 0:v:0 -c:0 copy -f nut \
+  '<named pipe ffmpeg2-sidecar0 src:a:v:0 write>'
+4. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 copy -f nut \
+  '<named pipe ffmpeg3-sidecar0 src:b:v:0 write>'
+5. sidecar: ffrwd-wasm -f nut -i '<named pipe ffmpeg1-sidecar0 src:p:v:0 read>' -f nut \
+  -i '<named pipe ffmpeg2-sidecar0 src:a:v:0 read>' -f nut -i \
+  '<named pipe ffmpeg3-sidecar0 src:b:v:0 read>' -nn \
+  depth=../sidecar/modules/target/wasm32-wasip2/release/depth.onnx -gpu \
+  ../../ffrwd-package-blitz/target/wasm32-wasip2/release/compose.wasm -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/depth_gpu.wasm -m \
+  compose=../../ffrwd-package-blitz/target/wasm32-wasip2/release/compose.wasm -m \
+  depth_gpu=../sidecar/modules/target/wasm32-wasip2/release/depth_gpu.wasm \
+  -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];[1:v]decode=format=rgba:hw=auto[decode1];'\
+'[2:v]decode=format=rgba:hw=auto[decode2];'\
+'[v=decode0][inputs=decode1][inputs=decode2]compose=html=<style>body{margin\\:0}img{position\\:absolute\;'\
+'top\\:4%\;width\\:30%}</style><img\ src\\="ffrwd\\:0"\ style\\="top\\:0\;'\
+'width\\:100%\;'\
+'height\\:100%"><img\ src\\="ffrwd\\:1"\ style\\="left\\:4%"><img\ src\\="ffrwd\\:2"\ style\\="right\\:4%">:lead=0:renderer=gpu[video=n1];'\
+'[v=n1]depth_gpu=memory=gpu[out=n2];'\
+'[v=n1][inputs=n2]compose=html=<style>body{margin\\:0}img{position\\:absolute}</style><img\ src\\="ffrwd\\:0"\ style\\="width\\:100%\;'\
+'height\\:100%"><img\ src\\="ffrwd\\:1"\ style\\="right\\:4%\;bottom\\:4%\;'\
+'width\\:30%">:lead=0:renderer=gpu[video=n3];[n3]encode=codec=h264_d3d12va:b=40M[out0]' \
+  -bound \
+  'compose=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"inputs",'\
+'"streams":[{"rate":{"num":15,"den":1}},{"rate":{"num":15,"den":1}}]}]' -bound \
+  'depth_gpu=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
+  'compose=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"inputs",'\
+'"streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut pipe:1
+# this listing is not a shell command -- run the plan with `ffrwd run`
+```
+
+`compose` is blitz's own build, declared from a checkout of ffrwd-package-blitz beside this one, so the command names no path that only one machine has; a project that installs or links the package calls `ffrwd.blitz.compose` with the same arguments and reaches the same module. `renderer => 'gpu'` and `memory => 'gpu'` hold each call's pictures on the device, so the region takes each input's packets and decodes them there, as recipe 157's does. `c.v` is read twice, by `depth` and by the second `compose`, and is one node. The second `compose` holds the depth map as one of its `inputs` with `lead => 0`, so the map of frame N is drawn on frame N. The run needs a D3D12 adapter, which the decoder, both renderers, the model's session and the encoder share.
