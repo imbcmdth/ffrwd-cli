@@ -2055,7 +2055,7 @@ impl gpu_ext::ffrwd::gpu::nn::Host for Host {
         };
         let yuv = Yuv {
             matrix: match format.color.map(|c| c.space) {
-                Some("bt470bg" | "smpte170m" | "bt601") => Matrix::Bt601,
+                Some("bt470bg" | "smpte170m") => Matrix::Bt601,
                 _ => Matrix::Bt709,
             },
             full_range: format.color.is_some_and(|c| c.range == "pc"),

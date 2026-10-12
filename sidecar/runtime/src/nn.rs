@@ -809,10 +809,8 @@ pub fn configure(config: &Config) -> Result<()> {
     report_verdict(&dir, config, &placements);
 
     let cuda_runtime = match provider {
-        Provider::Cuda => dlls::CUDA_DEPS
-            .first()
-            .and_then(|dep| dlls::locate(&dlls::search_dirs(&dir), dep.file))
-            .map(|found| found.join(dlls::CUDA_DEPS[0].file)),
+        Provider::Cuda => dlls::locate(&dlls::search_dirs(&dir), dlls::CUDA_RUNTIME)
+            .map(|found| found.join(dlls::CUDA_RUNTIME)),
         _ => None,
     };
     let placed = placements

@@ -44,13 +44,20 @@ pub struct CudaDep {
     pub family: &'static str,
 }
 
+/// The CUDA runtime the CUDA provider links against, which the host also
+/// loads to import the pool's memory into CUDA.
+#[cfg(windows)]
+pub const CUDA_RUNTIME: &str = "cudart64_12.dll";
+#[cfg(not(windows))]
+pub const CUDA_RUNTIME: &str = "libcudart.so.12";
+
 /// What the CUDA provider links against. These belong to the machine, like
 /// the driver: a CUDA 12 runtime and cuDNN 9 are prerequisites, not something
 /// the sidecar carries.
 #[cfg(windows)]
 pub const CUDA_DEPS: &[CudaDep] = &[
     CudaDep {
-        file: "cudart64_12.dll",
+        file: CUDA_RUNTIME,
         family: "cudart64_",
     },
     CudaDep {
@@ -73,7 +80,7 @@ pub const CUDA_DEPS: &[CudaDep] = &[
 #[cfg(not(windows))]
 pub const CUDA_DEPS: &[CudaDep] = &[
     CudaDep {
-        file: "libcudart.so.12",
+        file: CUDA_RUNTIME,
         family: "libcudart.so.",
     },
     CudaDep {

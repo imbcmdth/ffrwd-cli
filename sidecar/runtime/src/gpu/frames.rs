@@ -23,6 +23,8 @@
 //! for an input that follows another's. Each is made by one conversion
 //! (`super::convert`) the first time anything asks and kept with the frame,
 //! so every reader asking for the same thing shares it.
+//! A model reads a tensor, and [`GpuFrame::tensor`] makes one of the
+//! planes as held, kept the same way.
 //!
 //! Every texture is on the one device [`super::shared_device`] opens, which
 //! is the device every module's `wasi:webgpu` answers, so a module reads a
