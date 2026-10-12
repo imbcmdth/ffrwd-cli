@@ -1463,6 +1463,10 @@ input's `-i`, in the order written.
   variant takes), and runs the rest on the CPU as one segment between one
   `hwdownload` and one `hwupload_cuda`. A software encoder, a module or a
   second file reading the same picture gets the one download it needs.
+  `hwaccel => 'vulkan'` to a `_vulkan` encoder is the same path with the
+  `_vulkan` filters (`scale`, `overlay`, `transpose`, `hflip`, `vflip`,
+  `bwdif`) and `hwupload`, and a picture that came down for a CPU segment
+  goes up again before the encoder, which reads only the card's frames.
   Recipe [156](examples.md#156-stay-on-the-card-from-decode-to-encode).
 
 `format` is the option that changes what the path means: with a demuxer

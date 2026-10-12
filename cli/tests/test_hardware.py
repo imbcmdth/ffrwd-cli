@@ -166,3 +166,34 @@ def test_nothing_changes_without_a_hardware_encoder_or_a_hwaccel_or_the_filters(
     without = _reference()
     without._filters = {k: v for k, v in without._filters.items() if not k.endswith("_cuda")}
     assert keep_on_the_card(card, without) is card
+
+
+def test_the_vulkan_family_sends_a_picture_up_again_before_its_encoder() -> None:
+    """The flips have Vulkan variants and ride the card; `pad` has none, so
+    the picture comes down for it and, the encoder reading only the card's
+    frames, goes up again ahead of the file."""
+    g = _graph(
+        [
+            _node("n1", "hflip", {}, ["src:f:v:0"]),
+            _node("n2", "scale", {"width": 1280, "height": -2}, ["n1"]),
+            _node("n3", "pad", {"width": 1920, "height": 1080}, ["n2"]),
+        ],
+        [_sink("out.mp4", ["n3"], "h264_vulkan")],
+        options={"f": {"hwaccel": "vulkan"}},
+    )
+    kept = keep_on_the_card(g, _reference())
+    assert kept.input_options == {"f": {"hwaccel": "vulkan", "hwaccel_output_format": "vulkan"}}
+    assert _filters(kept) == [
+        ("n1", "hflip_vulkan", {}, ["src:f:v:0"]),
+        ("n2", "scale_vulkan", {"w": 1280, "h": -2}, ["n1"]),
+        ("n2_hwdownload", "hwdownload", {}, ["n2"]),
+        ("n3", "pad", {"width": 1920, "height": 1080}, ["n2_hwdownload"]),
+        ("n3_hwupload", "hwupload", {}, ["n3"]),
+    ]
+    assert kept.sinks[0].outputs[0].ref == "n3_hwupload"
+    # The families do not mix: a CUDA decode reaching a Vulkan encoder is
+    # left as it was lowered.
+    mixed = _graph(
+        [_node("n1", "hflip", {}, ["src:f:v:0"])], [_sink("out.mp4", ["n1"], "h264_vulkan")]
+    )
+    assert keep_on_the_card(mixed, _reference()) is mixed

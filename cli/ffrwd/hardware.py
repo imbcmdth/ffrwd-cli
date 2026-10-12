@@ -20,46 +20,90 @@ so is the whole command when the build's ffmpeg is known and has no
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from .ir import FrameRef, Graph, Node, SinkUnit, is_src, src_parts
 from .registry import Registry
 
 __all__ = ["keep_on_the_card"]
 
-# The hwaccel names that decode onto a CUDA device.
-_HWACCELS = frozenset({"cuda", "cuvid", "nvdec"})
-# What the input is told so decoded frames stay on the device.
-_OUTPUT_FORMAT = "cuda"
-# The encoder family that takes frames on the device.
-_ENCODER_SUFFIX = "_nvenc"
-
-# The filters a `_cuda` variant stands in for, with the options the variant
-# takes under the name the CPU filter spells them. A call with an option
-# outside this list stays on the CPU: the variant does not take it.
-_VARIANTS: Mapping[str, Mapping[str, str]] = {
-    "scale": {
-        "width": "w",
-        "height": "h",
-        "w": "w",
-        "h": "h",
-        "force_original_aspect_ratio": "force_original_aspect_ratio",
-        "force_divisible_by": "force_divisible_by",
-    },
-    "overlay": {
-        name: name
-        for name in ("x", "y", "eof_action", "eval", "shortest", "repeatlast", "ts_sync_mode")
-    },
-    "pad": {name: name for name in ("width", "height", "x", "y", "color", "eval", "aspect")},
-    "transpose": {name: name for name in ("dir", "passthrough")},
-    "yadif": {name: name for name in ("mode", "parity", "deint")},
-    "bwdif": {name: name for name in ("mode", "parity", "deint")},
-}
-
 # Filters that read frames wherever they are and hand them on there: they
 # touch timing, counts and pads, never pixels.
 _PASSTHROUGH = frozenset(
     {"split", "null", "copy", "setpts", "settb", "trim", "fps", "select", "setsar", "setdar"}
+)
+
+
+@dataclass(frozen=True)
+class _Family:
+    """One device family: how its decoder is asked for, what keeps frames
+    on it, which encoders read them there, and which filters run on it."""
+
+    # The hwaccel names that decode onto the device.
+    hwaccels: frozenset[str]
+    # What the input is told so decoded frames stay on the device.
+    output_format: str
+    # The encoders that read frames on the device, by name suffix.
+    encoder_suffix: str
+    # The filter variants' name suffix.
+    filter_suffix: str
+    # The filter that sends a frame up to the device.
+    upload: str
+    # Whether the encoder reads only frames on the device, so a picture that
+    # came down for a CPU segment goes up again before it.
+    encoder_needs_device: bool
+    # The filters a variant stands in for, with the options the variant takes
+    # under the name the CPU filter spells them. A call with an option
+    # outside this list stays on the CPU: the variant does not take it.
+    variants: Mapping[str, Mapping[str, str]]
+
+
+def _same(*names: str) -> dict[str, str]:
+    return {name: name for name in names}
+
+
+_FAMILIES: tuple[_Family, ...] = (
+    _Family(
+        hwaccels=frozenset({"cuda", "cuvid", "nvdec"}),
+        output_format="cuda",
+        encoder_suffix="_nvenc",
+        filter_suffix="_cuda",
+        upload="hwupload_cuda",
+        encoder_needs_device=False,
+        variants={
+            "scale": {
+                "width": "w",
+                "height": "h",
+                "w": "w",
+                "h": "h",
+                "force_original_aspect_ratio": "force_original_aspect_ratio",
+                "force_divisible_by": "force_divisible_by",
+            },
+            "overlay": _same(
+                "x", "y", "eof_action", "eval", "shortest", "repeatlast", "ts_sync_mode"
+            ),
+            "pad": _same("width", "height", "x", "y", "color", "eval", "aspect"),
+            "transpose": _same("dir", "passthrough"),
+            "yadif": _same("mode", "parity", "deint"),
+            "bwdif": _same("mode", "parity", "deint"),
+        },
+    ),
+    _Family(
+        hwaccels=frozenset({"vulkan"}),
+        output_format="vulkan",
+        encoder_suffix="_vulkan",
+        filter_suffix="_vulkan",
+        upload="hwupload",
+        encoder_needs_device=True,
+        variants={
+            "scale": {"width": "w", "height": "h", "w": "w", "h": "h"},
+            "overlay": _same("x", "y"),
+            "transpose": _same("dir", "passthrough"),
+            "hflip": {},
+            "vflip": {},
+            "bwdif": _same("mode", "parity", "deint"),
+        },
+    ),
 )
 
 
@@ -71,9 +115,15 @@ def keep_on_the_card(g: Graph, registry: Registry) -> Graph:
     nothing in it qualifies. Runs after the split pass, so every fan-out is
     a ``split`` node already, which rides on the card like any other.
     """
-    aliases = _aliases_on_the_card(g)
-    if not aliases or not _build_has_variants(registry):
-        return g
+    for family in _FAMILIES:
+        aliases = _aliases_on_the_card(g, family)
+        if aliases and _build_has_variants(registry, family):
+            return _kept(g, family, aliases)
+    return g
+
+
+def _kept(g: Graph, family: _Family, aliases: frozenset[str]) -> Graph:
+    """`g` with `aliases`' pictures kept on `family`'s device."""
 
     nodes: dict[str, Node] = {}
     # The refs whose frames sit on the device after the pass.
@@ -100,7 +150,7 @@ def keep_on_the_card(g: Graph, registry: Registry) -> Graph:
         node_id = f"{_slug(ref)}_hwupload"
         if node_id not in nodes:
             nodes[node_id] = Node(
-                id=node_id, filter="hwupload_cuda", args={}, inputs=[ref], outputs=["video"]
+                id=node_id, filter=family.upload, args={}, inputs=[ref], outputs=["video"]
             )
             resident.add(node_id)
         return node_id
@@ -108,7 +158,7 @@ def keep_on_the_card(g: Graph, registry: Registry) -> Graph:
     for node in g.nodes.values():
         on_card = [ref in resident for ref in node.inputs]
         lineage = [ref in resident or ref in descended for ref in node.inputs]
-        variant = _variant_of(node)
+        variant = _variant_of(node, family)
         if variant is not None and any(lineage):
             # On the card, every input sent up that is not there already.
             inputs = [
@@ -129,37 +179,44 @@ def keep_on_the_card(g: Graph, registry: Registry) -> Graph:
             if any(lineage):
                 _mark(node, descended)
 
+    def at_the_sink(unit: SinkUnit, ref: FrameRef) -> FrameRef:
+        """`ref` as `unit`'s encoder reads it: down for one that reads the
+        CPU's frames, up again for one that reads only the device's."""
+        if _takes_the_card(unit, family):
+            if family.encoder_needs_device and ref in descended:
+                return uploaded(ref)
+            return ref
+        return downloaded(ref) if ref in resident else ref
+
     sinks = [
         replace(
             unit,
-            outputs=[
-                replace(output, ref=downloaded(output.ref))
-                if output.ref in resident and not _takes_the_card(unit)
-                else output
-                for output in unit.outputs
-            ],
+            outputs=[replace(output, ref=at_the_sink(unit, output.ref)) for output in unit.outputs],
         )
         for unit in g.sinks
     ]
     options = {
-        alias: _with_output_format(values) if alias in aliases else dict(values)
+        alias: _with_output_format(values, family) if alias in aliases else dict(values)
         for alias, values in g.input_options.items()
     }
     return replace(g, nodes=nodes, sinks=sinks, input_options=options)
 
 
-def _aliases_on_the_card(g: Graph) -> frozenset[str]:
-    """The aliases decoded onto a CUDA device whose picture reaches an
-    ``_nvenc`` sink."""
+def _aliases_on_the_card(g: Graph, family: _Family) -> frozenset[str]:
+    """The aliases decoded onto `family`'s device whose picture reaches a
+    sink encoding on it."""
     decoded = {
         alias
         for alias, options in g.input_options.items()
-        if str(options.get("hwaccel", "")).lower() in _HWACCELS
+        if str(options.get("hwaccel", "")).lower() in family.hwaccels
     }
     if not decoded:
         return frozenset()
     wanted = {
-        output.ref for unit in g.sinks if _takes_the_card(unit) for output in unit.outputs
+        output.ref
+        for unit in g.sinks
+        if _takes_the_card(unit, family)
+        for output in unit.outputs
     }
     if not wanted:
         return frozenset()
@@ -208,16 +265,16 @@ def _video_refs(g: Graph, alias: str) -> set[FrameRef]:
     }
 
 
-def _takes_the_card(unit: SinkUnit) -> bool:
-    """Whether the unit's encoder reads frames on the device."""
+def _takes_the_card(unit: SinkUnit, family: _Family) -> bool:
+    """Whether the unit's encoder reads frames on `family`'s device."""
     codec = unit.options.get("video_codec")
-    return isinstance(codec, str) and codec.endswith(_ENCODER_SUFFIX)
+    return isinstance(codec, str) and codec.endswith(family.encoder_suffix)
 
 
-def _variant_of(node: Node) -> tuple[str, dict[str, object]] | None:
-    """The ``_cuda`` filter and args standing in for `node`, or None where
-    the build has none or the call names an option the variant lacks."""
-    spelled = _VARIANTS.get(node.filter)
+def _variant_of(node: Node, family: _Family) -> tuple[str, dict[str, object]] | None:
+    """`family`'s filter and args standing in for `node`, or None where
+    the family has none or the call names an option the variant lacks."""
+    spelled = family.variants.get(node.filter)
     if spelled is None:
         return None
     args: dict[str, object] = {}
@@ -226,16 +283,18 @@ def _variant_of(node: Node) -> tuple[str, dict[str, object]] | None:
         if renamed is None:
             return None
         args[renamed] = value
-    return f"{node.filter}_cuda", args
+    return f"{node.filter}{family.filter_suffix}", args
 
 
-def _build_has_variants(registry: Registry) -> bool:
-    """Whether the ffmpeg this compile sees has the ``_cuda`` filters: yes
+def _build_has_variants(registry: Registry, family: _Family) -> bool:
+    """Whether the ffmpeg this compile sees has `family`'s filters: yes
     where it is known to, and where no ffmpeg is known at all, since the
     command is then written for the reader's own."""
     if not registry.available():
         return True
-    return all(registry.get(f"{name}_cuda") is not None for name in _VARIANTS)
+    return all(
+        registry.get(f"{name}{family.filter_suffix}") is not None for name in family.variants
+    )
 
 
 def _mark(node: Node, into: set[FrameRef]) -> None:
@@ -248,7 +307,7 @@ def _slug(ref: FrameRef) -> str:
     return ref.replace(":", "_")
 
 
-def _with_output_format(options: Mapping[str, object]) -> dict[str, object]:
+def _with_output_format(options: Mapping[str, object], family: _Family) -> dict[str, object]:
     """`options` with ``hwaccel_output_format`` right after ``hwaccel``,
     unless the query set one itself."""
     if "hwaccel_output_format" in options:
@@ -257,5 +316,5 @@ def _with_output_format(options: Mapping[str, object]) -> dict[str, object]:
     for name, value in options.items():
         written[name] = value
         if name == "hwaccel":
-            written["hwaccel_output_format"] = _OUTPUT_FORMAT
+            written["hwaccel_output_format"] = family.output_format
     return written

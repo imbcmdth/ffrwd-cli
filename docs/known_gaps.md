@@ -59,13 +59,16 @@ from.
 
 ## Sharp edges
 
-- **The card path is CUDA's.** `hwaccel => 'cuda'` to an `_nvenc` encoder
-  keeps the picture on the card; `vulkan`, `vaapi`, `qsv` and `amf` are
-  decoded and encoded as asked, but every filter between runs on the CPU,
-  and a `_cuda` filter the compiler writes needs an ffmpeg built with
-  them, which a packaged build may lack. A `scale` with `flags` or a
+- **The card path is CUDA's and Vulkan's.** `hwaccel => 'cuda'` to an
+  `_nvenc` encoder, or `hwaccel => 'vulkan'` to a `_vulkan` one, keeps
+  the picture on the card; `vaapi`, `qsv` and `amf` are decoded and
+  encoded as asked, but every filter between runs on the CPU, and the
+  `_cuda` or `_vulkan` filters the compiler writes need an ffmpeg built
+  with them, which a packaged build may lack. A `scale` with `flags` or a
   colour option, or an `overlay` with `format` or `alpha`, has no variant
-  spelling and runs on the CPU, with the download and upload that costs.
+  spelling and runs on the CPU, with the download and upload that costs;
+  a Vulkan encoder reads only the card's frames, so a CPU segment ahead
+  of one ends with an upload.
 - **A packet filter's rows cost a second pass over the input.** The rows
   it reads are a file, and a file is finished before whatever reads it
   starts -- so a producer reading the same input the encoder reads runs
