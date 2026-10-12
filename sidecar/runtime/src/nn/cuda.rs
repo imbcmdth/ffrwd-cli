@@ -48,6 +48,9 @@ const MEMORY_D3D12_RESOURCE: c_int = 5;
 const MEMORY_DEDICATED: c_uint = 1;
 /// The handle type of a D3D12 sync object (4).
 const SEMAPHORE_D3D12: c_int = 4;
+/// `cudaStreamDefault`: a blocking stream, which the legacy default stream
+/// is ordered with.
+const STREAM_BLOCKING: c_uint = 0;
 /// `cudaStreamNonBlocking`.
 const STREAM_NON_BLOCKING: c_uint = 1;
 /// `cudaMemcpyDeviceToHost`.
@@ -259,12 +262,18 @@ impl Cuda {
 
     /// A stream of its own on the session device, which a session is built
     /// on so the waits and signals queued in it are ordered with its work.
+    ///
+    /// It is a blocking stream. ONNX Runtime's CUDA provider does some of a
+    /// run's copies on the legacy default stream rather than the session's,
+    /// and only a blocking stream orders that stream's work after a wait
+    /// queued in it: on a non-blocking one the copies read a bound input
+    /// before the pass that writes it has run.
     pub fn stream(&'static self) -> Result<CudaStream> {
         self.current()?;
         let mut stream: *mut c_void = std::ptr::null_mut();
         // SAFETY: a valid out pointer.
         self.check("cudaStreamCreateWithFlags", unsafe {
-            (self.fns.stream_create)(&mut stream, STREAM_NON_BLOCKING)
+            (self.fns.stream_create)(&mut stream, STREAM_BLOCKING)
         })?;
         Ok(CudaStream { cuda: self, stream })
     }
