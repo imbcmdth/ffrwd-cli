@@ -29,10 +29,6 @@ fn main() {
     let dir = PathBuf::from(dir);
 
     let paths: Vec<PathBuf> = FILES.iter().map(|f| dir.join(f)).collect();
-    for path in &paths {
-        println!("cargo::rerun-if-changed={}", path.display());
-    }
-
     let missing: Vec<&str> = FILES
         .iter()
         .zip(&paths)
@@ -40,6 +36,10 @@ fn main() {
         .map(|(name, _)| *name)
         .collect();
     if !missing.is_empty() {
+        // Cargo reruns a build script on every build while a path it watches
+        // does not exist, so with files missing it watches the directory,
+        // which changes when they are added.
+        println!("cargo::rerun-if-changed={}", dir.display());
         println!(
             "cargo::warning=transcribe is built without its model: {} missing from {}",
             missing.join(", "),
@@ -48,6 +48,9 @@ fn main() {
         return;
     }
 
+    for path in &paths {
+        println!("cargo::rerun-if-changed={}", path.display());
+    }
     for (name, path) in FILES.iter().zip(&paths) {
         // WEIGHTS, TOKENIZER, CONFIG, MELFILTERS.
         let key = name
