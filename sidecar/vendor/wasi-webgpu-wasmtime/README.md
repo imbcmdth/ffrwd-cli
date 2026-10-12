@@ -36,7 +36,10 @@ and C guests to [wasi-webgpu-headers](https://github.com/wasi-gfx/wasi-webgpu-he
 * Adapter requests try Vulkan, then Metal, then D3D12, then GL: on Windows
   the same GPU shows up under Vulkan and D3D12, and wgpu's D3D12 reports no
   subgroups unless it can load DXC. `WGPU_BACKEND` narrows the instance's
-  backends as wgpu reads it.
+  backends as wgpu reads it. A store granted the sidecar's own device is
+  answered with that device instead, which opens on D3D12 first on Windows;
+  wgpu-core is built with `static-dxc` on x86_64 MSVC, the one Windows
+  target DXC links into, so D3D12 has subgroups there.
 * Implemented where upstream had `todo!()` and PyroWave needs them: the
   pipeline constant and required limit records (ported from upstream's later
   crate), storage texture binding layouts, the WGSL language features, and

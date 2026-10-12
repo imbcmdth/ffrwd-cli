@@ -24,9 +24,11 @@ async-broadcast = "0.7"
 async-trait = "0.1"
 log = "0.4"
 
-# One backend set per platform. Windows carries Vulkan beside D3D12 because
-# wgpu's D3D12 backend reports no subgroups without a DXC it can load, and
-# compute modules (pyrowave) need subgroups; the host tries Vulkan first.
+# One backend set per platform. Windows carries Vulkan beside D3D12 for the
+# targets DXC cannot be linked into (aarch64, and the GNU toolchains): wgpu's
+# D3D12 backend reports no subgroups without DXC, and compute modules
+# (pyrowave) need subgroups. On x86_64 MSVC DXC is linked in (`static-dxc`),
+# so D3D12 has them.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies.wgpu-core]
 version = "29"
 features = ["wgsl", "vulkan"]
@@ -34,6 +36,13 @@ features = ["wgsl", "vulkan"]
 [target.'cfg(target_os = "windows")'.dependencies.wgpu-core]
 version = "29"
 features = ["wgsl", "vulkan", "dx12"]
+
+# DXC linked in where it can be: wgpu-hal links it for x86_64 MSVC only,
+# and asking for the feature anywhere else makes its default compiler
+# choice panic.
+[target.'cfg(all(target_os = "windows", target_env = "msvc", not(target_arch = "aarch64")))'.dependencies.wgpu-core]
+version = "29"
+features = ["wgsl", "vulkan", "dx12", "static-dxc"]
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies.wgpu-core]
 version = "29"
