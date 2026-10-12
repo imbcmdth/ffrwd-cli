@@ -1277,6 +1277,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nn-frames"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "nn-probe"
 version = "0.1.0"
 dependencies = [

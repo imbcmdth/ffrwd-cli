@@ -846,3 +846,414 @@ fn the_depth_of_field_chain_runs_and_keeps_every_frame() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Frames made into a model's input by the host (`ffrwd:gpu/nn`): nn_frames
+// asks for each frame as a tensor and runs a graph of each channel's mean
+// and largest value on it. The same frames give the same rows whichever
+// way the tensor was made: on the CPU from host memory, on the device and
+// read back, or on the device and bound to a CUDA session in place.
+
+/// Builds the nn-frames module, once per test binary.
+fn frames_module() -> PathBuf {
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let output = Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--target",
+                "wasm32-wasip2",
+                "-p",
+                "nn-frames",
+            ])
+            .current_dir(sidecar_root().join("modules"))
+            .output()
+            .expect("spawn cargo build for nn-frames");
+        assert!(
+            output.status.success(),
+            "building nn-frames failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+    sidecar_root().join("modules/target/wasm32-wasip2/release/nn_frames.wasm")
+}
+
+/// `channel-means.onnx`, or its NHWC twin.
+fn means_model(nhwc: bool) -> PathBuf {
+    sidecar_root().join(if nhwc {
+        "modules/nn-frames/model/channel-means-nhwc.onnx"
+    } else {
+        "modules/nn-frames/model/channel-means.onnx"
+    })
+}
+
+const MEANS_WIDTH: u32 = 64;
+const MEANS_HEIGHT: u32 = 48;
+const MEANS_FRAMES: usize = 4;
+
+/// A NUT file of `MEANS_FRAMES` yuv420p frames, each a different picture
+/// of ramps, so every channel's mean and largest value move.
+fn means_input(dir: &std::path::Path) -> PathBuf {
+    use ffrwd_wasm::nut::{Muxer, Stream, TimeBase};
+    let (w, h) = (MEANS_WIDTH as usize, MEANS_HEIGHT as usize);
+    let (cw, ch) = (w / 2, h / 2);
+    let stream = Stream::video(
+        "yuv420p",
+        MEANS_WIDTH,
+        MEANS_HEIGHT,
+        TimeBase { num: 1, den: 25 },
+    )
+    .expect("yuv420p is carried");
+    let path = dir.join("means.nut");
+    let mut wire = Vec::new();
+    {
+        let mut muxer = Muxer::new(&mut wire, &stream).expect("write NUT headers");
+        for k in 0..MEANS_FRAMES {
+            let mut frame = Vec::with_capacity(w * h + 2 * cw * ch);
+            for y in 0..h {
+                for x in 0..w {
+                    frame.push((16 + (x * 3 + y * 2 + k * 29) % 220) as u8);
+                }
+            }
+            for plane in 0..2 {
+                for y in 0..ch {
+                    for x in 0..cw {
+                        let ramp = if plane == 0 {
+                            x * 7 + k * 11
+                        } else {
+                            y * 9 + k * 5
+                        };
+                        frame.push((16 + ramp % 225) as u8);
+                    }
+                }
+            }
+            muxer.write_frame(k as i64, &frame).expect("write a frame");
+        }
+        muxer.finish().expect("finish the stream");
+    }
+    std::fs::write(&path, wire).expect("write the input");
+    path
+}
+
+/// One nn_frames run over `input`, its rows and its stderr. `params` are the
+/// module's after `model=means`.
+fn means_run(
+    runtime: &std::path::Path,
+    dir: &std::path::Path,
+    input: &std::path::Path,
+    target: &str,
+    nhwc: bool,
+    params: &str,
+    extra: &[&str],
+) -> (Vec<serde_json::Value>, String) {
+    let module = frames_module();
+    let module = module.to_string_lossy().to_string();
+    let rows = dir.join(format!(
+        "rows-{target}-{}.ndjson",
+        params.replace([':', '='], "_")
+    ));
+    let _ = std::fs::remove_file(&rows);
+    let mut args: Vec<String> = extra.iter().map(|a| a.to_string()).collect();
+    args.extend([
+        "-nn".to_string(),
+        format!("means={}", means_model(nhwc).display()),
+        "-nn-target".to_string(),
+        target.to_string(),
+        "-gpu".to_string(),
+        module.clone(),
+        "-f".to_string(),
+        "nut".to_string(),
+        "-i".to_string(),
+        input.display().to_string(),
+        "-m".to_string(),
+        format!("nn_frames={module}"),
+        "-filter_complex".to_string(),
+        format!("[v=0:v]nn_frames=model=means:{params}[@rows=r]"),
+        "-map".to_string(),
+        "[r]".to_string(),
+        "-f".to_string(),
+        "ndjson".to_string(),
+        rows.display().to_string(),
+    ]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run_with_runtime(runtime, &refs);
+    let message = stderr(&output);
+    assert!(
+        output.status.success() || message.contains("no GPU"),
+        "nn_frames ({target}, {params}) exited {:?}:\n{message}",
+        output.status.code()
+    );
+    let written = std::fs::read_to_string(&rows).unwrap_or_default();
+    let parsed = written
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a row is JSON"))
+        .collect();
+    (parsed, message)
+}
+
+/// Every output value of every row, in order.
+fn output_values(rows: &[serde_json::Value]) -> Vec<f64> {
+    rows.iter()
+        .flat_map(|row| {
+            ["mean", "max"].into_iter().flat_map(move |name| {
+                row["outputs"][name]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{name} is a list: {row}"))
+                    .iter()
+                    .map(|v| v.as_f64().expect("a number"))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect()
+}
+
+/// The largest difference between two runs' numbers.
+fn apart(a: &[serde_json::Value], b: &[serde_json::Value]) -> f64 {
+    output_values(a)
+        .iter()
+        .zip(&output_values(b))
+        .map(|(p, q)| (p - q).abs())
+        .fold(0f64, f64::max)
+}
+
+/// Asserts two runs' rows hold the same numbers within float rounding.
+fn assert_same_rows(a: &[serde_json::Value], b: &[serde_json::Value], what: &str) {
+    assert_eq!(a.len(), MEANS_FRAMES, "{what}: one row per frame: {a:?}");
+    assert_eq!(a.len(), b.len(), "{what}: as many rows");
+    let worst = apart(a, b);
+    assert!(
+        worst < 1e-4,
+        "{what}: apart by up to {worst}:\n{a:?}\n{b:?}"
+    );
+    assert!(
+        output_values(a).iter().all(|v| (0.0..=1.0).contains(v)),
+        "{what}: 0 to 1 in, 0 to 1 out: {a:?}"
+    );
+}
+
+/// The `download` stage's bytes in the run's profile row.
+fn downloaded_bytes(message: &str) -> u64 {
+    let row: serde_json::Value = message
+        .lines()
+        .filter_map(|line| line.strip_prefix("ffrwd:row "))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a row is JSON"))
+        .find(|row| row["kind"] == "profile")
+        .unwrap_or_else(|| panic!("no profile row on stderr:\n{message}"));
+    row["download"]["bytes"].as_u64().expect("download bytes")
+}
+
+/// A scratch directory of the test's own.
+fn means_dir(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ffrwd-nn-{test}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory to work in");
+    dir
+}
+
+#[test]
+fn a_frame_made_into_a_tensor_gives_the_same_rows_on_every_route() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("nn_frames cannot run a model without a runtime");
+        return;
+    };
+    let dir = means_dir("routes");
+    let input = means_input(&dir);
+    let tensor = u64::from(MEANS_WIDTH / 2 * MEANS_HEIGHT / 2 * 3 * 4);
+    let size = format!("width={}:height={}", MEANS_WIDTH / 2, MEANS_HEIGHT / 2);
+    let profile = ["-profile"];
+
+    // On the CPU, from host memory: the reference.
+    let (host, message) = means_run(
+        &runtime,
+        &dir,
+        &input,
+        "cpu",
+        false,
+        &format!("memory=host:{size}"),
+        &profile,
+    );
+    assert!(
+        message.contains("[nn] means: input in host memory, made on the CPU"),
+        "{message}"
+    );
+    assert_eq!(downloaded_bytes(&message), 0, "nothing is on the GPU");
+    assert_eq!(host.len(), MEANS_FRAMES, "{message}");
+
+    // On the device and read back, for a CPU session.
+    let (downloaded, message) = means_run(
+        &runtime,
+        &dir,
+        &input,
+        "cpu",
+        false,
+        &format!("memory=gpu:{size}"),
+        &profile,
+    );
+    if message.contains("no GPU") {
+        eprintln!("SKIPPED: the GPU routes. This machine has no GPU adapter.");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    assert!(
+        message.contains("[nn] means: input downloaded, CPU takes host memory"),
+        "{message}"
+    );
+    assert_same_rows(&host, &downloaded, "downloaded against the CPU");
+    assert_eq!(
+        downloaded_bytes(&message),
+        tensor * MEANS_FRAMES as u64,
+        "each frame's tensor is read back once, and nothing else: {message}"
+    );
+
+    // On the device and bound in place, for a CUDA session.
+    let (bound, message) = means_run(
+        &runtime,
+        &dir,
+        &input,
+        "cuda",
+        false,
+        &format!("memory=gpu:{size}"),
+        &profile,
+    );
+    if !message.contains("[nn] means: execution provider CUDA") {
+        eprintln!("SKIPPED: the bound route. The CUDA provider did not engage here:\n{message}");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    if !cfg!(windows) {
+        assert!(
+            message.contains("[nn] means: input downloaded, CUDA takes host memory here"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    assert!(
+        message.contains("[nn] means: input from the pool, bound on CUDA"),
+        "a CUDA session binds the pool's memory on Windows: {message}"
+    );
+    assert_same_rows(&host, &bound, "bound against the CPU");
+    assert_eq!(
+        downloaded_bytes(&message),
+        0,
+        "the bound route reads nothing back: {message}"
+    );
+
+    // NHWC, letterboxed, BGR, scaled: the device pass and the CPU agree on
+    // every option, through the other graph.
+    let options = format!("{size}:layout=nhwc:fit=letterbox:order=bgr:scale=0.5");
+    let (host, _) = means_run(
+        &runtime,
+        &dir,
+        &input,
+        "cpu",
+        true,
+        &format!("memory=host:{options}"),
+        &[],
+    );
+    let (bound, message) = means_run(
+        &runtime,
+        &dir,
+        &input,
+        "cuda",
+        true,
+        &format!("memory=gpu:{options}"),
+        &[],
+    );
+    assert!(
+        message.contains("[nn] means: input from the pool, bound on CUDA"),
+        "{message}"
+    );
+    assert_same_rows(&host, &bound, "NHWC, letterboxed, bound against the CPU");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pictures_decoded_on_the_device_are_bound_to_cuda_and_never_read_back() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("nn_frames cannot run a model without a runtime");
+        return;
+    };
+    if !cfg!(windows) {
+        eprintln!("SKIPPED: a decoder shares the process's device on Windows (D3D12) only.");
+        return;
+    }
+    let Some(av) = std::env::var_os("FFRWD_AV_RUNTIME")
+        .map(PathBuf::from)
+        .filter(|d| d.join("avcodec-63.dll").is_file())
+    else {
+        eprintln!(
+            "SKIPPED: decoded pictures into a model. Point FFRWD_AV_RUNTIME at a directory \
+             holding FFmpeg 9.0's shared libraries to run it."
+        );
+        return;
+    };
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/h264.nut");
+    let module = frames_module();
+    let module = module.to_string_lossy().to_string();
+    let dir = means_dir("decoded");
+    let run = |target: &str| {
+        let rows = dir.join(format!("rows-{target}.ndjson"));
+        let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+            .env_remove("FFRWD_NN_RUNTIME")
+            .env("FFRWD_AV_RUNTIME", &av)
+            .args(["-profile", "-nn-runtime"])
+            .arg(&runtime)
+            .args(["-nn", &format!("means={}", means_model(false).display())])
+            .args(["-nn-target", target, "-gpu", &module, "-f", "nut", "-i"])
+            .arg(&fixture)
+            .args(["-m", &format!("nn_frames={module}"), "-filter_complex"])
+            .arg(
+                "[0:v]decode=format=yuv420p:hw=d3d12va[d];\
+                 [v=d]nn_frames=model=means:memory=gpu:width=32:height=24[@rows=r]",
+            )
+            .args(["-map", "[r]", "-f", "ndjson"])
+            .arg(&rows)
+            .output()
+            .expect("spawn ffrwd-wasm");
+        let message = stderr(&output);
+        assert!(
+            output.status.success() || message.contains("no GPU"),
+            "{target}: {message}"
+        );
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(&rows)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a row is JSON"))
+            .collect();
+        (rows, message)
+    };
+    let (downloaded, message) = run("cpu");
+    if message.contains("no GPU") {
+        eprintln!("SKIPPED: this machine has no GPU adapter.");
+        return;
+    }
+    assert!(
+        message.contains("[gpu] decode h264: d3d12va, frames "),
+        "the pictures stay on the device: {message}"
+    );
+    assert!(
+        message.contains("[nn] means: input downloaded, CPU takes host memory"),
+        "{message}"
+    );
+    let frames = downloaded.len() as u64;
+    assert!(frames > 0, "{message}");
+    assert_eq!(
+        downloaded_bytes(&message),
+        frames * 32 * 24 * 3 * 4,
+        "the tensor is read back, never the picture: {message}"
+    );
+    let (bound, message) = run("cuda");
+    if !message.contains("[nn] means: execution provider CUDA") {
+        eprintln!("SKIPPED: the bound route. The CUDA provider did not engage here:\n{message}");
+        return;
+    }
+    assert!(
+        message.contains("[nn] means: input from the pool, bound on CUDA"),
+        "{message}"
+    );
+    assert_eq!(downloaded_bytes(&message), 0, "{message}");
+    assert_eq!(bound.len(), downloaded.len());
+    let worst = apart(&downloaded, &bound);
+    assert!(worst < 1e-4, "apart by up to {worst}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

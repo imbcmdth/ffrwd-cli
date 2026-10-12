@@ -23,6 +23,7 @@ members = [
     "captions",
     "transcribe",
     "nn-probe",
+    "nn-frames",
     "gpu-probe",
     "gpu-box",
     "depth",

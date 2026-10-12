@@ -1,0 +1,14 @@
+package ffrwd:nn-frames;
+
+/// A sink that runs a model on each frame of its input, the frame made into
+/// the model's input tensor by the host (`ffrwd:gpu/nn`), and writes what
+/// the model returned as rows. The node world beside `ffrwd:gpu`, so it
+/// needs a `-gpu` grant, and `wasi:nn`, so it needs a model bound with
+/// `-nn`.
+world nn-frames {
+  include ffrwd:av/node-module@0.19.1;
+  include ffrwd:gpu/gpu-nn-module@0.1.0;
+  import wasi:nn/graph@0.2.0-rc-2024-10-28;
+  import wasi:nn/inference@0.2.0-rc-2024-10-28;
+  import wasi:nn/errors@0.2.0-rc-2024-10-28;
+}
