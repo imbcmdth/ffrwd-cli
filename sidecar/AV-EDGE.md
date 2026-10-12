@@ -98,12 +98,30 @@ into `ffv1` keeps every bit only with `pix_fmt=bgra`.
 `d3d11va`, `d3d12va`, `dxva2`, `videotoolbox`, `vaapi`, `vulkan`. `auto`
 tries the platform's order (Windows: d3d11va, cuda; Linux: vulkan, cuda;
 macOS: videotoolbox), skipping a device type the build does not have, and
-falls back to software. Either way the
-frames come back to host memory. One line on stderr says what engaged:
+falls back to software. The frames come back to host memory, with one
+exception: when the node reading them holds its frames on the GPU
+(`NODE-CLI.md`) and the device is the sidecar's own, `d3d12va` on
+Windows, the decoder writes straight into the sidecar's frame pool and
+nothing comes back. One line on stderr says what engaged, and a second
+says whether the decoder's own images were taken as they are or copied
+once on the device:
 
     [av] decode h264: d3d11va
     [av] decode h264: software (d3d11va: no device)
+    [av] decode h264: d3d12va, on the host's device
+    [gpu] decode h264: d3d12va, frames wrapped
 
 An encoder is named outright (`codec=h264_nvenc`) and engages or refuses;
 there is no fallback from a hardware encoder to a software one, since the
-query named it.
+query named it. `h264_d3d12va` and `hevc_d3d12va` take their frames from
+the pool with one copy on the device and no readback; an rgba frame a
+module rendered is made NV12 on the device first (BT.709 limited range
+unless the stream says BT.601 or full range), and the header says what
+was written. These two encoders in FFmpeg 9.0.1 fail on a B-frame on
+NVIDIA's driver and write no extradata, so `bf=0` is set unless asked
+otherwise, and the parameter sets for the header are taken from a first
+packet coded ahead of the stream. Every other encoder reads a GPU frame
+back once.
+
+    [av] encode h264_d3d12va: 1920x1080 nv12, from the device
+    [gpu] encode h264_d3d12va: from the device, each frame one copy

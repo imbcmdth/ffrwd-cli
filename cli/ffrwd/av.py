@@ -44,6 +44,8 @@ HOSTED_ENCODERS = frozenset(
         "h264_amf",
         "hevc_amf",
         "av1_amf",
+        "h264_d3d12va",
+        "hevc_d3d12va",
         "h264_mf",
         "hevc_mf",
         "h264_videotoolbox",
@@ -76,7 +78,7 @@ ENCODE_OPTIONS: Mapping[str, str] = {
 }
 
 # The encoder names that run on a hardware encode session.
-HARDWARE_ENCODER_SUFFIXES = ("_nvenc", "_qsv", "_vaapi", "_amf")
+HARDWARE_ENCODER_SUFFIXES = ("_nvenc", "_qsv", "_vaapi", "_amf", "_d3d12va")
 
 # The ``encode`` node's argument naming its encoder.
 CODEC = "codec"

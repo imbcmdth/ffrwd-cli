@@ -421,8 +421,8 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   own stream, unfiltered, in a codec the sidecar's build decodes (h264,
   hevc, av1, vp9, mpeg2video, prores, mjpeg, ffv1, mpeg4); the ffmpeg
   behind writes `-c:v copy` when the destination names an encoder the
-  sidecar hosts (the `_nvenc`, `_amf`, `_mf`, `_videotoolbox` and
-  `_vaapi` encoders, and ffv1, mpeg4, mpeg2video and mjpeg), with the
+  sidecar hosts (the `_nvenc`, `_amf`, `_mf`, `_videotoolbox`, `_vaapi`
+  and `_d3d12va` encoders, and ffv1, mpeg4, mpeg2video and mjpeg), with the
   encoder's options moved into the sidecar's `encode` node. Anything
   else on either side stays raw, as without the clause. `codec_params`
   has no spelling in the node and is refused beside a hosted encoder.
