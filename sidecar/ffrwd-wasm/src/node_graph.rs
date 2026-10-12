@@ -1067,6 +1067,17 @@ fn output_streams(
                 },
             },
         };
+        // A video output like an input, in that input's pixel format, keeps
+        // its colour tags too: a reader of both sees one format.
+        let format = match (format, like.map(|b| &b.format)) {
+            (StreamFormat::Video(mut made), Some(StreamFormat::Video(from)))
+                if made.pix_fmt == from.pix_fmt && made.color.is_none() =>
+            {
+                made.color = from.color;
+                StreamFormat::Video(made)
+            }
+            (format, _) => format,
+        };
         let source = like.or(clock);
         let delay = match (&output.format, clock) {
             (None, Some(clock)) if matches!(format, StreamFormat::Packets(_)) => clock.decode_delay,
