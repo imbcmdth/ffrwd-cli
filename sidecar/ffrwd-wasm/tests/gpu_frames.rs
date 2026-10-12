@@ -123,11 +123,22 @@ fn run_with(memory: &str, jobs: &str, frames: &[Vec<u8>], extra: &[&str]) -> Out
     child.wait_with_output().expect("wait for ffrwd-wasm")
 }
 
+/// Set to anything but blank where a GPU is promised (CI's software Vulkan
+/// driver): a run that finds no adapter then fails rather than skips.
+const GPU_REQUIRED: &str = "FFRWD_GPU_REQUIRED";
+
 /// True when `output` is the refusal of a machine with no GPU, which these
-/// tests skip rather than fail: the path is the owner's machine's to prove.
+/// tests skip rather than fail, unless [`GPU_REQUIRED`] says one is there.
 fn no_gpu(output: &Output) -> bool {
     let stderr = String::from_utf8_lossy(&output.stderr);
-    !output.status.success() && (stderr.contains("no GPU") || stderr.contains("no adapter"))
+    let missing =
+        !output.status.success() && (stderr.contains("no GPU") || stderr.contains("no adapter"));
+    let required = std::env::var_os(GPU_REQUIRED).is_some_and(|v| !v.is_empty());
+    assert!(
+        !(missing && required),
+        "{GPU_REQUIRED} is set, and the run found no GPU adapter:\n{stderr}"
+    );
+    missing
 }
 
 fn frames_of(output: &Output, what: &str) -> Vec<(i64, Vec<u8>)> {

@@ -9,11 +9,12 @@ on:
     paths: [sidecar/**]
   pull_request:
     paths: [sidecar/**]
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     # The Rust workspace lives in sidecar/; every path below is relative to it.
     defaults:
       run:
@@ -26,6 +27,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-wasip2
 
       - name: Format (rustfmt)
         run: cargo fmt --check
@@ -51,6 +53,21 @@ jobs:
       # target nor ffmpeg, so --lib --bins keeps it to the module-free tests.
       - name: Test (module-free only)
         run: cargo test --workspace --lib --bins
+
+      # The GPU frame path on mesa's lavapipe, a Vulkan driver that runs on
+      # the CPU. The device, the frame pool, the planes a module reads and
+      # the texture it hands back go through wgpu's real code; speed, the
+      # hardware decoder and encoder, and any vendor's driver do not. With
+      # FFRWD_GPU_REQUIRED set, a run that finds no adapter fails rather
+      # than skips.
+      - name: Install a software Vulkan driver
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
+
+      - name: Test the GPU frame path on lavapipe
+        env:
+          FFRWD_GPU_REQUIRED: "1"
+          WGPU_BACKEND: vulkan
+        run: cargo test -p ffrwd-wasm --test gpu_frames -- --nocapture
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
