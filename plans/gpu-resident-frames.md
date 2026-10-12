@@ -1657,6 +1657,12 @@ bound runs differ from each other, so that is the CUDA session's own
 run-to-run variation. A DirectML session over the same 1080p input, on
 the downloaded route: 6.8 ms for channel-means.
 
+These figures were taken before the CUDA session's stream was made a
+blocking stream (see "Faces, ages and a blur on the GPU" below). With the
+non-blocking stream, ONNX Runtime could read a bound input before the pass
+had finished writing it, so the bound route's times for decoded input are
+probably low. They have not been measured again.
+
 What was learned:
 
 - `cudaExternalSemaphoreWaitParams`'s keyed-mutex member is a u64 and a
@@ -2103,6 +2109,116 @@ Deciding when to cut is open: a cost model weighing what a split frees
 (a GPU, cores, a node) against what crossing costs (bytes on the wire, an
 encode and a decode, the generation loss above) would call `_cut` with the
 streams it picks, beside or instead of the per-module placement.
+
+## Faces, ages and a blur on the GPU
+
+**What was ported (2026-10-12, owner's machine).** The chain in faceage's
+`blur-children` recipe detects faces with rfdetr, estimates the age of each
+face with faceage, makes a matte of the faces under the age limit, and blurs
+the picture under the matte. Each step now has a GPU build:
+
+- rfdetr's `detect_gpu`, `detect_faces_gpu` and `detect_plates_gpu` take
+  their input from `frame-tensor`, so the module no longer reads the
+  picture. `boxes_mask_gpu`, `segment_mask_gpu` and `draw_boxes_gpu` draw
+  on the device.
+- faceage's `ages_gpu` takes each frame's faces as one tensor from the new
+  `crops-tensor`, and runs the age model once a frame however many faces
+  there are.
+- mask_tools' `masked_gpu`, with `blur_where_gpu` and `mosaic_where_gpu`
+  over it, composites on the device. The host versions run ffmpeg's
+  `gblur`, `alphamerge` and `overlay`, so before this every frame left the
+  GPU for the blur whatever else was ported.
+
+Each GPU build is a function of its own with a `_gpu` suffix, beside the
+host build. A `memory` parameter on the existing function cannot choose the
+module: the dialect has no overloading, a wasm function names one module,
+and the host builds must keep running on a sidecar built without GPU
+support. Every existing recipe of the three packages compiles to the same
+commands as before. The packages' work is on a branch named `gpu` in each
+repository and is not published.
+
+`ffrwd:gpu/nn` gains `crops-tensor(id, index, crops, options)`, which makes
+a list of rectangles of a frame into one tensor of N crops, each resized on
+its own and reading only its own pixels. `frame-tensor-options` gains
+`filter` (bilinear or bicubic) and `antialias`, which together give
+Pillow's resampling: the detectors shrink a 4K frame about 6.7 times, and
+plain bilinear sampling aliases badly at that ratio. The crops on the CPU
+are within 1.03/255 of the packages' shared `ffrwd-frame` crate. The age
+model's input made on the device differs from that crate's by 0.0011 on
+average and 0.040 at most, on a scale of 0 to 1. Recipe 163.
+
+**Measured.** A classroom clip of 343 frames at 30 fps with five faces,
+scaled to each size, run with `ffrwd run --profile`; the median of three
+runs on a quiet machine, start-up of about 4 s included. The baseline is
+today's chain, with its age model on CUDA:
+
+| size | baseline, fps | all on the GPU, `h264_d3d12va`, fps | all on the GPU, libx264, fps |
+|---|---|---|---|
+| 720p | 20.7 | 23.0 | 21.8 |
+| 1080p | 18.2 | 21.8 | 21.4 |
+| 4K | 12.0 | 21.1 | 18.0 |
+
+With `h264_d3d12va` the run is one sidecar region from the decoder to the
+encoder: `upload`, `download` and `fetch` are 0 bytes, and ffmpeg only
+copies packets in and out. The baseline moves 33 MB a frame into the
+sidecar at 4K, and its modules fetch 66 MB a frame. With libx264 the
+picture is read back once at the exit, 33 MB a frame at 4K; making it
+yuv420p on the device first would make that 12 MB.
+
+Steady-state time a frame, from a 343-frame run less a 30-frame run:
+
+| per frame | 720p | 4K |
+|---|---|---|
+| the detector alone | 6.8 ms | 7.0 ms |
+| the detector and the ages | 31.8 ms | 31.8 ms |
+| the detector, the matte, the blur and the encode | 7.7 ms | 9.0 ms |
+| the whole chain, `h264_d3d12va` | 33.6 ms | 36.2 ms |
+| the baseline | 38.7 ms | 67.3 ms |
+
+The age model takes about 25 ms a frame for five faces and the detector
+about 7 ms. Everything else takes 1 to 2 ms. The chain is now limited by
+inference and costs nearly the same at every size; at 720p the GPU path
+barely helps, because moving the frames was never the cost there.
+
+The results agree with the baseline. The same faces under 16 are blurred
+on all 343 frames at all three sizes. Each child's age is within 0.4 years
+of the baseline's and the adult's within 1.0. The boxes are within 5 px at
+720p and 14 px at 4K. The mattes from `boxes_mask_gpu` and
+`draw_boxes_gpu` are byte for byte the host builds'. The mosaic matches
+ffmpeg's `pixelize` exactly. The blur is a true Gaussian, which differs
+from `gblur` by 1.3 to 2.0 levels on average inside the matte.
+
+**Found on the way.**
+
+- The CUDA session's stream was non-blocking, so ONNX Runtime's copies on
+  the legacy stream could read a bound input before the pass had written
+  it: 45 of 343 frames carried the previous frame's ages. The stream is now
+  a blocking stream. This was also why
+  `pictures_decoded_on_the_device_are_bound_to_cuda_and_never_read_back`
+  failed now and then; it now passes 20 runs of 20.
+- With no `FFRWD_NN_TARGET`, the provider walk chose DirectML for the
+  process, and the age model, which is pinned off DirectML, ran on the
+  CPU at 0.9 fps. The walk now takes first a provider that no model in the
+  run excludes, so the age model runs on CUDA by default.
+- A source read by several nodes of a region on the GPU crossed raw,
+  because `_code_edges` only coded an edge the region's entry node reads
+  itself. It is now decoded once in the region.
+- A query cannot use the host build and the GPU build of one model
+  together: the run fails with "-nn bound twice".
+- When the region decodes an mp4 with B-frames, rows carry timestamps two
+  frames later than when ffmpeg decodes it. This comes from the mp4's edit
+  list together with NUT shifting timestamps so that none are negative.
+  The output files start at 0, but an exit written with `-copyts` would
+  start two frames late.
+- An input read both as rgba and as yuv420p gets one `-pad` colour, so the
+  yuv420p copy is treated as full range. The face chain does not hit this.
+
+**Follow-up.** The age model is now most of each frame's time. Running it
+every other frame (`every => 2`), a smaller age model, or a batch shared
+across frames would each move the 720p figure more than any further
+change to how frames move. The GPU builds could also be chosen by the
+compiler instead of by a `_gpu` name, when the sidecar holds the frames
+on the device.
 
 ## 5. Risks and open questions
 
