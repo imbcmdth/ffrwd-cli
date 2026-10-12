@@ -1159,6 +1159,147 @@ What blocks it is (1), the libav build, which belongs to the builds
 repository. After that, (2) and (3) are the shortest route: three D3D12
 filters and no interop.
 
+**Item 6a, `filter` (2026-10-12, owner's machine):** the host's fourth
+node runs a libavfilter graph on the D3D12 device, and the compiler moves a
+query's `scale` into it where the picture is on the device on both sides.
+
+- ffrwd-av (commit on `main`, not pushed or released): libavfilter 12 is
+  built, with `buffer`, `buffersink`, `format`, `hwupload`, `hwdownload`
+  and `null` everywhere, and per platform `scale_d3d12` and
+  `deinterlace_d3d12` on Windows; on Linux glibc the `_cuda` filters
+  (`scale`, `overlay`, `pad`, `transpose`, `yadif`, `bwdif`, `chromakey`,
+  `colorspace`) through `--enable-cuda-llvm` (clang's NVPTX target; the
+  nvcc route is non-free) and thirteen `_vulkan` ones; none on musl or
+  macOS. In 9.0 the Vulkan filters' shaders are compiled to SPIR-V at
+  build time by a `glslc` or `glslang` program, so the archive gains only
+  libavfilter; there is no run-time shader compiler option left to bundle.
+  `libplacebo` is not built (a library of its own). clang missing or unable
+  to target NVPTX drops `cuda_llvm` and the `_cuda` filters the way missing
+  vulkan headers drop Vulkan; a hardware filter configure turns off is
+  recorded in `CONFIGURE`. The CI run is the owner's to dispatch; nothing
+  here ran the builds.
+- The wheel: `fetch_av.py` takes `avfilter-12` where the archive has it,
+  so the v1.1.0 pins still build; `av-pins.json` names the major. The pins
+  still point at v1.1.0, which has no libavfilter: they move with the next
+  ffrwd-av release. Until then a compile whose sidecar loads v1.1.0 keeps
+  `scale` in ffmpeg, so recipe 158's exec test fails there (the release
+  workflow's exec tier included); it passes where `FFRWD_AV_RUNTIME` names
+  a libav with `scale_d3d12`, and where the sidecar loads no libav (CI's
+  exec tier).
+- The shim (`runtime/src/av/ffi.rs`, `sys.rs`, `filter.rs`): libavfilter
+  loads after the four, optional; without it everything else runs and
+  `filter` is refused with the reinstall hint. Twenty-one functions;
+  `AVFilterContext`, `AVFilterGraph`, `AVFilterInOut` and
+  `AVBufferSrcParameters` transcribed with compile-time offsets, and checked
+  at load against the filter context's and graph's own option tables, a
+  filter allocated into a graph, and the source parameters' defaults.
+  `--av-info` adds `avfilter`, `avfilter_error` and `filters`.
+- The node (`ffrwd-wasm/src/av_nodes.rs`, `AvFilter`):
+  `filter=graph=<graph>[:format=yuv420p|rgba]`. One graph per instance,
+  configured at open between a `buffer` source whose `hw_frames_ctx` is a
+  d3d12va NV12 frames context and a `buffersink`, so the output's size is
+  known before the first frame. On the shared device (a reader or writer of
+  its frames is on the GPU) a frame there is copied once on the device into
+  a picture of the source, as for the encoder, and the sink's pictures are
+  wrapped as frames with no copy. A frame in host memory is made NV12 by
+  libswscale and uploaded; with no shared device the graph runs on a device
+  of its own and its pictures are read back. `[av] filter scale_d3d12: on
+  the host's device` at open.
+- What scale_d3d12 needed of the protocol: it signals one sync object of
+  its own for every picture it writes, never waits on an output picture
+  before writing its texture again, and never signals the input picture
+  after reading it. So the host keeps each picture it took from a graph
+  until its own sync object says the queue has read it, rather than
+  signalling the filter's object (which would let the next picture's
+  reader through early), and copies into the source only after waiting on
+  what the filter signalled for its last output.
+- The compiler (`cli/ffrwd/device_filters.py`): a `scale` with only its
+  width and height, whose picture comes from the device (a node's output
+  held on the GPU, another such filter, or an input's own picture) and is
+  read only there (a node's input held on the GPU, another such filter, or
+  an `_d3d12va` encoder), and whose run touches a node holding its picture
+  on the GPU, becomes a `filter` node; a run of them is one graph. Which
+  variants the run has is what the compile's sidecar lists under
+  `filters`, asked once per process the way `--describe` is, and only
+  where a candidate exists. Where that sidecar loads no libav at all the
+  command is written for a reader whose sidecar has the bundled
+  libavfilter, as item 7 writes for a reader's ffmpeg; where it loads a
+  libav without libavfilter, nothing moves. Recipe 158; `docs/dialect.md`.
+- Found on the way: a compiled region holding its pictures on the GPU
+  decoded in software, since `decode` defaults to `hw=none` and the
+  compiler wrote no `hw`; recipe 157 was uploading every frame. Such a
+  region's `decode` is now told `hw=auto` (157's pin changed), and recipe
+  158 runs with `upload` and `download` at 0 bytes.
+
+Tests: `gpu_frames` `scale_d3d12_runs_between_a_decoder_and_an_encoder_on_the_device`
+(h264 320x240, 60 frames, decode on the device, `scale_d3d12` to
+160x120, `h264_d3d12va`: 60 pictures at 160x120, profile `upload` and
+`download` 0 bytes, 0.238 levels from ffmpeg's own `scale_d3d12` on
+average, plane means within 0.074) and
+`scale_d3d12_takes_pictures_in_host_memory_uploaded_and_reads_them_back`
+(byte-identical to ffmpeg's `hwupload,scale_d3d12,hwdownload`); `av`
+gains the refusal without libavfilter, the av-info fields and three
+option refusals; `test_node_world` the compiler's table of cases.
+
+What was learned:
+
+- `deinterlace_d3d12` does not run on the 4090: `CreateVideoProcessor`
+  returns 0x887A0005 (DXGI_ERROR_DEVICE_REMOVED), "Failed to create video
+  processor", from ffmpeg 9.0.1's own command line and from the node over
+  BtbN's 9.0 libraries, on progressive and field-flagged input alike. So `yadif` and `bwdif` are not
+  mapped; the node still runs it by hand where a driver allows.
+- ffmpeg's own `-hwaccel d3d12va -hwaccel_output_format d3d12` into
+  `scale_d3d12` made one picture 9 levels off the software decode's scale
+  in one of seven runs (frame 11 of 60); the node's runs matched every
+  time, and the test's reference decodes in software and uploads.
+- One `ffrwd run` of recipe 158 printed device-removed errors when the
+  host first made its sync object for kept pictures, with the output
+  complete; three reruns and every direct run were clean, and other GPU
+  work was running on the machine at the time. Not explained.
+
+Linux beyond the build: the `_cuda` filters need the pool's Vulkan images
+exported (`VK_KHR_external_memory_fd`) and imported into CUDA
+(`cuImportExternalMemory`, `cuExternalMemoryGetMappedMipmappedArray`), the
+images' timeline semaphores imported (`cuImportExternalSemaphore`) and
+waited and signalled around the work, an `AVCUDADeviceContext` on the
+primary context of the device matched by UUID, and one device-side
+`cuMemcpy2DAsync` in and one out, since libavfilter's CUDA frames are
+linear memory; that is the inference providers' import, to be written
+once for both. The `_vulkan` filters need the `AVVulkanDeviceContext`
+filled from the shared device (instance, physical device, device, queue
+families, the enabled extensions and features, which wgpu's open must
+include), each pool image handed over as an `AVVkFrame` with its layout,
+access and timeline semaphore, and raw submits that wait on those
+semaphores, which wgpu-core's submit does not do; the decoder's Vulkan
+path needs the same.
+
+Measured on the owner's machine (release build, h264 sources from
+`testsrc2` with B-frames, 600 frames at 1080p60 and 300 at 4K60, the
+sidecar alone against ffmpeg 9.0.1 alone, both decoding with d3d12va and
+encoding with `h264_d3d12va`; ffmpeg needs `-bf 0` for that encoder on
+this driver, which the node sets itself; median of three runs after a
+warm one):
+
+| chain | node ms/frame | ffmpeg ms/frame |
+|---|---|---|
+| 1080p, no filter | 5.24 | 2.28 |
+| 1080p, `filter=graph=null` | 5.02 | - |
+| 1080p, `scale_d3d12` to 1920x1080 | 5.13 | 2.39 |
+| 1080p, `scale_d3d12` to 1280x720 | 5.14 | 2.20 |
+| 4K, no filter | 13.41 | 6.99 |
+| 4K, `filter=graph=null` | 14.20 | - |
+| 4K, `scale_d3d12` to 3840x2160 | 14.15 | 7.35 |
+| 4K, `scale_d3d12` to 1920x1080 | 9.94 | 5.91 |
+
+The scale itself costs ffmpeg 0.1 ms a frame at 1080p and 0.4 ms at 4K,
+and the node about the same: at 1080p its runs with and without a filter
+are within run-to-run noise, at 4K the node adds 0.7 to 0.8 ms (the copy
+into the source's picture and the pass-through), and `scale_d3d12` over
+`null` adds nothing measurable. The node's chain is about twice ffmpeg's
+time with no filter at all, so the gap is the decode-and-encode path
+through the network, which wave 0's table already showed at 235 fps, not
+the filter.
+
 ### Wave 4: inference on the GPU
 
 1. **The provider is per model.** `NN-EDGE.md` has every model a process
