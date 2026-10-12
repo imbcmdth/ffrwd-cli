@@ -1869,7 +1869,18 @@ struct Host {
     /// the node world once the call returns.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     gpu_emitted: Vec<GpuEmission>,
+    /// The outputs `ffrwd:gpu/nn.output-texture` bound, by the context's
+    /// entry in `table` and the output's name.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    gpu_outputs: GpuOutputs,
 }
+
+/// Outputs bound to textures; held weakly, since the context holds them.
+#[derive(Default)]
+pub(crate) struct GpuOutputs(
+    #[cfg(feature = "gpu")]
+    HashMap<(u32, String), std::sync::Weak<crate::nn::output_texture::BoundTexture>>,
+);
 
 /// A frame a module handed over as a texture during one `process` call.
 #[cfg(feature = "gpu")]
@@ -1918,6 +1929,7 @@ pub(crate) mod gpu_ext {
             "wasi:webgpu/webgpu": wasi_webgpu_wasmtime::wasi::webgpu::webgpu,
             "wasi:graphics-context/graphics-context": wasi_webgpu_wasmtime::wasi::graphics_context::graphics_context,
             "wasi:nn/tensor.tensor": wasmtime_wasi_nn::Tensor,
+            "wasi:nn/inference.graph-execution-context": wasmtime_wasi_nn::ExecutionContext,
         },
         imports: { default: trappable },
     });
@@ -2093,6 +2105,47 @@ impl gpu_ext::ffrwd::gpu::nn::Host for Host {
             Err(e) => Ok(Err(format!("frame {index} of stream {id}: {e:#}"))),
         }
     }
+
+    fn output_texture(
+        &mut self,
+        context: Resource<wasmtime_wasi_nn::ExecutionContext>,
+        options: gpu_ext::ffrwd::gpu::nn::OutputTextureOptions,
+    ) -> wasmtime::Result<Result<Resource<wasi_webgpu_wasmtime::Texture>, String>> {
+        use wasi_webgpu_wasmtime::reexports::wgpu_types;
+        let key = (context.rep(), options.output.clone());
+        let size = (options.width, options.height);
+        let held = self.gpu_outputs.0.get(&key).and_then(|weak| weak.upgrade());
+        let bound = match held {
+            Some(bound) if bound.size() == size => bound,
+            _ => {
+                let context = self.table.get_mut(&context)?;
+                match crate::nn::output_texture::bind(
+                    context,
+                    &options.output,
+                    options.width,
+                    options.height,
+                ) {
+                    Ok(bound) => {
+                        self.gpu_outputs.0.retain(|_, weak| weak.strong_count() > 0);
+                        self.gpu_outputs.0.insert(key, Arc::downgrade(&bound));
+                        bound
+                    }
+                    Err(e) => return Ok(Err(format!("output {}: {e:#}", options.output))),
+                }
+            }
+        };
+        let texture = wasi_webgpu_wasmtime::Texture::shared(
+            bound.target.texture,
+            wgpu_types::Extent3d {
+                width: options.width,
+                height: options.height,
+                depth_or_array_layers: 1,
+            },
+            crate::gpu::output::FORMAT,
+            crate::gpu::output::MODULE_USAGE,
+        );
+        Ok(Ok(self.table.push(texture)?))
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -2262,6 +2315,14 @@ pub fn grant_gpu(path: &str) -> Result<()> {
         .map_err(|_| anyhow!("grant table poisoned"))?;
     table.entry(canonical(path)).or_default().gpu = true;
     Ok(())
+}
+
+/// Whether the argv granted `-gpu` to any module, and so whether frames may
+/// be held on the process's device this run.
+pub fn any_gpu_granted() -> bool {
+    grant_table()
+        .lock()
+        .is_ok_and(|table| table.values().any(|grants| grants.gpu))
 }
 
 /// The store's WASI context: no preopens, no env, no args; stderr passes
@@ -3515,6 +3576,7 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
+            gpu_outputs: Default::default(),
         },
     );
 
@@ -3965,6 +4027,7 @@ fn instantiate_values(
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
+            gpu_outputs: Default::default(),
         },
     );
 
@@ -4588,6 +4651,7 @@ fn instantiate_packet(
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
+            gpu_outputs: Default::default(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -5054,6 +5118,7 @@ fn instantiate_packet_filter(
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
+            gpu_outputs: Default::default(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -5806,6 +5871,7 @@ fn instantiate_packet_source(
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
+            gpu_outputs: Default::default(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -6176,6 +6242,7 @@ fn instantiate_data_filter(
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
+            gpu_outputs: Default::default(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -6688,6 +6755,7 @@ fn instantiate_codec(module_path: &str, purpose: Purpose) -> Result<(Store<Host>
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
+            gpu_outputs: Default::default(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -7241,6 +7309,7 @@ fn instantiate_rows_module(
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
+            gpu_outputs: Default::default(),
         },
     );
     let context = || format!("instantiating {module_path}");
@@ -8115,6 +8184,7 @@ mod socket_grant_test {
             gpu: StoreGpu::new(false),
             gpu_tick: None,
             gpu_emitted: Vec::new(),
+            gpu_outputs: Default::default(),
         }
     }
 
@@ -8220,6 +8290,7 @@ mod udp_grant_test {
                 gpu,
                 gpu_tick: None,
                 gpu_emitted: Vec::new(),
+                gpu_outputs: Default::default(),
             },
         );
         let instance = linker

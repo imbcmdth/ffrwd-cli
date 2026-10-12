@@ -585,13 +585,23 @@ pub struct PooledBuffer {
     /// binds it, and kept for the buffer's life.
     #[cfg(windows)]
     pub cuda: OnceLock<std::result::Result<crate::nn::cuda::CudaBuffer, String>>,
+    /// The D3D12 buffer, where it was made on a shared heap.
+    #[cfg(windows)]
+    pub resource: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    /// The buffer as a DirectML allocation, made the first time a DirectML
+    /// session binds it.
+    #[cfg(windows)]
+    pub dml: OnceLock<std::result::Result<Arc<crate::nn::directml::Allocation>, String>>,
 }
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        // CUDA's mapping goes before the memory under it.
+        // CUDA's mapping and DirectML's allocation go before the memory
+        // under them.
         #[cfg(windows)]
         drop(self.cuda.take());
+        #[cfg(windows)]
+        drop(self.dml.take());
         self.global.buffer_drop(self.id);
     }
 }
@@ -642,6 +652,10 @@ impl Pool {
                 shared: None,
                 #[cfg(windows)]
                 cuda: OnceLock::new(),
+                #[cfg(windows)]
+                resource: None,
+                #[cfg(windows)]
+                dml: OnceLock::new(),
             }
         };
         let made = Arc::new(made);
@@ -656,13 +670,15 @@ const USAGE: BufferUsages = BufferUsages::STORAGE.union(BufferUsages::COPY_SRC);
 /// A pool buffer on a shared heap, which another API imports.
 #[cfg(windows)]
 fn shared_buffer(global: &Arc<Global>, device: &SharedDevice, size: u64) -> Result<PooledBuffer> {
-    let (id, handle) = super::d3d12::shared_buffer(global, device, size, USAGE)?;
+    let (id, handle, resource) = super::d3d12::shared_buffer(global, device, size, USAGE)?;
     Ok(PooledBuffer {
         global: Arc::clone(global),
         id,
         size,
         shared: Some(handle),
         cuda: OnceLock::new(),
+        resource: Some(resource),
+        dml: OnceLock::new(),
     })
 }
 
@@ -676,6 +692,18 @@ fn shared_buffer(
 }
 
 /// The pools: buffers on a shared heap, and ordinary ones.
+/// A `size`-byte storage buffer of the process's device from the pool, on a
+/// shared heap where `shared` asks; it goes back to the pool once nothing
+/// holds it.
+pub(crate) fn pooled_buffer(
+    global: &Arc<Global>,
+    device: &SharedDevice,
+    size: u64,
+    shared: bool,
+) -> Result<Arc<PooledBuffer>> {
+    pool(shared).take(global, device, size, shared)
+}
+
 fn pool(shared: bool) -> &'static Pool {
     static SHARED: OnceLock<Pool> = OnceLock::new();
     static PLAIN: OnceLock<Pool> = OnceLock::new();
@@ -880,7 +908,7 @@ pub(super) fn make(
 }
 
 /// The first `len` bytes of `buffer`, copied out on the device and read.
-fn read_buffer(
+pub(crate) fn read_buffer(
     global: &Global,
     device: &SharedDevice,
     buffer: BufferId,

@@ -4196,14 +4196,9 @@ fn main() {
             std::process::exit(2);
         }
     };
-    // Models load once, before any component is instantiated. A run binding
-    // none touches no ONNX Runtime.
-    if let Err(e) = nn::configure(&nn_config) {
-        eprintln!("ffrwd-wasm: {e:#}");
-        std::process::exit(2);
-    }
-
-    // Effect grants register before anything is instantiated, like models.
+    // Effect grants register before anything is instantiated, like models,
+    // and ahead of them: a DirectML session is built on the process's
+    // device where a module is granted one.
     let raw_args = match take_grant_args(raw_args) {
         Ok(rest) => rest,
         Err(e) => {
@@ -4211,6 +4206,13 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // Models load once, before any component is instantiated. A run binding
+    // none touches no ONNX Runtime.
+    if let Err(e) = nn::configure(&nn_config) {
+        eprintln!("ffrwd-wasm: {e:#}");
+        std::process::exit(2);
+    }
 
     if raw_args.first().map(String::as_str) == Some("--describe") {
         match raw_args.get(1) {

@@ -12,9 +12,13 @@
 
 #[cfg(all(windows, feature = "gpu"))]
 pub mod cuda;
+#[cfg(all(windows, feature = "gpu"))]
+pub mod directml;
 pub mod dlls;
 #[cfg(feature = "gpu")]
 pub mod frame_tensor;
+#[cfg(feature = "gpu")]
+pub mod output_texture;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -370,6 +374,22 @@ pub fn provider_of(name: &str) -> Option<Provider> {
     graph_registry().get()?.placed.get(name).copied()
 }
 
+/// The `-nn` name of the model whose session `key` is
+/// ([`wasmtime_wasi_nn::backend::BackendGraph::session_key`]).
+pub fn model_of_session(key: usize) -> Option<String> {
+    let models = graph_registry().get()?;
+    models
+        .names
+        .iter()
+        .find(|name| {
+            models
+                .registry
+                .get(name)
+                .is_some_and(|graph| key != 0 && graph.session_key() == key)
+        })
+        .cloned()
+}
+
 /// The CUDA runtime library the CUDA provider loads, where the process's
 /// provider is CUDA and its preflight found one.
 pub fn cuda_runtime() -> Option<PathBuf> {
@@ -390,8 +410,105 @@ pub fn require_configured(module_path: &str) -> Result<()> {
 
 /// The ONNX backend, told which provider a `gpu` session should ask for. The
 /// crate's own `backend::list()` builds one that always means CUDA.
-fn onnx_backend(provider: Provider) -> Backend {
-    Backend::from(OnnxBackend::with_gpu_providers(vec![provider]))
+fn onnx_backend(provider: Provider) -> OnnxBackend {
+    OnnxBackend::with_gpu_providers(vec![provider])
+}
+
+/// The stream every CUDA session is built on, where one was made: the
+/// waits for a frame's tensor and the signals after an output is written
+/// are queued in it, so the GPU orders them with the sessions' work.
+#[cfg(all(windows, feature = "gpu"))]
+pub fn session_stream() -> Option<&'static cuda::CudaStream> {
+    session_stream_cell().get()
+}
+
+#[cfg(all(windows, feature = "gpu"))]
+fn session_stream_cell() -> &'static OnceLock<cuda::CudaStream> {
+    static STREAM: OnceLock<cuda::CudaStream> = OnceLock::new();
+    &STREAM
+}
+
+/// `onnx` with the providers the host registers itself.
+///
+/// A CUDA session is built on a stream of the host's, so a wait for a
+/// frame's tensor is queued ahead of the run on the GPU rather than waited
+/// for by the CPU. Where the stream cannot be made, CUDA is registered as
+/// `ort` registers it and the CPU waits instead.
+///
+/// A DirectML session, where a module is granted the process's device and
+/// that device is D3D12, is built on that device and its queue, so buffers
+/// of the device bind to it. Where that cannot be done, DirectML is
+/// registered as `ort` registers it, on a device of its own.
+#[cfg(all(windows, feature = "gpu"))]
+fn registered(
+    onnx: OnnxBackend,
+    provider: Provider,
+    cuda_runtime: Option<&Path>,
+    directml_lib: Option<&Path>,
+) -> OnnxBackend {
+    use ort::execution_providers::{CUDAExecutionProvider, ExecutionProvider};
+    match provider {
+        Provider::Cuda => {
+            let made = cuda_runtime
+                .ok_or_else(|| anyhow::anyhow!("the CUDA runtime the provider loads was not found"))
+                .and_then(cuda::Cuda::open)
+                .and_then(|cuda| cuda.stream());
+            let stream = match made {
+                Ok(stream) => session_stream_cell().get_or_init(|| stream),
+                Err(e) => {
+                    eprintln!(
+                        "[nn] CUDA sessions run on the provider's own stream ({}); a frame's                          tensor is waited for by the CPU",
+                        one_line(&format!("{e:#}"))
+                    );
+                    return onnx;
+                }
+            };
+            let raw = stream.raw() as usize;
+            onnx.with_registrar(
+                Provider::Cuda,
+                Arc::new(move |builder| {
+                    // SAFETY: the stream is the process's, never destroyed.
+                    let cuda = unsafe {
+                        CUDAExecutionProvider::default().with_compute_stream(raw as *mut ())
+                    };
+                    cuda.register(builder).map_err(|e| e.to_string())
+                }),
+            )
+        }
+        Provider::DirectMl if crate::runtime::any_gpu_granted() => {
+            let (dml, queue) = match directml::prepare(directml_lib) {
+                Ok(made) => made,
+                Err(e) => {
+                    eprintln!(
+                        "[nn] DIRECTML sessions run on a device of their own ({}); a frame's                          tensor is read back for them",
+                        one_line(&format!("{e:#}"))
+                    );
+                    return onnx;
+                }
+            };
+            onnx.with_registrar(
+                Provider::DirectMl,
+                Arc::new(move |builder| {
+                    use ort::AsPointer;
+                    // SAFETY: live options, and what `prepare` made, held
+                    // for the process.
+                    unsafe { directml::register(builder.ptr_mut(), dml, queue) }
+                        .map_err(|e| format!("{e:#}"))
+                }),
+            )
+        }
+        _ => onnx,
+    }
+}
+
+#[cfg(not(all(windows, feature = "gpu")))]
+fn registered(
+    onnx: OnnxBackend,
+    _provider: Provider,
+    _cuda_runtime: Option<&Path>,
+    _directml_lib: Option<&Path>,
+) -> OnnxBackend {
+    onnx
 }
 
 /// The wasi-nn context one store gets. Backends are consumed by the context,
@@ -399,7 +516,7 @@ fn onnx_backend(provider: Provider) -> Backend {
 pub fn store_ctx() -> WasiNnCtx {
     match graph_registry().get() {
         Some(models) => WasiNnCtx::new(
-            vec![onnx_backend(models.provider)],
+            vec![Backend::from(onnx_backend(models.provider))],
             Registry::from(models.registry.clone()),
         ),
         None => empty_ctx(),
@@ -751,7 +868,25 @@ pub fn configure(config: &Config) -> Result<()> {
         .commit()
         .map_err(|e| anyhow::anyhow!("initialising ONNX Runtime from {}: {e}", lib.display()))?;
 
-    let mut onnx = onnx_backend(provider);
+    let cuda_runtime = match provider {
+        Provider::Cuda => dlls::locate(&dlls::search_dirs(&dir), dlls::CUDA_RUNTIME)
+            .map(|found| found.join(dlls::CUDA_RUNTIME)),
+        _ => None,
+    };
+    let directml_lib = match provider {
+        Provider::DirectMl => {
+            let dml = runtime_lib_dir(&dir, provider);
+            dlls::locate(&dlls::search_dirs(&dml), dlls::DIRECTML_LIB)
+                .map(|found| found.join(dlls::DIRECTML_LIB))
+        }
+        _ => None,
+    };
+    let mut onnx = Backend::from(registered(
+        onnx_backend(provider),
+        provider,
+        cuda_runtime.as_deref(),
+        directml_lib.as_deref(),
+    ));
 
     let mut registry = ModelRegistry::default();
     let mut names = Vec::new();
@@ -808,11 +943,6 @@ pub fn configure(config: &Config) -> Result<()> {
 
     report_verdict(&dir, config, &placements);
 
-    let cuda_runtime = match provider {
-        Provider::Cuda => dlls::locate(&dlls::search_dirs(&dir), dlls::CUDA_RUNTIME)
-            .map(|found| found.join(dlls::CUDA_RUNTIME)),
-        _ => None,
-    };
     let placed = placements
         .iter()
         .map(|p| (p.name.clone(), p.provider))

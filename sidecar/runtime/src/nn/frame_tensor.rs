@@ -6,12 +6,15 @@
 //! process's device is D3D12 and the CUDA runtime finds the same adapter,
 //! the pass writes a buffer on a shared heap that CUDA has imported, and
 //! the tensor handed to `wasi:nn` is that buffer, bound to the session with
-//! no copy: `[nn] <model>: input from the pool, bound on CUDA`. Otherwise
-//! the pass's output is read back once and the tensor is ordinary bytes:
-//! `[nn] <model>: input downloaded, <why>`. DirectML is one of those: the
-//! pinned `ort` (2.0.0-rc.10) carries none of DirectML's interop API, and
-//! its DirectML provider takes a device id and never the caller's D3D12
-//! device, so a DirectML session cannot be handed a D3D12 buffer.
+//! no copy: `[nn] <model>: input from the pool, bound on CUDA`. The session
+//! runs on a stream of the host's, in which a wait for the pass is queued
+//! ahead of the run, so the GPU orders the two and the CPU waits for
+//! neither. Where the model's session is DirectML on the process's own
+//! device and queue ([`crate::nn::directml`]), the pass's buffer is handed
+//! to the session as a DirectML allocation, and the queue orders the pass
+//! and the run: `[nn] <model>: input from the pool, bound on DIRECTML`.
+//! Otherwise the pass's output is read back once and the tensor is ordinary
+//! bytes: `[nn] <model>: input downloaded, <why>`.
 //!
 //! A frame in host memory is made into the tensor on the CPU, the same way
 //! the pass makes it: `[nn] <model>: input in host memory, made on the CPU`.
@@ -36,6 +39,10 @@ enum Route {
     /// The pass's buffer, bound to a CUDA session in place.
     #[cfg(windows)]
     Bound(&'static bound::Binder),
+    /// The pass's buffer, bound to a DirectML session on the process's
+    /// device in place.
+    #[cfg(windows)]
+    DirectMl,
     /// The pass's buffer read back once; why it is not bound.
     Downloaded(String),
 }
@@ -97,9 +104,11 @@ fn settle(provider: Provider) -> Route {
                 )
             }
         }
+        #[cfg(windows)]
+        Provider::DirectMl if crate::nn::directml::on_shared_device() => Route::DirectMl,
         Provider::DirectMl => Route::Downloaded(
-            "DIRECTML takes host memory (the pinned ort cannot hand a D3D12 buffer to a \
-             DirectML session)"
+            "DIRECTML takes host memory (its session runs on a device of its own, not the \
+             pool's)"
                 .to_string(),
         ),
         other => Route::Downloaded(format!("{} takes host memory", other.name())),
@@ -155,6 +164,21 @@ pub fn frame_tensor(
                 why
             }
         },
+        #[cfg(windows)]
+        Route::DirectMl => match bound::bind_directml(gpu, spec) {
+            Ok(tensor) => {
+                say(model, "input from the pool, bound on DIRECTML");
+                return Ok(tensor);
+            }
+            Err(e) => {
+                let why = format!("DIRECTML could not bind the pool's memory ({e:#})");
+                routes()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(model.to_string(), Route::Downloaded(why.clone()));
+                why
+            }
+        },
         Route::Downloaded(why) => why,
     };
     let made = gpu.tensor(spec, false)?;
@@ -166,25 +190,25 @@ pub fn frame_tensor(
 /// The bound route: the process's D3D12 device, the CUDA runtime the CUDA
 /// provider loaded, and the import of the device's shared sync object.
 #[cfg(windows)]
-mod bound {
+pub(crate) mod bound {
     use std::sync::{Arc, OnceLock};
     use std::time::Instant;
 
     use anyhow::{anyhow, bail, Result};
     use wasmtime_wasi_nn::wit::TensorType;
-    use wasmtime_wasi_nn::{DeviceHandle, DeviceInput, Tensor};
+    use wasmtime_wasi_nn::{DeviceHandle, DeviceInput, DeviceMemory, Tensor};
 
     use crate::gpu::d3d12::{adapter_luid, SharedSync};
     use crate::gpu::frames::GpuFrame;
     use crate::gpu::tensor::{DeviceTensor, TensorSpec};
-    use crate::nn::cuda::{Cuda, CudaBuffer, CudaSemaphore};
+    use crate::nn::cuda::{Cuda, CudaBuffer, CudaSemaphore, SESSION_DEVICE};
     use crate::profile::PROFILE;
 
     /// What binding a frame's tensor takes, made once a process.
     pub struct Binder {
-        cuda: &'static Cuda,
+        pub(crate) cuda: &'static Cuda,
         /// The device's shared sync object, as CUDA waits on it.
-        semaphore: CudaSemaphore,
+        pub(crate) semaphore: CudaSemaphore,
     }
 
     impl Binder {
@@ -203,12 +227,13 @@ mod bound {
             })?;
             let path = crate::nn::cuda_runtime()
                 .ok_or_else(|| anyhow!("the CUDA runtime the provider loads was not found"))?;
-            let cuda = Cuda::open(&path, luid)?;
+            let cuda = Cuda::open(&path)?;
+            let ordinal = cuda.ordinal_of(luid)?;
             // The CUDA provider runs every session on device 0.
-            if cuda.device != 0 {
+            if ordinal != SESSION_DEVICE {
                 bail!(
-                    "the pool's adapter is CUDA device {}, and the CUDA session runs on device 0",
-                    cuda.device
+                    "the pool's adapter is CUDA device {ordinal}, and the CUDA session runs on \
+                     device {SESSION_DEVICE}"
                 );
             }
             let sync = SharedSync::get()?;
@@ -247,6 +272,47 @@ mod bound {
         }
     }
 
+    /// `frame` made into `spec`'s tensor in a buffer of the process's
+    /// device, as a tensor whose elements are that buffer handed to
+    /// DirectML.
+    pub fn bind_directml(frame: &GpuFrame, spec: &TensorSpec) -> Result<Tensor> {
+        let made = frame.tensor(spec, true)?;
+        let allocation = crate::nn::directml::allocation_of_buffer(&made.buffer)?;
+        Ok(Tensor::on_device(
+            spec.dimensions(),
+            TensorType::Fp32,
+            DeviceHandle(Arc::new(DirectMlInput {
+                allocation: allocation.pointer(),
+                tensor: made,
+            })),
+        ))
+    }
+
+    /// A frame's tensor as a DirectML session binds it. The session runs on
+    /// the queue the pass was given to, after it, so nothing waits.
+    struct DirectMlInput {
+        allocation: u64,
+        tensor: Arc<DeviceTensor>,
+    }
+
+    impl DeviceInput for DirectMlInput {
+        fn memory(&self) -> DeviceMemory {
+            DeviceMemory::DirectMl {
+                allocation: self.allocation,
+            }
+        }
+
+        fn ready(&self) -> wasmtime::Result<()> {
+            Ok(())
+        }
+
+        fn read(&self) -> wasmtime::Result<Vec<u8>> {
+            self.tensor
+                .read_back()
+                .map_err(|e| wasmtime::format_err!("{e:#}"))
+        }
+    }
+
     /// A frame's tensor as a session binds it.
     struct Bound {
         pointer: u64,
@@ -264,22 +330,33 @@ mod bound {
     }
 
     impl DeviceInput for Bound {
-        fn cuda_pointer(&self) -> (u64, i32) {
-            (self.pointer, self.binder.cuda.device)
+        fn memory(&self) -> DeviceMemory {
+            DeviceMemory::Cuda {
+                pointer: self.pointer,
+                ordinal: SESSION_DEVICE,
+            }
         }
 
+        /// The session waits for the pass in its own stream, so the GPU
+        /// orders the two; without that stream the CPU waits.
         fn ready(&self) -> wasmtime::Result<()> {
+            let Some(value) = self.tensor.written_at else {
+                return Ok(());
+            };
+            let waited = match crate::nn::session_stream() {
+                Some(stream) => self.binder.semaphore.wait_in(stream, value),
+                None => self.binder.semaphore.wait(value),
+            };
+            waited.map_err(|e| wasmtime::format_err!("{e:#}"))
+        }
+
+        fn read(&self) -> wasmtime::Result<Vec<u8>> {
             if let Some(value) = self.tensor.written_at {
                 self.binder
                     .semaphore
                     .wait(value)
                     .map_err(|e| wasmtime::format_err!("{e:#}"))?;
             }
-            Ok(())
-        }
-
-        fn read(&self) -> wasmtime::Result<Vec<u8>> {
-            self.ready()?;
             let started = Instant::now();
             let bytes = self
                 .mapped()

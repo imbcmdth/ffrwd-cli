@@ -86,6 +86,8 @@ interface frames {
 /// which way that was.
 interface nn {
   use wasi:nn/tensor@0.2.0-rc-2024-10-28.{tensor};
+  use wasi:nn/inference@0.2.0-rc-2024-10-28.{graph-execution-context};
+  use wasi:webgpu/webgpu@0.0.1.{gpu-texture};
 
   /// How the tensor's elements are laid out: `nchw` is [1, 3, height,
   /// width], one plane per channel; `nhwc` is [1, height, width, 3], the
@@ -141,6 +143,33 @@ interface nn {
   /// tick's frames, a model no `-nn` binds, a size of 0, or a `std` of 0
   /// is an error.
   frame-tensor: func(id: u32, index: u32, options: frame-tensor-options) -> result<tensor, string>;
+
+  /// An output of a graph held as a texture.
+  record output-texture-options {
+    /// The graph's name for the output.
+    output: string,
+    /// The texture's size. The output's fp32 elements are its texels in
+    /// order, row by row, so it has `width * height` of them; the output's
+    /// dynamic dimensions are taken as the last the width, the one before
+    /// it the height, and any others 1.
+    width: u32,
+    height: u32,
+  }
+
+  /// Binds output `options.output` of `context` to an `r32float` texture
+  /// of the module's device, one element a texel: from the next `compute`
+  /// of `context` on, each writes the output there, and a pass the module
+  /// submits after `compute` returns reads what that `compute` wrote.
+  /// Where the session can write the device's memory the output never
+  /// leaves the device; elsewhere it comes back to host memory and is
+  /// uploaded into the texture once. `compute` still lists the output, and
+  /// its `data` reads the elements back. The texture is the host's, valid
+  /// as long as `context` is, read-only to the module (`texture-binding`
+  /// and `copy-src`), and dropping the handle drops nothing; binding the
+  /// same output again at the same size answers the same texture. An
+  /// output the graph does not have, one that is not fp32, a size of 0 or
+  /// one whose element count the output's shape cannot have is an error.
+  output-texture: func(context: borrow<graph-execution-context>, options: output-texture-options) -> result<gpu-texture, string>;
 }
 
 /// What a module includes beside `ffrwd:av/node-module`.

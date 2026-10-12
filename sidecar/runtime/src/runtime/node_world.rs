@@ -300,6 +300,7 @@ fn instantiate_node(module_path: &str, purpose: Purpose) -> Result<Instantiated>
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
+            gpu_outputs: Default::default(),
         },
     );
     let instance = linker

@@ -1,7 +1,9 @@
 //! The CUDA runtime, loaded at run time, for the few calls that let a CUDA
-//! session read memory on the process's D3D12 device: importing a shared
-//! D3D12 buffer as a CUDA device pointer, importing a shared D3D12 sync
-//! object as a CUDA external semaphore, and waiting on it.
+//! session read and write memory on the process's D3D12 device: importing
+//! a shared D3D12 buffer as a CUDA device pointer, importing a shared D3D12
+//! sync object as a CUDA external semaphore, waiting on one and signalling
+//! one in a stream, and the stream every CUDA session runs on, so those
+//! waits and signals are ordered with the sessions' work on the GPU.
 //!
 //! The library is the CUDA 12 runtime ONNX Runtime's CUDA provider already
 //! loaded (`cudart64_12.dll`, found where the provider's preflight found
@@ -33,6 +35,8 @@ type FnImportExternalSemaphore =
     unsafe extern "C" fn(*mut *mut c_void, *const SemaphoreHandleDesc) -> CudaError;
 type FnWaitExternalSemaphores =
     unsafe extern "C" fn(*const *mut c_void, *const WaitParams, c_uint, *mut c_void) -> CudaError;
+type FnSignalExternalSemaphores =
+    unsafe extern "C" fn(*const *mut c_void, *const SignalParams, c_uint, *mut c_void) -> CudaError;
 type FnStreamCreateWithFlags = unsafe extern "C" fn(*mut *mut c_void, c_uint) -> CudaError;
 type FnStreamSynchronize = unsafe extern "C" fn(*mut c_void) -> CudaError;
 type FnMemcpy = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> CudaError;
@@ -109,12 +113,30 @@ struct WaitParams {
     reserved: [c_uint; 16],
 }
 
+/// `cudaExternalSemaphoreSignalParams`, the layout the `_v2` entry point
+/// takes: a D3D12 sync object is set to `value`. Its parameters end on a
+/// u32 after 8-byte members, so C pads the struct to 144 bytes, as this
+/// one is.
+#[repr(C)]
+struct SignalParams {
+    value: u64,
+    nv_sci_sync: u64,
+    keyed_mutex_key: u64,
+    params_reserved: [c_uint; 12],
+    flags: c_uint,
+    reserved: [c_uint; 16],
+}
+
 // The sizes the CUDA 12 and 13 headers give these structs on 64-bit
 // Windows.
 const _: () = assert!(std::mem::size_of::<MemoryHandleDesc>() == 104);
 const _: () = assert!(std::mem::size_of::<BufferDesc>() == 88);
 const _: () = assert!(std::mem::size_of::<SemaphoreHandleDesc>() == 96);
 const _: () = assert!(std::mem::size_of::<WaitParams>() == 144);
+const _: () = assert!(std::mem::size_of::<SignalParams>() == 144);
+
+/// The CUDA device every session runs on: the CUDA provider's default.
+pub const SESSION_DEVICE: c_int = 0;
 
 /// The functions resolved from the runtime, each named as it is exported.
 struct Fns {
@@ -127,6 +149,7 @@ struct Fns {
     free: FnDestroy,
     import_external_semaphore: FnImportExternalSemaphore,
     wait_external_semaphores: FnWaitExternalSemaphores,
+    signal_external_semaphores: FnSignalExternalSemaphores,
     stream_create: FnStreamCreateWithFlags,
     stream_synchronize: FnStreamSynchronize,
     stream_destroy: FnDestroy,
@@ -135,13 +158,10 @@ struct Fns {
     get_error_string: FnGetErrorString,
 }
 
-/// The loaded runtime, its functions, and the CUDA device the process's
-/// D3D12 adapter is.
+/// The loaded runtime and its functions.
 pub struct Cuda {
     _library: Library,
     fns: Fns,
-    /// The CUDA ordinal of the adapter the process's D3D12 device is on.
-    pub device: c_int,
     /// Where the library was loaded from.
     pub path: PathBuf,
 }
@@ -165,20 +185,19 @@ unsafe fn symbol<T: Copy>(library: &Library, path: &Path, name: &str) -> Result<
 }
 
 impl Cuda {
-    /// The runtime, loaded once per process from `path`, with the device
-    /// whose LUID is `luid` (the D3D12 adapter's) found among CUDA's. The
-    /// first answer, a refusal included, is every later one.
-    pub fn open(path: &Path, luid: [u8; 8]) -> Result<&'static Cuda> {
+    /// The runtime, loaded once per process from `path`. The first answer,
+    /// a refusal included, is every later one.
+    pub fn open(path: &Path) -> Result<&'static Cuda> {
         static OPENED: OnceLock<std::result::Result<Cuda, String>> = OnceLock::new();
         OPENED
-            .get_or_init(|| Cuda::load(path, luid).map_err(|e| format!("{e:#}")))
+            .get_or_init(|| Cuda::load(path).map_err(|e| format!("{e:#}")))
             .as_ref()
             .map_err(|e| anyhow!("{e}"))
     }
 
-    fn load(path: &Path, luid: [u8; 8]) -> Result<Cuda> {
+    fn load(path: &Path) -> Result<Cuda> {
         // SAFETY: loading the CUDA runtime runs its initialisers, which the
-        // CUDA provider has already run in this process.
+        // CUDA provider runs in this process too.
         let library = unsafe { Library::new(path) }
             .map_err(|e| anyhow!("{} could not be loaded: {e}", path.display()))?;
         // SAFETY: each type is the signature the CUDA 12 runtime's headers
@@ -198,6 +217,11 @@ impl Cuda {
                     path,
                     "cudaWaitExternalSemaphoresAsync_v2",
                 )?,
+                signal_external_semaphores: symbol(
+                    &library,
+                    path,
+                    "cudaSignalExternalSemaphoresAsync_v2",
+                )?,
                 stream_create: symbol(&library, path, "cudaStreamCreateWithFlags")?,
                 stream_synchronize: symbol(&library, path, "cudaStreamSynchronize")?,
                 stream_destroy: symbol(&library, path, "cudaStreamDestroy")?,
@@ -206,29 +230,43 @@ impl Cuda {
                 get_error_string: symbol(&library, path, "cudaGetErrorString")?,
             }
         };
-        let mut cuda = Cuda {
+        Ok(Cuda {
             _library: library,
             fns,
-            device: -1,
             path: path.to_path_buf(),
-        };
+        })
+    }
+
+    /// The CUDA ordinal of the adapter whose LUID is `luid`.
+    pub fn ordinal_of(&self, luid: [u8; 8]) -> Result<c_int> {
         let mut count: c_int = 0;
         // SAFETY: a call with a valid out pointer.
-        cuda.check("cudaGetDeviceCount", unsafe {
-            (cuda.fns.get_device_count)(&mut count)
+        self.check("cudaGetDeviceCount", unsafe {
+            (self.fns.get_device_count)(&mut count)
         })?;
         let mut properties = vec![0u8; PROPERTIES_LEN];
         for ordinal in 0..count {
             // SAFETY: the buffer is larger than any `cudaDeviceProp`.
-            cuda.check("cudaGetDeviceProperties", unsafe {
-                (cuda.fns.get_device_properties)(properties.as_mut_ptr(), ordinal)
+            self.check("cudaGetDeviceProperties", unsafe {
+                (self.fns.get_device_properties)(properties.as_mut_ptr(), ordinal)
             })?;
             if properties[LUID_OFFSET..LUID_OFFSET + 8] == luid {
-                cuda.device = ordinal;
-                return Ok(cuda);
+                return Ok(ordinal);
             }
         }
         bail!("none of the {count} CUDA device(s) is the adapter the process's D3D12 device is on")
+    }
+
+    /// A stream of its own on the session device, which a session is built
+    /// on so the waits and signals queued in it are ordered with its work.
+    pub fn stream(&'static self) -> Result<CudaStream> {
+        self.current()?;
+        let mut stream: *mut c_void = std::ptr::null_mut();
+        // SAFETY: a valid out pointer.
+        self.check("cudaStreamCreateWithFlags", unsafe {
+            (self.fns.stream_create)(&mut stream, STREAM_NON_BLOCKING)
+        })?;
+        Ok(CudaStream { cuda: self, stream })
     }
 
     /// `code` as an error naming `call`, or nothing for success.
@@ -248,11 +286,11 @@ impl Cuda {
         bail!("{call} failed: {text} (error {code})")
     }
 
-    /// Makes the adapter's device current on the calling thread.
+    /// Makes the session device current on the calling thread.
     fn current(&self) -> Result<()> {
         // SAFETY: a call with a valid ordinal.
         self.check("cudaSetDevice", unsafe {
-            (self.fns.set_device)(self.device)
+            (self.fns.set_device)(SESSION_DEVICE)
         })
     }
 
@@ -302,8 +340,8 @@ impl Cuda {
     }
 
     /// The D3D12 sync object behind the NT handle `handle` as a CUDA
-    /// external semaphore, with a stream of its own to wait on it in. The
-    /// handle stays the caller's to close.
+    /// external semaphore, with a stream of its own to wait on it in where
+    /// no session stream is given. The handle stays the caller's to close.
     pub fn import_semaphore(&'static self, handle: *mut c_void) -> Result<CudaSemaphore> {
         self.current()?;
         let desc = SemaphoreHandleDesc {
@@ -330,6 +368,39 @@ impl Cuda {
             semaphore,
             stream,
         })
+    }
+}
+
+/// A CUDA stream, destroyed when dropped.
+pub struct CudaStream {
+    cuda: &'static Cuda,
+    stream: *mut c_void,
+}
+
+// SAFETY: a stream handle, used through the thread-safe runtime API.
+unsafe impl Send for CudaStream {}
+unsafe impl Sync for CudaStream {}
+
+impl CudaStream {
+    /// The `cudaStream_t`, for a session to be built on.
+    pub fn raw(&self) -> *mut c_void {
+        self.stream
+    }
+
+    /// Returns once everything queued in the stream has run.
+    pub fn synchronize(&self) -> Result<()> {
+        self.cuda.current()?;
+        // SAFETY: a live stream.
+        self.cuda.check("cudaStreamSynchronize", unsafe {
+            (self.cuda.fns.stream_synchronize)(self.stream)
+        })
+    }
+}
+
+impl Drop for CudaStream {
+    fn drop(&mut self) {
+        // SAFETY: made here, released once.
+        unsafe { (self.cuda.fns.stream_destroy)(self.stream) };
     }
 }
 
@@ -390,9 +461,47 @@ unsafe impl Send for CudaSemaphore {}
 unsafe impl Sync for CudaSemaphore {}
 
 impl CudaSemaphore {
+    /// Has `stream`'s later work wait until the sync object has reached
+    /// `value`, without the CPU waiting.
+    pub fn wait_in(&self, stream: &CudaStream, value: u64) -> Result<()> {
+        self.queue_wait(stream.stream, value)
+    }
+
+    /// Has `stream` set the sync object to `value` once the work queued in
+    /// it before has run.
+    pub fn signal_in(&self, stream: &CudaStream, value: u64) -> Result<()> {
+        self.cuda.current()?;
+        let params = SignalParams {
+            value,
+            nv_sci_sync: 0,
+            keyed_mutex_key: 0,
+            params_reserved: [0; 12],
+            flags: 0,
+            reserved: [0; 16],
+        };
+        // SAFETY: one imported semaphore, its parameters, and a live stream.
+        self.cuda
+            .check("cudaSignalExternalSemaphoresAsync", unsafe {
+                (self.cuda.fns.signal_external_semaphores)(
+                    &self.semaphore,
+                    &params,
+                    1,
+                    stream.stream,
+                )
+            })
+    }
+
     /// Returns once the sync object has reached `value`: the wait is queued
-    /// on the semaphore's stream, and the stream is waited for.
+    /// on the semaphore's own stream, and the stream is waited for.
     pub fn wait(&self, value: u64) -> Result<()> {
+        self.queue_wait(self.stream, value)?;
+        // SAFETY: a live stream.
+        self.cuda.check("cudaStreamSynchronize", unsafe {
+            (self.cuda.fns.stream_synchronize)(self.stream)
+        })
+    }
+
+    fn queue_wait(&self, stream: *mut c_void, value: u64) -> Result<()> {
         self.cuda.current()?;
         let params = WaitParams {
             value,
@@ -406,11 +515,7 @@ impl CudaSemaphore {
         };
         // SAFETY: one imported semaphore, its parameters, and a live stream.
         self.cuda.check("cudaWaitExternalSemaphoresAsync", unsafe {
-            (self.cuda.fns.wait_external_semaphores)(&self.semaphore, &params, 1, self.stream)
-        })?;
-        // SAFETY: a live stream.
-        self.cuda.check("cudaStreamSynchronize", unsafe {
-            (self.cuda.fns.stream_synchronize)(self.stream)
+            (self.cuda.fns.wait_external_semaphores)(&self.semaphore, &params, 1, stream)
         })
     }
 }

@@ -1111,14 +1111,16 @@ pub fn adapter_luid() -> Option<[u8; 8]> {
 }
 
 /// A `size`-byte buffer of the process's device on a shared heap, handed to
-/// wgpu with `usage`, and the NT handle another API imports it through.
-/// The buffer is wgpu's to drop; the handle keeps nothing alive but itself.
+/// wgpu with `usage`, the NT handle another API imports it through, and the
+/// D3D12 resource, for an API on the same device (DirectML). The buffer is
+/// wgpu's to drop; the handle and the resource keep nothing alive but
+/// themselves and their reference.
 pub fn shared_buffer(
     global: &Global,
     device: &SharedDevice,
     size: u64,
     usage: wgpu_types::BufferUsages,
-) -> Result<(wgpu_core::id::BufferId, SharedHandle)> {
+) -> Result<(wgpu_core::id::BufferId, SharedHandle, ID3D12Resource)> {
     let raw = self::device().ok_or_else(|| anyhow!("the process's device is not a D3D12 one"))?;
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -1154,6 +1156,7 @@ pub fn shared_buffer(
     .with_context(|| format!("a shared {size}-byte buffer"))?;
     let resource = made.ok_or_else(|| anyhow!("CreateCommittedResource made nothing"))?;
     let handle = share(&raw, &resource.cast()?)?;
+    let kept = resource.clone();
     // SAFETY: a buffer of this device, `size` bytes, in the common state,
     // which a buffer leaves for any state it is first used in.
     let hal = unsafe { wgpu_hal::dx12::Device::buffer_from_raw(resource, size) };
@@ -1174,7 +1177,7 @@ pub fn shared_buffer(
         global.buffer_drop(buffer);
         bail!("wgpu refused a shared buffer: {e}");
     }
-    Ok((buffer, handle))
+    Ok((buffer, handle, kept))
 }
 
 /// A sync object of the process's device that the queue signals after
@@ -1231,4 +1234,74 @@ impl SharedSync {
         *signalled = next;
         Ok(next)
     }
+}
+
+/// A sync object of the process's device that another API signals and the
+/// queue waits on, so work given to the queue afterwards runs once what
+/// that API did before the signal has; and the NT handle that API imports
+/// it through.
+pub struct ForeignSync {
+    sync: SyncObject,
+    handle: SharedHandle,
+    /// The last value handed out.
+    next: std::sync::Mutex<u64>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the count is behind a lock.
+unsafe impl Send for ForeignSync {}
+unsafe impl Sync for ForeignSync {}
+
+impl ForeignSync {
+    /// The process's one such sync object, made the first time anything
+    /// asks.
+    pub fn get() -> Result<&'static ForeignSync> {
+        static MADE: std::sync::OnceLock<std::result::Result<ForeignSync, String>> =
+            std::sync::OnceLock::new();
+        MADE.get_or_init(|| ForeignSync::make().map_err(|e| format!("{e:#}")))
+            .as_ref()
+            .map_err(|e| anyhow!("{e}"))
+    }
+
+    fn make() -> Result<ForeignSync> {
+        let device = device().ok_or_else(|| anyhow!("the process's device is not a D3D12 one"))?;
+        // SAFETY: a COM call on a live device.
+        let sync: SyncObject = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_SHARED) }
+            .context("a shared sync object")?;
+        let handle = share(&device, &sync.cast()?)?;
+        Ok(ForeignSync {
+            sync,
+            handle,
+            next: std::sync::Mutex::new(0),
+        })
+    }
+
+    /// The handle another API imports the sync object through.
+    pub fn handle(&self) -> &SharedHandle {
+        &self.handle
+    }
+
+    /// Has `signal` set the sync object to the next value, then has the
+    /// queue wait for that value before anything given to it afterwards.
+    /// The lock is held across both, so values are signalled in order.
+    pub fn signal_then_wait(
+        &self,
+        global: &Global,
+        device: &SharedDevice,
+        signal: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<()> {
+        let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let value = *next + 1;
+        signal(value)?;
+        *next = value;
+        // SAFETY: COM calls on live objects.
+        unsafe { queue(global, device)?.Wait(&self.sync, value) }
+            .context("having the queue wait on the shared sync object")
+    }
+}
+
+/// The queue every module and the host submit to, as D3D12 has it, for an
+/// API on the same device to submit its own work to in order with theirs.
+pub fn raw_queue() -> Result<ID3D12CommandQueue> {
+    let device = shared_device().ok_or_else(|| anyhow!("this machine has no GPU adapter"))?;
+    queue(shared(), device)
 }

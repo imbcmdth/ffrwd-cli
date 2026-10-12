@@ -31,6 +31,8 @@ pub mod d3d12;
 #[cfg(feature = "gpu")]
 pub mod frames;
 #[cfg(feature = "gpu")]
+pub mod output;
+#[cfg(feature = "gpu")]
 pub mod tensor;
 
 /// A build without the `gpu` feature holds no frame on a GPU; the type
