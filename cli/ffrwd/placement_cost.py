@@ -51,6 +51,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
+from . import av
 from .errors import ErrorCode, FfrwdError
 from .placement import (
     Placement,
@@ -60,7 +61,6 @@ from .placement import (
     file_handoffs,
     flow_edges,
     gpu_processes,
-    needs_gpu,
     stream_order,
 )
 from .processes import (
@@ -305,10 +305,14 @@ def process_load(process: object, plan: ProcessPlan, fps: float = 30.0) -> Load:
             _LIGHT_CORES if _module_name(path) in _LIGHT_MODULES else _REGION_CORES
             for path in loaded
         )
-        if needs_gpu(process):
+        # The region's own decode and encode nodes, each a session on the card.
+        encodes, decodes = av.sessions(process.graph)
+        if process.models or any(grant.effect == "gpu" for grant in process.grants):
             # A model or a gpu grant: compute on the card.
-            return Load(cores + (_MODEL_CORES if process.models else 0.0), gpu_jobs=1)
-        return Load(cores)
+            return Load(
+                cores + (_MODEL_CORES if process.models else 0.0), 1, encodes, decodes
+            )
+        return Load(cores, 0, encodes, decodes)
     if not isinstance(process, FfmpegProcess):
         return Load()
     cores = 0.0

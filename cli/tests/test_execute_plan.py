@@ -1068,7 +1068,7 @@ def test_the_nn_runtime_directory_leads_ld_library_path(
     monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
     monkeypatch.setenv("LD_LIBRARY_PATH", "/already")
 
-    env = _EXECUTE._nn_runtime_env(["sidecar", "-nn-runtime", "/x", "-nn-target", "gpu"])
+    env = _EXECUTE._runtime_env(["sidecar", "-nn-runtime", "/x", "-nn-target", "gpu"])
 
     assert env is not None
     assert env["LD_LIBRARY_PATH"] == f"/x{os.pathsep}/already"
@@ -1081,10 +1081,25 @@ def test_the_nn_runtime_directory_stands_alone_with_nothing_inherited(
     monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
     monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
 
-    env = _EXECUTE._nn_runtime_env(["sidecar", "-nn-runtime", "/x"])
+    env = _EXECUTE._runtime_env(["sidecar", "-nn-runtime", "/x"])
 
     assert env is not None
     assert env["LD_LIBRARY_PATH"] == "/x"
+
+
+def test_the_av_runtime_directory_leads_ld_library_path_beside_the_nn_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """libavcodec loads its own libraries by soname, as the provider does."""
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/already")
+
+    env = _EXECUTE._runtime_env(["sidecar", "-av-runtime", "/av", "-nn-runtime", "/nn"])
+    assert env is not None
+    assert env["LD_LIBRARY_PATH"] == os.pathsep.join(["/nn", "/av", "/already"])
+    alone = _EXECUTE._runtime_env(["sidecar", "-av-runtime", "/av"])
+    assert alone is not None
+    assert alone["LD_LIBRARY_PATH"] == os.pathsep.join(["/av", "/already"])
 
 
 def test_a_member_with_no_nn_runtime_flag_is_untouched(
@@ -1093,7 +1108,7 @@ def test_a_member_with_no_nn_runtime_flag_is_untouched(
     """An ffmpeg member's argv names no runtime, so nothing is added for it."""
     monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
 
-    assert _EXECUTE._nn_runtime_env(["ffmpeg", "-i", "in.mp4", "out.mp4"]) is None
+    assert _EXECUTE._runtime_env(["ffmpeg", "-i", "in.mp4", "out.mp4"]) is None
 
 
 def test_windows_sets_nothing_even_with_a_runtime_flag(
@@ -1102,13 +1117,13 @@ def test_windows_sets_nothing_even_with_a_runtime_flag(
     """The sidecar's own loader already covers Windows; the cli leaves it be."""
     monkeypatch.setattr(_EXECUTE.sys, "platform", "win32")
 
-    assert _EXECUTE._nn_runtime_env(["sidecar", "-nn-runtime", "/x"]) is None
+    assert _EXECUTE._runtime_env(["sidecar", "-nn-runtime", "/x"]) is None
 
 
 def test_a_sidecar_with_a_runtime_is_spawned_with_the_built_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`_spawn` passes the environment `_nn_runtime_env` built straight through."""
+    """`_spawn` passes the environment `_runtime_env` built straight through."""
     monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
     monkeypatch.setattr(_EXECUTE.subprocess, "Popen", _FakePopen)
     monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
@@ -1120,7 +1135,7 @@ def test_a_sidecar_with_a_runtime_is_spawned_with_the_built_environment(
             command,
             subprocess.DEVNULL,
             subprocess.DEVNULL,
-            env=_EXECUTE._nn_runtime_env(command),
+            env=_EXECUTE._runtime_env(command),
         ),
     )
 
@@ -1141,7 +1156,7 @@ def test_an_ffmpeg_member_is_spawned_with_no_environment_override(
             command,
             subprocess.DEVNULL,
             subprocess.DEVNULL,
-            env=_EXECUTE._nn_runtime_env(command),
+            env=_EXECUTE._runtime_env(command),
         ),
     )
 

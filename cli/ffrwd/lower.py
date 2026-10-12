@@ -292,8 +292,10 @@ from typing import Literal, cast
 from sqlglot import exp
 
 from ffrwd import binaries, loudnorm
+from ffrwd.av import DECODABLE
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.functions import (
+    CODED_EDGES,
     DECLARED_STREAM,
     SHARED_ARGUMENT,
     STAR_FIELD,
@@ -1680,7 +1682,8 @@ class _Connection:
     pcm its sound travels as, which the first module reading sound here
     decides, and `pix_fmt` the pixel format its picture does. `lateral` is
     the key of the run-time lateral whose instances write it, and "" for a
-    connection a process of the plan writes.
+    connection a process of the plan writes. `coded` says a module reading
+    it declares coded edges, so its picture may cross as packets.
     """
 
     streams: dict[FrameRef, _Stream] = field(default_factory=dict)
@@ -1688,6 +1691,7 @@ class _Connection:
     audio_codec: str = ""
     pix_fmt: str = ""
     lateral: str = ""
+    coded: bool = False
 
 
 # A run-time lateral's stream while lowering runs: never a node's input and
@@ -1729,6 +1733,9 @@ class _LateralUse:
     shape: dict[str, str | int | float] = field(default_factory=dict)
     ports: list[int] = field(default_factory=list)
 
+
+# What every feeder connection's destination starts with.
+_FEEDER_PREFIX = feeder_path(0).rpartition(":")[0] + ":"
 
 # How many picks a free feeder port is given before the compile gives up.
 _PORT_TRIES = 20
@@ -1810,7 +1817,10 @@ def _instance_template(
     data stream's place, what the call wrote itself, and every other value
     as a variable, ``:'name'`` for text and ``:name`` for the rest, which
     the host sets per message; one it leaves unset is NULL, and takes the
-    DEFAULT.
+    DEFAULT. A picture read by a module declaring coded edges is written as
+    a copy beside the port's pixel format, which the instance's compile
+    falls back to where the picture cannot be copied
+    (:meth:`_Lowerer._feeder_copy`).
     """
     alias = declared.alias
     arguments = [
@@ -1833,7 +1843,8 @@ def _instance_template(
             columns.append(f"{alias}.{parts[1]}")
         options = [f"format '{NUT}'"]
         if connection.pix_fmt:
-            options += [f"video_codec '{RAWVIDEO}'", f"pix_fmt '{connection.pix_fmt}'"]
+            codec = COPY_CODEC if connection.coded else RAWVIDEO
+            options += [f"video_codec '{codec}'", f"pix_fmt '{connection.pix_fmt}'"]
         if connection.audio_codec:
             options.append(f"audio_codec '{connection.audio_codec}'")
         statements.append(
@@ -5029,6 +5040,7 @@ class _Lowerer:
         self._check_metadata_track_container(options, outputs, path, raw)
         self._check_json_container(options, outputs, path, raw)
         self._codec_for_rows_track(options, outputs, path)
+        self._feeder_copy(options, outputs, path)
         options.update(colorimetry)
         return SinkUnit(
             outputs=outputs,
@@ -5040,6 +5052,36 @@ class _Lowerer:
             metadata=self.metadata,
             attachments=list(self.attachments),
         )
+
+    def _feeder_copy(
+        self, options: dict[str, object], outputs: Sequence[Output], path: str | None
+    ) -> None:
+        """A feeder COPY's ``video_codec 'copy'`` beside a ``pix_fmt``, settled.
+
+        The copy stands where every picture is an input's own stream,
+        untrimmed, in a codec the sidecar decodes; anywhere else the picture
+        is written raw in that pixel format, which the port takes as well.
+        """
+        if path is None or not path.startswith(_FEEDER_PREFIX):
+            return
+        if options.get("video_codec") != COPY_CODEC or "pix_fmt" not in options:
+            return
+        pictures = [output.ref for output in outputs if output.type == "video"]
+        if all(self._decodable(ref) for ref in pictures):
+            del options["pix_fmt"]
+        else:
+            options["video_codec"] = RAWVIDEO
+
+    def _decodable(self, ref: FrameRef) -> bool:
+        """True for an input's own picture, untrimmed, in a codec the sidecar
+        decodes."""
+        if not is_src(ref):
+            return False
+        alias, kind, _ = src_parts(ref)
+        if kind != "video" or alias in self.graph.input_trims or alias in self.fanout_windows:
+            return False
+        meta = self._probed_meta(ref)
+        return meta is not None and meta.codec in DECODABLE
 
     # -- a codec package's encoder ------------------------------------------
 
@@ -17155,6 +17197,7 @@ class _Lowerer:
         if lateral is not None:
             use = self._laterals[lateral[0]]
             connection.lateral = lateral[0]
+            connection.coded = connection.coded or declared.edges == CODED_EDGES
             if fed.stream.type == "video" and not connection.pix_fmt:
                 connection.pix_fmt = wire_pix_fmt(described)
             if port not in use.ports:

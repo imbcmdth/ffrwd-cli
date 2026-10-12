@@ -1256,3 +1256,44 @@ def test_a_stream_bound_where_a_groups_connection_brings_the_rows_is_refused() -
         "panel() binds 'cues', which arrives on the connection of the group 'panel', "
         "and 'feed' of that group is served by a port"
     )
+
+
+# -- a lateral feeding a region with coded edges ------------------------------
+
+
+def test_a_lateral_into_a_coded_region_writes_its_picture_as_a_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The instance names the copy beside the port's pixel format; its sound
+    is the pcm it always was."""
+    monkeypatch.setitem(
+        _DECLARATIONS,
+        "video",
+        _DECLARATIONS["video"].replace(
+            "LANGUAGE wasm;", "LANGUAGE wasm SET ffrwd.edges = 'coded';"
+        ),
+    )
+    (lateral,) = _lowered(_LEAF).laterals
+    assert "video_codec 'copy', pix_fmt 'yuv420p', audio_codec 'pcm_f32le'" in lateral.template
+
+
+@pytest.mark.parametrize(
+    ("picture", "options"),
+    [
+        ("f.video[1]", {"format": "nut", "video_codec": "copy"}),
+        (
+            "ffmpeg.hflip(f.video[1])",
+            {"format": "nut", "video_codec": "rawvideo", "pix_fmt": "yuv420p"},
+        ),
+    ],
+    ids=["an-inputs-own", "filtered"],
+)
+def test_an_instances_copy_stands_only_where_the_picture_is_an_inputs_own(
+    picture: str, options: dict[str, object]
+) -> None:
+    graph = _lowered(
+        f"COPY (SELECT {picture} FROM input('ad.mp4') f) TO 'tcp://127.0.0.1:9000' "
+        "WITH (format 'nut', video_codec 'copy', pix_fmt 'yuv420p')"
+    )
+    (unit,) = graph.sinks
+    assert unit.options == options

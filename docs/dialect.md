@@ -29,6 +29,7 @@ function := CREATE FUNCTION name(param ptype [DEFAULT literal], ...) RETURNS rty
                                  [ann annotation [DEFAULT NULL],]
                                  param type [DEFAULT literal], ...)
             RETURNS wrtype AS 'module', 'export' LANGUAGE wasm
+            [SET ffrwd.edges = 'coded']
           | CREATE FUNCTION name(param vtype, ...) RETURNS vtype
             AS 'module', 'export' LANGUAGE wasm
           | CREATE FUNCTION name(rows annotation) RETURNS annotation
@@ -409,6 +410,24 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   Postgres already uses, since they are only ever called qualified; a
   script's own may not. Each runs alone in a sidecar (`-codec encode` or
   `-codec decode`), from the `ffrwd:av@0.18.0` world on.
+- A **stream function declared `SET ffrwd.edges = 'coded'`** has its
+  region take coded packets on both pipes where it can, and the sidecar
+  decodes and encodes them itself with libavcodec, beside the module.
+  The ffmpeg in front writes `-c:v copy` when the module reads a source's
+  own stream, unfiltered, in a codec the sidecar's build decodes (h264,
+  hevc, av1, vp9, mpeg2video, prores, mjpeg, ffv1, mpeg4); the ffmpeg
+  behind writes `-c:v copy` when the destination names an encoder the
+  sidecar hosts (the `_nvenc`, `_amf`, `_mf`, `_videotoolbox` and
+  `_vaapi` encoders, and ffv1, mpeg4, mpeg2video and mjpeg), with the
+  encoder's options moved into the sidecar's `encode` node. Anything
+  else on either side stays raw, as without the clause. `codec_params`
+  has no spelling in the node and is refused beside a hosted encoder.
+  The clause means nothing on a value function, a codec package's
+  function, a packet sink or a data filter, and is refused there; so is
+  any other `SET` parameter. A run-time lateral feeding such a region
+  copies its picture too where the picture is a source's own stream.
+  Recipe [155](examples.md#155-decode-and-encode-inside-the-sidecar);
+  `sidecar/AV-EDGE.md` has the sidecar side.
 - A **value-returning `LANGUAGE wasm` function** (`RETURNS text`,
   `number`, `boolean` or `vector`) takes no stream at all: every
   parameter is one of those same `vtype`s, matched name-for-name against

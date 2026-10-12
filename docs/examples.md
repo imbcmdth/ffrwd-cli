@@ -547,6 +547,33 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f
 
 A module cannot be a link in one ffmpeg's filter graph, so the query compiles to three processes joined by pipes rather than one command: an ffmpeg that decodes, the sidecar hosting the module, and an ffmpeg that encodes what comes back. The frames travel as NUT, and the pixel format on both seams is the one the module and the wire agree on - `rgba` here, because that is what `invert` accepts. `ffrwd run` executes the whole pipeline itself; the printed form is for reading and pasting.
 
+## 155. Decode and encode inside the sidecar
+
+A module's region normally takes raw frames on both pipes: the first ffmpeg decodes, the sidecar reads the pixels, the last ffmpeg encodes. `SET ffrwd.edges = 'coded'` on the declaration moves both codec steps into the sidecar, where libavcodec runs them beside the module. The ffmpeg in front copies the stream's packets onto the pipe instead of decoding, and the one behind copies packets into the file instead of encoding:
+
+```pgsql
+CREATE FUNCTION invert(v video_stream) RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/invert.wasm', 'invert'
+  LANGUAGE wasm SET ffrwd.edges = 'coded';
+
+COPY (
+  SELECT invert(f.video[1])
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'inverted.mp4' WITH (video_codec 'h264_nvenc', video_bitrate '6M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -f nut pipe:1 | ffrwd-wasm -f \
+  nut -i pipe:0 -m invert=../sidecar/modules/target/wasm32-wasip2/release/invert.wasm \
+  -filter_complex \
+  '[0:v]decode=format=rgba[decode0];[decode0]invert[n1];'\
+'[n1]encode=codec=h264_nvenc:b=6M[out0]' -map '[out0]' -f nut pipe:1 | ffmpeg -f nut \
+  -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 copy inverted.mp4
+```
+
+`decode` and `encode` are the host's own nodes, like `leaky`: no module file stands behind them. The entry takes the copy only when the module reads a source's own stream, unfiltered, in a codec the sidecar's libavcodec decodes (h264, hevc, av1, vp9, mpeg2video, prores, mjpeg, ffv1, mpeg4); a filtered picture arrives raw, as before. The exit takes the copy only when the destination names an encoder the sidecar hosts (the `_nvenc`, `_amf`, `_mf`, `_videotoolbox` and `_vaapi` families, and the software ffv1, mpeg4, mpeg2video and mjpeg), and the encoder's options move into the node under the names ffmpeg's command line uses (`b` for `video_bitrate`, `g` for `gop`). Name `libx264` instead and the entry is still copied while the exit stays raw, since that encoder is not in the LGPL build the sidecar carries. Raw frames exist only inside the region, so the raw pipes, and ffmpeg's rawvideo packing on both sides, are gone from the path. `sidecar/AV-EDGE.md` says where the libraries come from and what the sidecar refuses.
+
 ## 139. Rewrite a stream's packets without decoding it
 
 `RETURNS packets` declares a module that reads a stream's ENCODED bytes and hands the same stream back - the interface a module weaving data into a file uses. Write the call as a column of the COPY's SELECT and the compiler defers it past the encoder the destination would have placed:

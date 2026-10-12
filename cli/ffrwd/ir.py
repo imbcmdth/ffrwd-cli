@@ -97,6 +97,12 @@ MAX_SPREAD = "max_spread"
 DEFAULT_MAX_LATENESS = 0.5
 DEFAULT_MAX_SPREAD = 2
 
+# The nodes that decode a region's coded input and encode its output, with
+# the libavcodec the sidecar loads. Hosted the same way: `decode` takes the
+# pixel format its pictures leave in, `encode` the encoder and its options.
+DECODE = "decode"
+ENCODE = "encode"
+
 # What a line of a sidecar's stderr starts with when it is a row the node
 # reports, a leaky's, rather than its log. The rest of the line is one JSON
 # object.

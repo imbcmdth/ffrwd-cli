@@ -12,9 +12,9 @@ from dataclasses import replace
 
 import pytest
 
-from ffrwd import wasm
+from ffrwd import processes, wasm
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.execute import plan_argv
+from ffrwd.execute import keeps_clock, plan_argv
 from ffrwd.ir import (
     Graph,
     ModuleSource,
@@ -2667,3 +2667,302 @@ def test_a_plan_document_this_version_did_not_write_is_refused_by_name(
     that fails later."""
     with pytest.raises(ValueError, match=named):
         ProcessPlan.from_dict(written)
+
+
+# ---------------------------------------------------------------- coded edges
+
+
+def _coded_probe(codec: str = "h264") -> ProbeResult:
+    """A picture in `codec` and a sound, as ffprobe would describe them."""
+    picture, sound = _video_probe().streams
+    return replace(_video_probe(), streams=[replace(picture, codec=codec), sound])
+
+
+def _coded_graph(
+    options: dict[str, object], *, filtered: bool = False, trimmed: bool = False
+) -> Graph:
+    """`invert` over an input's picture, the sound mapped beside it into one file."""
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    read = "src:a:v:0"
+    if filtered:
+        g.nodes["n0"] = Node(
+            id="n0", filter="hue", args={"h": 30}, inputs=[read], outputs=["video"]
+        )
+        read = "n0"
+    g.nodes["e0"] = Node(id="e0", filter="invert", args={}, inputs=[read], outputs=["video"])
+    g.sinks = [
+        SinkUnit(
+            outputs=[_out("e0"), _out("src:a:a:0", "audio")],
+            path="out.mp4",
+            options=dict(options),
+        )
+    ]
+    if trimmed:
+        g.input_trims["a"] = (1.0, 2.0)
+    return g
+
+
+_NVENC = {"video_codec": "h264_nvenc", "video_bitrate": "6M", "gop": 60, "audio_codec": "aac"}
+
+
+def _coded(
+    g: Graph, codec: str = "h264", coded: tuple[str, ...] = ("invert",)
+) -> ProcessPlan:
+    return partition(
+        g,
+        external=external_ids("e0"),
+        probes={"a": _coded_probe(codec)},
+        pix_fmts={"invert": "rgba"},
+        coded=coded,
+    )
+
+
+def test_a_coded_region_copies_its_input_in_and_its_file_out() -> None:
+    """The input's own h264 picture crosses as its packets and the file's
+    hosted encoder runs in the region, its options moved onto the node; the
+    sound beside it is untouched."""
+    plan = _coded(_coded_graph(_NVENC))
+    (region,) = plan.sidecars
+    entry = next(e for e in plan.stream_edges if e.target == region.id)
+    leaving = next(e for e in plan.stream_edges if e.source == region.id)
+    assert entry.format.codec == COPY_CODEC
+    assert leaving.format.codec == COPY_CODEC
+    assert region.av and region.network
+    assert region.graph is not None
+    assert [(n.filter, n.args) for n in region.graph.nodes.values()] == [
+        ("decode", {"format": "rgba"}),
+        ("invert", {}),
+        ("encode", {"codec": "h264_nvenc", "b": "6M", "g": 60}),
+    ]
+    writer = next(p for p in plan.ffmpeg if p.graph.sinks[0].path == "out.mp4")
+    assert writer.graph.sinks[0].options == {"video_codec": COPY_CODEC, "audio_codec": "aac"}
+    argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)
+    network = argv[region.id][argv[region.id].index("-filter_complex") + 1]
+    assert network == (
+        "[0:v]decode=format=rgba[decode0];[decode0]invert[e0];"
+        "[e0]encode=codec=h264_nvenc:b=6M:g=60[out0]"
+    )
+    assert argv[region.id][argv[region.id].index("-m") + 1] == "invert=invert"
+    feeder = argv[entry.source]
+    assert feeder[feeder.index("-c:0") + 1] == COPY_CODEC and "-pix_fmt:0" not in feeder
+    written = argv[writer.id]
+    assert written[written.index("-c:0") + 1] == COPY_CODEC
+    assert written[written.index("-c:1") + 1] == "aac"
+    assert "-b:0" not in written and "-g:0" not in written
+    # The packets left the input with the clock ffmpeg shifted them by.
+    assert not keeps_clock(leaving, plan)
+    assert SidecarProcess.from_dict(region.to_dict()) == region
+
+
+def test_a_coded_region_writing_an_encoder_ffmpeg_has_hands_back_frames() -> None:
+    """libx264 is not one the sidecar encodes: the entry is still copied, the
+    exit stays raw, and ffmpeg encodes as it always did."""
+    options = {"video_codec": "libx264", "crf": 20}
+    plan = _coded(_coded_graph(options))
+    (region,) = plan.sidecars
+    leaving = next(e for e in plan.stream_edges if e.source == region.id)
+    assert leaving.format.codec == RAWVIDEO
+    assert region.graph is not None
+    assert [n.filter for n in region.graph.nodes.values()] == ["decode", "invert"]
+    writer = next(p for p in plan.ffmpeg if p.graph.sinks[0].path == "out.mp4")
+    assert writer.graph.sinks[0].options == options
+
+
+@pytest.mark.parametrize(
+    ("graph", "codec"),
+    [
+        (_coded_graph({"video_codec": "libx264"}, filtered=True), "h264"),
+        (_coded_graph({"video_codec": "libx264"}, trimmed=True), "h264"),
+        (_coded_graph({"video_codec": "libx264"}), "dnxhd"),
+    ],
+    ids=["filtered", "trimmed", "not-decodable"],
+)
+def test_a_coded_region_reads_frames_where_the_packets_cannot_be_decoded(
+    graph: Graph, codec: str
+) -> None:
+    """The command is exactly the one the declaration without SET compiles to."""
+    declared = _coded(graph, codec)
+    plain = _coded(graph, codec, coded=())
+    assert not any(s.av for s in declared.sidecars)
+    assert plan_argv(declared, sidecar_argv=wasm.shown_argv) == plan_argv(
+        plain, sidecar_argv=wasm.shown_argv
+    )
+
+
+def test_a_hosted_encoder_beside_codec_params_is_refused() -> None:
+    with pytest.raises(FfrwdError) as caught:
+        _coded(_coded_graph({"video_codec": "hevc_nvenc", "codec_params": "x=1"}))
+    assert caught.value.code is ErrorCode.UNSUPPORTED_SQL
+    assert "names codec_params beside hevc_nvenc" in caught.value.message
+    assert caught.value.hint is not None and "video_bitrate" in caught.value.hint
+
+
+def test_a_raw_entry_into_a_hosted_encoder_keeps_the_clock() -> None:
+    """Frames an ffmpeg decoded are the plan's clock, so what the region
+    encodes from them is too."""
+    plan = _coded(_coded_graph(_NVENC, filtered=True))
+    (region,) = plan.sidecars
+    assert region.graph is not None
+    assert [n.filter for n in region.graph.nodes.values()] == ["invert", "encode"]
+    leaving = next(e for e in plan.stream_edges if e.source == region.id)
+    assert keeps_clock(leaving, plan)
+
+
+def test_only_a_running_sidecar_is_told_where_the_av_libraries_are(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wasm.binaries, "ffrwd_wasm_path", lambda: "ffrwd-wasm")
+    monkeypatch.setattr(wasm.av, "spawn_args", lambda: ["-av-runtime", "/libs"])
+    (coded,) = _coded(_coded_graph(_NVENC)).sidecars
+    (plain,) = _coded(_coded_graph(_NVENC), coded=()).sidecars
+    argv = wasm.sidecar_argv(coded)
+    assert argv[argv.index("-av-runtime") + 1] == "/libs"
+    assert "-av-runtime" not in wasm.sidecar_argv(plain)
+    assert "-av-runtime" not in wasm.shown_argv(coded)
+    monkeypatch.setattr(wasm.av, "spawn_args", lambda: [])
+    assert "-av-runtime" not in wasm.sidecar_argv(coded)
+
+
+def test_a_hosted_encoders_delay_moves_from_the_file_into_the_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The frames the encoder holds back are held in the region now: the sound
+    beside the picture waits exactly as long as it did for ffmpeg's encoder."""
+    monkeypatch.setitem(processes._ENCODER_LAGS, "h264_nvenc", 12)
+    graph = _passthrough_graph({"video_codec": "h264_nvenc"})
+
+    def placed(coded: tuple[str, ...]) -> ProcessPlan:
+        return partition(
+            graph,
+            external=external_ids("e0"),
+            probes={"a": _live_probe()},
+            pix_fmts={"invert": "rgba"},
+            coded=coded,
+        )
+
+    declared, plain = placed(("invert",)), placed(())
+    assert declared.sidecars[0].av and not plain.sidecars[0].av
+    assert declared.sidecars[0].lookahead == plain.sidecars[0].lookahead + 12
+    bounds = {(e.source, e.target, e.ref): e.bound for e in declared.stream_edges}
+    assert bounds == {(e.source, e.target, e.ref): e.bound for e in plain.stream_edges}
+    sound = next(e for e in declared.stream_edges if e.ref == "src:a:a:0")
+    assert sound.bound == 1 + 12
+
+
+# ---------------------------------------------------------------- coded node regions
+
+
+def _port(name: str, pairing: str, pixel_format: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "kind": "video",
+        "required": True,
+        "many": False,
+        "pairing": {"kind": pairing},
+        "rows": "ignore",
+        "window": 1,
+        "stride": 1,
+        "accepts": {"pixel_formats": [pixel_format]},
+    }
+
+
+# A compositor: its clock picture in rgba, a second picture laid over it in
+# yuv420p, and one picture out.
+_COMPOSE: dict[str, object] = {
+    "inputs": [_port("v", "lockstep", "rgba"), _port("over", "arrival", "yuv420p")],
+    "outputs": [{"name": "v", "kind": "video", "latency": 0}],
+    "clock": {"kind": "input", "port": "v"},
+    "pure": True,
+    "one_to_one": True,
+    "bounded": True,
+    "relation": [],
+}
+
+
+def _compose_probe() -> ProbeResult:
+    """Two h264 pictures, tagged bt709 and limited range."""
+    return ProbeResult(
+        streams=[
+            StreamMeta(
+                type="video", index=index, metadata={}, width=1280, height=720,
+                fps="30/1", sample_rate=None, codec="h264", color_range="tv",
+                color_primaries="bt709", color_transfer="bt709", color_space="bt709",
+            )
+            for index in (0, 1)
+        ]
+    )
+
+
+def _compose_plan(*, over: bool) -> ProcessPlan:
+    """`compose` over an input's first picture, and with `over` its second
+    picture through a `hue` laid over it, into one hosted encoder."""
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    inputs, ports = ["src:a:v:0"], ["v"]
+    if over:
+        g.nodes["n0"] = Node(
+            id="n0", filter="hue", args={"h": 30}, inputs=["src:a:v:1"], outputs=["video"]
+        )
+        inputs, ports = [*inputs, "n0"], [*ports, "over"]
+    g.nodes["c0"] = Node(
+        id="c0",
+        filter="compose",
+        args={},
+        inputs=inputs,
+        outputs=["video"],
+        ports=ports,
+        out_ports=["v"],
+    )
+    g.node_shapes["c0"] = _COMPOSE
+    g.sinks = [
+        SinkUnit(
+            outputs=[_out("c0")],
+            path="out.mp4",
+            options={"video_codec": "h264_nvenc", "video_bitrate": "6M"},
+        )
+    ]
+    return partition(
+        g, external=external_ids("c0"), probes={"a": _compose_probe()}, coded=("compose",)
+    )
+
+
+def _pad_of(sidecar: list[str]) -> dict[str, object] | None:
+    """The ``-pad`` JSON after the sidecar's one ``-i``, or None."""
+    at = sidecar.index("-i") + 2
+    return json.loads(sidecar[at + 1]) if sidecar[at] == "-pad" else None
+
+
+def test_a_coded_node_region_decodes_into_its_port_and_encodes_its_output() -> None:
+    plan = _compose_plan(over=False)
+    (region,) = plan.sidecars
+    assert region.node_network and region.av
+    entry = next(e for e in plan.stream_edges if e.target == region.id)
+    leaving = next(e for e in plan.stream_edges if e.source == region.id)
+    assert (entry.format.codec, leaving.format.codec) == (COPY_CODEC, COPY_CODEC)
+    argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)
+    sidecar = argv[region.id]
+    # The decoder reads the colour off the codec itself: the pad says nothing.
+    assert _pad_of(sidecar) is None
+    assert sidecar[sidecar.index("-filter_complex") + 1] == (
+        "[0:v]decode=format=rgba[decode0];[v=decode0]compose[v=c0];"
+        "[c0]encode=codec=h264_nvenc:b=6M[out0]"
+    )
+    assert sidecar[sidecar.index("-map") + 1] == "[out0]"
+    feeder, writer = argv[entry.source], argv[leaving.target]
+    assert feeder[feeder.index("-c:0") + 1] == COPY_CODEC
+    assert writer[writer.index("-c:0") + 1] == COPY_CODEC and "-b:0" not in writer
+
+
+def test_a_filtered_picture_beside_a_coded_one_stays_raw_with_its_colour() -> None:
+    plan = _compose_plan(over=True)
+    (region,) = plan.sidecars
+    entering = {e.ref: e.format for e in plan.stream_edges if e.target == region.id}
+    assert entering["src:a:v:0"].codec == COPY_CODEC
+    raw = entering["n0"]
+    assert isinstance(raw, VideoFormat)
+    assert (raw.codec, raw.pix_fmt) == (RAWVIDEO, "yuv420p")
+    sidecar = plan_argv(plan, sidecar_argv=wasm.shown_argv)[region.id]
+    assert _pad_of(sidecar) == {
+        "color": {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}
+    }
+    network = sidecar[sidecar.index("-filter_complex") + 1]
+    assert network.startswith("[0:v]decode=format=rgba[decode0];[v=decode0][over=0:v:1]compose")

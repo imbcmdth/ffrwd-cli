@@ -53,6 +53,8 @@ _SIDECAR_DISTRIBUTION = "ffrwd-wasm"
 # The sidecar's program name: what a printed command line names, and what
 # PATH is searched for.
 SIDECAR_EXECUTABLE = "ffrwd-wasm"
+# Where the sidecar's wheel puts the libav libraries, beside its package.
+_AV_DIRECTORY = "ffrwd_wasm_av"
 
 
 # How long a process tree that was just ended is given to let go of its pipes
@@ -197,6 +199,29 @@ def _sidecar_scripts_path() -> str | None:
             return located
     candidate = os.path.join(sysconfig.get_path("scripts"), SIDECAR_EXECUTABLE + suffix)
     return candidate if os.path.isfile(candidate) else None
+
+
+def ffrwd_av_dir() -> str | None:
+    """The directory the installed ``ffrwd-wasm`` wheel put its libav
+    libraries in, or None.
+
+    The wheel carries them under a top-level ``ffrwd_wasm_av/``, found
+    through the distribution's own file list for the reason
+    :func:`_sidecar_scripts_path` gives. None where the distribution is not
+    installed or lists no such file.
+    """
+    try:
+        dist = importlib.metadata.distribution(_SIDECAR_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    for listed in dist.files or ():
+        if not listed.parts or listed.parts[0] != _AV_DIRECTORY:
+            continue
+        located = os.path.normpath(str(dist.locate_file(listed)))
+        for _ in listed.parts[1:]:
+            located = os.path.dirname(located)
+        return located
+    return None
 
 
 def ffrwd_wasm_path() -> str | None:

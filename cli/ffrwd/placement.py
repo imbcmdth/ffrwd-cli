@@ -60,6 +60,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from . import av
 from .errors import ErrorCode, FfrwdError
 from .ir import is_rows_document
 from .processes import (
@@ -352,11 +353,15 @@ _GPU_FILTER_SUFFIXES = ("_cuda", "_npp")
 
 
 def needs_gpu(process: FfmpegProcess | SidecarProcess) -> bool:
-    """Whether `process` computes on a GPU: a region with a model or a
-    ``gpu`` grant, or an ffmpeg process with an NVIDIA codec, hwaccel or
-    filter."""
+    """Whether `process` computes on a GPU: a region with a model, a ``gpu``
+    grant or an ``encode`` node naming a hardware encoder, or an ffmpeg
+    process with an NVIDIA codec, hwaccel or filter."""
     if isinstance(process, SidecarProcess):
-        return bool(process.models) or any(grant.effect == _GPU for grant in process.grants)
+        return (
+            bool(process.models)
+            or any(grant.effect == _GPU for grant in process.grants)
+            or av.sessions(process.graph)[0] > 0
+        )
     graph = process.graph
     for options in graph.input_options.values():
         if str(options.get("hwaccel", "")).lower() in _GPU_HWACCELS:

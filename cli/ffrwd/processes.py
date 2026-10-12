@@ -113,10 +113,13 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Literal
 
+from .av import DECODABLE, ENCODE_OPTIONS, HOSTED_ENCODERS
 from .errors import ErrorCode, FfrwdError
 from .ir import (
+    DECODE,
     DEFAULT_MAX_LATENESS,
     DEFAULT_MAX_SPREAD,
+    ENCODE,
     LEAKY,
     MAX_LATENESS,
     MAX_SPREAD,
@@ -142,7 +145,7 @@ from .ir import (
 )
 from .probe import JSON_CODEC, ProbeResult, StreamMeta, is_url
 from .shapes import Accepts, NodeShape, node_shape
-from .sink import COLOR_OPTIONS
+from .sink import COLOR_OPTIONS, option_spec
 from .timing import Paths, paths_of
 
 __all__ = [
@@ -413,7 +416,14 @@ _ZERO_LATENCY = "zerolatency"
 
 # Nodes the sidecar hosts itself. They belong to a region the way a module
 # does -- ffmpeg cannot run them -- but no ``-m`` entry binds their name.
-HOSTED_FILTERS = frozenset({ROWFILTER, ROWMERGE, LEAKY})
+HOSTED_FILTERS = frozenset({ROWFILTER, ROWMERGE, LEAKY, DECODE, ENCODE})
+
+# The hosted nodes only ever spelled in a network string, even alone.
+_NETWORK_ONLY = frozenset({LEAKY, DECODE, ENCODE})
+
+# The video options a file output may keep where its stream arrives coded:
+# what a stream copy still writes.
+_COPY_KEEPS = frozenset({"video_codec", "frames", *COLOR_OPTIONS})
 
 # How long a picture is taken to last where nothing states its rate, when a
 # stretch of time is turned into pictures: one at sixty frames a second, so
@@ -1203,7 +1213,8 @@ class SidecarProcess:
     :data:`PIPE`. Its nodes call modules by the NAME `modules` binds, not by
     path, so the graph renders as a filtergraph and the ``-m`` table says what
     each name loads. `lookahead` is the region's total declared latency: the
-    largest sum of per-module lookahead along any path through it.
+    largest sum of per-module lookahead along any path through it, plus the
+    frames its own encoder holds back where it encodes its output.
 
     `module` is the path the region's ENTRY module loads and `node` the
     logical node it came from -- the whole region for the common case of one
@@ -1313,6 +1324,9 @@ class SidecarProcess:
     # is, by its position among the input's pictures, in ``-i`` order: None
     # for a picture at its own size, and empty for an input with none.
     geometries: tuple[tuple[tuple[int, int] | None, ...], ...] = ()
+    # True for a region holding a `decode` or `encode` node: the sidecar
+    # loads libavcodec, and is told where it is.
+    av: bool = False
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1340,12 +1354,12 @@ class SidecarProcess:
             return False
         if self.data_filter or self.codec:
             return False
-        # A leaky is the host's own node, which no ``-m`` loads: it is only
-        # ever spelled in a network string, even alone.
+        # A leaky, a decode and an encode are the host's own nodes, which no
+        # ``-m`` loads: each is only ever spelled in a network string.
         return (
             len(self.graph.nodes) > 1
             or any(len(node.inputs) > 1 for node in self.graph.nodes.values())
-            or any(node.filter == LEAKY for node in self.graph.nodes.values())
+            or any(node.filter in _NETWORK_ONLY for node in self.graph.nodes.values())
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -1405,6 +1419,8 @@ class SidecarProcess:
                 [None if size is None else list(size) for size in one]
                 for one in self.geometries
             ]
+        if self.av:
+            written["av"] = True
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -1472,6 +1488,7 @@ class SidecarProcess:
                 for one in _read_list(d, "geometries")
                 if isinstance(one, list)
             ),
+            av=d.get("av") is True,
         )
 
 
@@ -2110,8 +2127,19 @@ class _Partitioner:
         effects: Mapping[str, tuple[str, ...]] | None = None,
         anchors: Mapping[str, tuple[int, int]] | None = None,
         small: Mapping[str, tuple[int, int]] | None = None,
+        *,
+        coded: Collection[str] = (),
     ) -> None:
         self.g = g
+        # The modules whose declaration says their region's edges are coded.
+        self.coded = frozenset(coded)
+        # What each such region decodes and encodes, by its id: the pixel
+        # format each coded read is decoded to, and each coded write's
+        # `encode` arguments, by the ref the edge carries.
+        self.decodes: dict[str, dict[FrameRef, str]] = {}
+        self.encodes: dict[str, dict[FrameRef, dict[str, object]]] = {}
+        # The frames each such region's encoders hold back, at most.
+        self.encode_delays: dict[str, int] = {}
         # The scales putting a picture only timing inputs read at
         # CLOCK_SIZE, each with the size it stands for.
         self.small = dict(small or {})
@@ -3178,7 +3206,8 @@ class _Partitioner:
             members = self.members[pid]
             if any(self._node_delay(name) is None for name in members):
                 return None
-            return 1 + self._lookahead(members, frames=True)
+            held = self.encode_delays.get(pid, 0)
+            return 1 + self._lookahead(members, frames=True) + held
         process = next((p for p in self.pending if p.id == pid), None)
         if process is None:
             return None
@@ -4097,6 +4126,7 @@ class _Partitioner:
 
         self._place_module_sources()
         self._redirect_live_reads()
+        self._code_edges()
         self._add_rows_edges()
         self._add_rows_documents()
         self._bundle_node_edges()
@@ -4128,6 +4158,129 @@ class _Partitioner:
             for document in sidecar.rows
             if document.sink.path == tap
         )
+
+    def _code_edges(self) -> None:
+        """The edges of each region whose entry module says its edges are coded.
+
+        An input's own picture the entry reads, in a codec the sidecar
+        decodes, crosses as the input's packets and is decoded in the region.
+        A picture the region writes straight to one file, whose encoder the
+        sidecar has, is encoded in the region and copied into the file, with
+        the file's encoder options moved onto the encoder. Every other edge
+        stays raw.
+        """
+        for sidecar in self.sidecars:
+            if sidecar.module not in self.coded:
+                continue
+            if sidecar.sink or sidecar.packet_sink or sidecar.packet_filter:
+                continue
+            if sidecar.packet_source or sidecar.data_filter or sidecar.codec:
+                continue
+            entry = self.g.nodes[sidecar.node]
+            for index, edge in enumerate(self.edges):
+                if edge.target != sidecar.id or edge.ref not in entry.inputs:
+                    continue
+                wire = edge.format
+                if not isinstance(wire, VideoFormat) or not self._decodable(edge):
+                    continue
+                self.decodes.setdefault(sidecar.id, {})[edge.ref] = wire.pix_fmt
+                self.edges[index] = replace(edge, format=replace(wire, codec=COPY_CODEC))
+            for index, edge in enumerate(self.edges):
+                if edge.source != sidecar.id:
+                    continue
+                wire = edge.format
+                if not isinstance(wire, VideoFormat) or wire.codec != RAWVIDEO:
+                    continue
+                found = self._encoded_write(edge)
+                if found is None:
+                    continue
+                args, held = found
+                self.encodes.setdefault(sidecar.id, {})[edge.ref] = args
+                self.encode_delays[sidecar.id] = max(
+                    self.encode_delays.get(sidecar.id, 0), held
+                )
+                self.edges[index] = replace(edge, format=replace(wire, codec=COPY_CODEC))
+
+    def _decodable(self, edge: StreamEdge) -> bool:
+        """True when `edge` carries an input's own picture, untrimmed, in a
+        codec the sidecar decodes."""
+        wire = edge.format
+        if not isinstance(wire, VideoFormat) or wire.codec != RAWVIDEO:
+            return False
+        if wire.geometry is not None or not is_src(edge.ref):
+            return False
+        alias, kind, _ = src_parts(edge.ref)
+        if kind != "video" or alias in self.g.input_trims:
+            return False
+        meta = self._origin_meta(edge.ref)
+        return meta is not None and meta.codec in DECODABLE and self._copyable(edge.ref)
+
+    def _encoded_write(self, edge: StreamEdge) -> tuple[dict[str, object], int] | None:
+        """The `encode` arguments for a picture `edge` hands one file, and the
+        frames that encoder holds back, or None.
+
+        The file is the one destination reading the stream, as it is: the
+        ffmpeg at the far end maps it into one file and nothing else, and
+        the file's only picture is this one. Its encoder is one the sidecar
+        has, and every video option it names either moves onto the encoder
+        or is one a stream copy still writes.
+        """
+        if any(
+            other is not edge and other.source == edge.source and other.ref == edge.ref
+            for other in self.edges
+        ):
+            return None
+        process = next((p for p in self.pending if p.id == edge.target), None)
+        if process is None or edge.ref in process.pipes:
+            return None
+        if any(edge.ref in self.g.nodes[name].inputs for name in process.nodes):
+            return None
+        units = [
+            unit
+            for unit in process.sinks
+            if any(output.ref == edge.ref for output in unit.outputs)
+        ]
+        if len(units) != 1:
+            return None
+        unit = units[0]
+        if unit.path is None or unit.path == PIPE or unit.path in self.g.feeders:
+            return None
+        if unit.window is not None:
+            return None  # a window cut from coded packets starts between keyframes
+        if [output.ref for output in unit.outputs if output.type == "video"] != [edge.ref]:
+            return None
+        codec = unit.options.get("video_codec")
+        if not isinstance(codec, str) or codec not in HOSTED_ENCODERS:
+            return None
+        if "codec_params" in unit.options:
+            raise FfrwdError(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{unit.path}' names codec_params beside {codec}, which the "
+                "sidecar encodes, and the sidecar's encoder takes no codec_params",
+                hint="name each encoder setting as an option of its own (crf, "
+                "preset, gop, video_bitrate, ...), or drop the SET clause to "
+                "encode in ffmpeg",
+            )
+        args: dict[str, object] = {"codec": codec}
+        for name, value in unit.options.items():
+            spec = option_spec(name)
+            if spec is None or spec.scope != "video" or name in _COPY_KEEPS:
+                continue
+            if name not in ENCODE_OPTIONS or not isinstance(value, str | int | float):
+                return None
+            args[ENCODE_OPTIONS[name]] = value
+        kept = {
+            name: value
+            for name, value in unit.options.items()
+            if name not in ENCODE_OPTIONS
+        }
+        kept["video_codec"] = COPY_CODEC
+        meta = self._origin_meta(edge.ref)
+        held = encoder_delay(codec, unit.options, meta.height if meta is not None else None)
+        process.sinks = [
+            replace(one, options=kept) if one is unit else one for one in process.sinks
+        ]
+        return args, held
 
     def _bundle_node_edges(self) -> None:
         """Every stream between a node region and one other process, in one NUT.
@@ -5393,6 +5546,7 @@ class _Partitioner:
                 out_ports=list(node.out_ports),
                 bound=node.bound,
             )
+        nodes, encoded = self._code_nodes(sidecar.id, nodes, read_as, rewrite)
         bundles: dict[str, list[StreamEdge]] = {}
         for edge in outgoing:
             bundles.setdefault(pipe_key(edge), []).append(edge)
@@ -5400,8 +5554,9 @@ class _Partitioner:
             SinkUnit(
                 outputs=[
                     Output(
-                        # A leg of a dissolved split leaves as what it copies.
-                        ref=rewrite(edge.ref),
+                        # A leg of a dissolved split leaves as what it copies;
+                        # a coded write leaves as its encoder's output.
+                        ref=encoded.get(edge.ref) or rewrite(edge.ref),
                         type=ref_type(self.g, edge.ref),
                         name=None,
                         metadata={},
@@ -5463,6 +5618,8 @@ class _Partitioner:
             reads_rows=any(e.annotations for e in self.edges if e.target == sidecar.id),
             writes_rows=any(e.annotations for e in self.edges if e.source == sidecar.id),
             rows_modules=self._rows_modules(sidecar, members),
+            lookahead=sidecar.lookahead + self.encode_delays.get(sidecar.id, 0),
+            av=bool(self.decodes.get(sidecar.id) or self.encodes.get(sidecar.id)),
             graph=Graph(
                 input_paths=[PIPE] * len(read_order),
                 sources={alias: index for index, alias in enumerate(read_order)},
@@ -5470,6 +5627,59 @@ class _Partitioner:
                 sinks=sinks,
             ),
         )
+
+    def _code_nodes(
+        self,
+        region: str,
+        nodes: dict[str, Node],
+        read_as: Mapping[FrameRef, FrameRef],
+        rewrite: Callable[[FrameRef], FrameRef],
+    ) -> tuple[dict[str, Node], dict[FrameRef, FrameRef]]:
+        """`nodes` with a `decode` in front of each coded read of `region` and
+        an `encode` behind each coded write, and the encoder each written
+        ref now leaves from."""
+        decodes = self.decodes.get(region, {})
+        encodes = self.encodes.get(region, {})
+        if not decodes and not encodes:
+            return nodes, {}
+        taken = set(self.g.nodes) | set(nodes)
+
+        def fresh(base: str) -> str:
+            count = 0
+            while f"{base}{count}" in taken:
+                count += 1
+            taken.add(f"{base}{count}")
+            return f"{base}{count}"
+
+        front: dict[str, Node] = {}
+        decoded: dict[FrameRef, FrameRef] = {}
+        for ref, pix_fmt in decodes.items():
+            name = fresh(DECODE)
+            front[name] = Node(
+                id=name,
+                filter=DECODE,
+                args={"format": pix_fmt},
+                inputs=[read_as.get(ref, ref)],
+                outputs=["video"],
+            )
+            decoded[read_as.get(ref, ref)] = name
+        made = {**front}
+        for name, node in nodes.items():
+            made[name] = replace(
+                node, inputs=[decoded.get(read, read) for read in node.inputs]
+            )
+        encoded: dict[FrameRef, FrameRef] = {}
+        for ref, args in encodes.items():
+            name = fresh(ENCODE)
+            made[name] = Node(
+                id=name,
+                filter=ENCODE,
+                args=dict(args),
+                inputs=[rewrite(ref)],
+                outputs=["video"],
+            )
+            encoded[ref] = name
+        return made, encoded
 
     def _region_colors(
         self,
@@ -5781,6 +5991,7 @@ def partition(
     models: Mapping[str, ModelBinding] | None = None,
     effects: Mapping[str, tuple[str, ...]] | None = None,
     anchors: Mapping[str, tuple[int, int]] | None = None,
+    coded: Collection[str] = (),
 ) -> ProcessPlan:
     """Partition a logical graph into the processes that run it.
 
@@ -5819,6 +6030,11 @@ def partition(
     what a rejection about a live input points at. An alias missing from it
     gets an unanchored rejection.
 
+    `coded` names the modules whose declaration says ``SET ffrwd.edges =
+    'coded'``: a region entered by one reads an input's own picture as its
+    packets and writes a file's picture encoded, where it can
+    (:meth:`_Partitioner._code_edges`).
+
     Raises ``FfrwdError`` -- unanchored, for the caller to re-anchor on the
     declaration -- for a multi-input module whose streams cannot pair up, and
     ``UNBOUNDED_LIVE_INPUT`` -- already anchored, from `anchors` -- for a live
@@ -5835,14 +6051,15 @@ def partition(
     from . import startup
 
     partitioner = _Partitioner(
-        g, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors
+        g, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors,
+        coded=coded,
     )
     reads = partitioner.timing_reads()
     if reads:
         shrunk, small = partitioner.shrunk(reads)
         partitioner = _Partitioner(
             shrunk, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors,
-            small,
+            small, coded=coded,
         )
     plan = partitioner.run()
     plan = startup.arrange(plan)

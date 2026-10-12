@@ -2030,3 +2030,117 @@ def test_every_wasm_kind_agrees_about_which_parameters_are_rows(
     assert len({name for one in named for name in one}) == len(declared.params), what
     # `reads` is the first of the columns, wherever there are any.
     assert reads == (columns[0] if columns else None), what
+
+
+# -- SET ffrwd.edges ----------------------------------------------------------
+
+_CODED_INVERT = (
+    "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
+    "  AS 'invert.wasm', 'invert' LANGUAGE wasm {setting};\n"
+    "COPY (SELECT invert(f.video[1]) FROM input('a.mp4') f) TO 'out.mp4'"
+)
+
+
+@pytest.mark.parametrize(
+    "setting",
+    ["SET ffrwd.edges = 'coded'", "SET ffrwd.edges TO coded", "SET FFRWD.EDGES = 'coded'"],
+)
+def test_a_stream_function_declares_coded_edges(setting: str) -> None:
+    declared = _resolved(_CODED_INVERT.format(setting=setting)).wasm["invert"]
+    assert declared.edges == "coded"
+
+
+def test_a_stream_function_with_no_set_clause_declares_no_edges() -> None:
+    assert _resolved(_CODED_INVERT.format(setting="")).wasm["invert"].edges == ""
+
+
+@pytest.mark.parametrize(
+    ("declaration", "message"),
+    [
+        (
+            "CREATE FUNCTION invert(v video_stream) RETURNS video_stream "
+            "AS 'invert.wasm', 'invert' LANGUAGE wasm SET search_path = 'x'",
+            "function 'invert' sets 'search_path', which is not a setting a function takes",
+        ),
+        (
+            "CREATE FUNCTION invert(v video_stream) RETURNS video_stream "
+            "AS 'invert.wasm', 'invert' LANGUAGE wasm SET ffrwd.edges = 'raw'",
+            "function 'invert' sets ffrwd.edges to 'raw'",
+        ),
+        (
+            "CREATE FUNCTION invert(v video_stream) RETURNS video_stream "
+            "AS 'invert.wasm', 'invert' LANGUAGE wasm SET search_path = 'x', 'y'",
+            "function 'invert' says SET search_path = 'x', 'y', which the dialect "
+            "does not take",
+        ),
+        (
+            "CREATE FUNCTION score(x number) RETURNS number "
+            "AS 'score.wasm', 'score' LANGUAGE wasm SET ffrwd.edges = 'coded'",
+            "function 'score' sets ffrwd.edges, and it is a value function",
+        ),
+        (
+            "CREATE FUNCTION enc(q number) RETURNS encoder "
+            "AS 'enc.wasm', 'enc' LANGUAGE wasm SET ffrwd.edges = 'coded'",
+            "function 'enc' sets ffrwd.edges, and it is a codec function",
+        ),
+        (
+            "CREATE FUNCTION pub(name text) RETURNS sink "
+            "AS 'pub.wasm', 'publish' LANGUAGE wasm SET ffrwd.edges = 'coded'",
+            "function 'pub' sets ffrwd.edges, and it is a function returning sink",
+        ),
+        (
+            "CREATE FUNCTION weave(v video_stream) RETURNS packets "
+            "AS 'weave.wasm', 'weave' LANGUAGE wasm SET ffrwd.edges = 'coded'",
+            "function 'weave' sets ffrwd.edges, and it is a function returning packets",
+        ),
+        (
+            "CREATE FUNCTION pick(d data_stream) RETURNS data_stream "
+            "AS 'pick.wasm', 'pick' LANGUAGE wasm SET ffrwd.edges = 'coded'",
+            "function 'pick' sets ffrwd.edges, and it is a data filter",
+        ),
+        (
+            "CREATE FUNCTION louder(a audio_stream) RETURNS audio_stream "
+            "AS $$ SELECT volume(a, 2) $$ LANGUAGE sql SET ffrwd.edges = 'coded'",
+            "function 'louder' sets ffrwd.edges, and is written in sql",
+        ),
+    ],
+    ids=[
+        "other-setting",
+        "other-value",
+        "unparsed-setting",
+        "value",
+        "codec",
+        "sink",
+        "packets",
+        "data-filter",
+        "sql",
+    ],
+)
+def test_a_set_clause_is_refused_where_it_means_nothing(
+    declaration: str, message: str
+) -> None:
+    with pytest.raises(FfrwdError) as caught:
+        _resolved(declaration + ";\nCOPY (SELECT f.video[1] FROM input('a.mp4') f) TO 'o.mp4'")
+    error = caught.value
+    assert error.code is ErrorCode.UNSUPPORTED_SQL
+    assert error.message == message
+    assert error.line == 1 and error.col > 1
+    assert error.hint is not None and "ffrwd.edges" in error.hint
+
+
+def test_a_packages_stream_function_declares_coded_edges(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "tools.sql").write_text(
+        "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
+        "  AS 'modules/invert.wasm', 'invert' LANGUAGE wasm SET ffrwd.edges = 'coded';\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ffrwd.json").write_text(
+        json.dumps({"name": "ffrwd/tools", "version": "1.0.0", "lib": {"invert": "src/tools.sql"}}),
+        encoding="utf-8",
+    )
+    packages = discover(tmp_path)
+    assert packages is not None
+    query = "COPY (SELECT ffrwd.tools.invert(f.video[1]) FROM input('a.mp4') f) TO 'out.mp4'"
+    declared = resolve(parse(query), packages=packages).wasm["ffrwd.tools.invert"]
+    assert declared.edges == "coded"

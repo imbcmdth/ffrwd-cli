@@ -50,7 +50,7 @@ from .decode import decode_ahead_of_frame_readers
 from .emit import Emitted, emit
 from .errors import ErrorCode, FfrwdError
 from .execute import DEFAULT_TIMEOUT
-from .functions import WasmFunction, package_modules, script_definitions
+from .functions import CODED_EDGES, WasmFunction, package_modules, script_definitions
 from .inputs import declared_probe, forces_demuxer, probe_options, render_options
 from .ir import LEAKY, Graph, Lateral
 from .leaky import decode_ahead_of_leaky
@@ -746,6 +746,7 @@ def compile_all(
                 models=_nn_models(hosted | _source_wasm(res), describes, packages),
                 effects=_effect_grants(stream_wasm | _source_wasm(res), describes),
                 anchors=res.input_anchors,
+                coded={d.module for d in stream_wasm.values() if d.edges == CODED_EDGES},
             )
             check_spellable(plan)
         except FfrwdError as err:

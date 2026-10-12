@@ -256,6 +256,15 @@ _WASM_MULTI_HINT = (
     "a sink reading several streams takes no annotation column yet: declare "
     "its streams, then the values it is configured with"
 )
+# The one setting a declaration's SET clause may name, and the one value it
+# takes: the region the function runs in reads its input and writes its output
+# as coded packets, decoded and encoded inside the sidecar.
+EDGES_SETTING = "ffrwd.edges"
+CODED_EDGES = "coded"
+_EDGES_HINT = (
+    f"a LANGUAGE wasm stream function may say SET {EDGES_SETTING} = "
+    f"'{CODED_EDGES}', and that is the only setting a function takes"
+)
 # The languages a body may be written in, and the stream types a module filters.
 _SQL = "sql"
 _WASM = "wasm"
@@ -682,6 +691,9 @@ class WasmFunction:
     # What a module of an older world refuses this declaration with, for one
     # only a node can carry (`returns` is WASM_NODE).
     refusal: FfrwdError | None = field(default=None, compare=False)
+    # What the declaration's ``SET ffrwd.edges`` says: CODED_EDGES for a
+    # stream function whose region takes and gives coded packets, else "".
+    edges: str = ""
 
     @property
     def is_node_only(self) -> bool:
@@ -1381,10 +1393,12 @@ def _function_name(create: exp.Create) -> tuple[exp.Expr, exp.Identifier, list[e
 
 def _properties(
     create: exp.Create, name: str, anchor: exp.Expr
-) -> tuple[exp.ReturnsProperty, str]:
-    """The ``RETURNS`` property and the declared language; anything else is rejected."""
+) -> tuple[exp.ReturnsProperty, str, list[exp.SetConfigProperty]]:
+    """The ``RETURNS`` property, the declared language and the SET clauses;
+    anything else is rejected."""
     returns: exp.ReturnsProperty | None = None
     language = ""
+    settings: list[exp.SetConfigProperty] = []
     properties = create.args.get("properties")
     if isinstance(properties, exp.Properties):
         for prop in properties.expressions:
@@ -1393,6 +1407,9 @@ def _properties(
                 continue
             if isinstance(prop, exp.LanguageProperty):
                 language = _ident_name(prop.this) if isinstance(prop.this, exp.Expr) else ""
+                continue
+            if isinstance(prop, exp.SetConfigProperty):
+                settings.append(prop)
                 continue
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -1408,7 +1425,100 @@ def _properties(
             anchor,
             hint=_FUNCTION_HINT,
         )
-    return returns, language
+    return returns, language, settings
+
+
+def _edges(
+    settings: Sequence[exp.SetConfigProperty], name: str, anchor: exp.Expr
+) -> tuple[str, exp.Expr | None]:
+    """What the SET clauses say of ``ffrwd.edges``, and the node saying it.
+
+    ``("", None)`` where there is none. Any other setting, or any other value,
+    is refused.
+    """
+    edges, said = "", None
+    for prop in settings:
+        items = prop.this.expressions if isinstance(prop.this, exp.Set) else []
+        if not items:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{name}' says {_written(prop)}, which the dialect "
+                "does not take",
+                prop,
+                fallback=anchor,
+                hint=_EDGES_HINT,
+            )
+        for item in items:
+            pair = item.this if isinstance(item, exp.SetItem) else None
+            if not isinstance(pair, exp.EQ):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"function '{name}' says SET {_written(item)}, which the "
+                    "dialect does not take",
+                    item,
+                    fallback=anchor,
+                    hint=_EDGES_HINT,
+                )
+            setting = _written(pair.this).lower()
+            if setting != EDGES_SETTING:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"function '{name}' sets '{_written(pair.this)}', which is "
+                    "not a setting a function takes",
+                    pair,
+                    fallback=anchor,
+                    hint=_EDGES_HINT,
+                )
+            value = pair.expression
+            written = (
+                str(value.this)
+                if isinstance(value, exp.Literal) and value.is_string
+                or isinstance(value, exp.Var)
+                else None
+            )
+            if written != CODED_EDGES:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"function '{name}' sets {EDGES_SETTING} to "
+                    f"{_written(value)}",
+                    pair,
+                    fallback=anchor,
+                    hint=f"{EDGES_SETTING} takes '{CODED_EDGES}' and nothing "
+                    "else; leave the SET clause off for raw frames",
+                )
+            edges, said = written, pair
+    return edges, said
+
+
+def _check_edges(
+    declared: WasmFunction, said: exp.Expr, anchor: exp.Expr
+) -> None:
+    """Refuse ``SET ffrwd.edges`` on a wasm function that is not a stream
+    function: only a stream function runs in a region whose edges it names.
+    A declaration only a node can carry is one where it returns a stream."""
+    streams = declared.returns in WASM_STREAM_TYPES and not declared.is_data_filter
+    node = declared.is_node_only and any(
+        output.type in WASM_STREAM_TYPES for output in declared.outputs or ()
+    )
+    if streams or node:
+        return
+    kind = (
+        "a value function"
+        if declared.is_value
+        else "a codec function"
+        if declared.is_codec
+        else "a data filter"
+        if declared.is_data_filter
+        else f"a function returning {declared.written_returns}"
+    )
+    raise _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"function '{declared.name}' sets {EDGES_SETTING}, and it is {kind}",
+        said,
+        fallback=anchor,
+        hint=f"{EDGES_SETTING} says how a stream function's region reads and "
+        "writes its streams: RETURNS video_stream or audio_stream",
+    )
 
 
 def _body_text(create: exp.Create, name: str, anchor: exp.Expr) -> str:
@@ -2724,7 +2834,8 @@ def _define(create: exp.Create, *, packaged: bool = False) -> _Function | WasmFu
 
     # The LANGUAGE first: it is what says how the signature reads, since only
     # a wasm one may carry an annotation column.
-    returns_prop, language = _properties(create, name, identifier)
+    returns_prop, language, settings = _properties(create, name, identifier)
+    edges, said = _edges(settings, name, identifier)
     if not language:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -2739,7 +2850,20 @@ def _define(create: exp.Create, *, packaged: bool = False) -> _Function | WasmFu
 
     written_body = create.args.get("expression")
     if language == _WASM:
-        return _define_wasm(create, name, identifier, params, returns_prop, written_body)
+        declared = _define_wasm(create, name, identifier, params, returns_prop, written_body)
+        if said is None:
+            return declared
+        _check_edges(declared, said, identifier)
+        return replace(declared, edges=edges)
+    if said is not None:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{name}' sets {EDGES_SETTING}, and is written in {language}",
+            said,
+            fallback=identifier,
+            hint=f"{EDGES_SETTING} says how a LANGUAGE wasm stream function's "
+            "region reads and writes its streams",
+        )
     if language != _SQL:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,

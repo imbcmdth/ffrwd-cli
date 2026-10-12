@@ -7692,3 +7692,22 @@ def test_a_vector_annotation_field_of_the_wrong_json_type_is_refused() -> None:
         sql, ErrorCode.UDF_ARG_TYPE, "declares 'hits' as", detector=_annotating(rows)
     )
     assert "e (number)" in error.message
+
+
+def test_a_declaration_setting_coded_edges_reaches_the_partition() -> None:
+    """The input is never probed here, so only the file's side can be coded:
+    the region encodes for a hosted encoder, and the same query undeclared
+    hands frames back as ever."""
+    query = (
+        "COPY (SELECT invert(f.video[1]) FROM input('a.mp4') f) TO 'out.mp4' "
+        "WITH (video_codec 'h264_nvenc')"
+    )
+    coded = DECLARE.replace("LANGUAGE wasm;", "LANGUAGE wasm SET ffrwd.edges = 'coded';")
+    declared = _compiled(coded + query).plan
+    plain = _compiled(DECLARE + query).plan
+    assert declared is not None and plain is not None
+    (region,) = declared.sidecars
+    assert region.av
+    assert region.graph is not None
+    assert [n.filter for n in region.graph.nodes.values()] == ["invert", "encode"]
+    assert not any(s.av for s in plain.sidecars)

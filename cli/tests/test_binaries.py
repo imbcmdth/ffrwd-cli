@@ -21,7 +21,7 @@ from types import ModuleType
 
 import pytest
 
-from ffrwd import binaries
+from ffrwd import av, binaries
 
 
 def _fake_version(
@@ -454,3 +454,29 @@ def test_a_probe_that_runs_out_of_time_ends_the_real_ffprobe(
     assert _alive(beat), "the shim never started its child"
     assert _stopped(beat), "the launcher's child outlived the probe"
     probe.clear_cache()
+
+
+def test_the_av_libraries_are_where_the_distribution_listed_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    site = tmp_path / "site-packages"
+    listed = ["ffrwd_wasm/__init__.py", "ffrwd_wasm_av/avcodec-63.dll", "ffrwd_wasm_av/LICENSE"]
+    _installed(monkeypatch, _FakeDist(site, listed))
+    assert binaries.ffrwd_av_dir() == str(site / "ffrwd_wasm_av")
+    _installed(monkeypatch, _FakeDist(site, ["ffrwd_wasm/__init__.py"]))
+    assert binaries.ffrwd_av_dir() is None
+    _installed(monkeypatch, None)
+    assert binaries.ffrwd_av_dir() is None
+
+
+def test_a_sidecar_is_told_the_av_directory_only_where_nothing_else_names_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(av.RUNTIME_DIR_VAR, raising=False)
+    monkeypatch.setattr(av.binaries, "ffrwd_av_dir", lambda: "/site/ffrwd_wasm_av")
+    assert av.spawn_args() == ["-av-runtime", "/site/ffrwd_wasm_av"]
+    monkeypatch.setenv(av.RUNTIME_DIR_VAR, "/my/build")
+    assert av.spawn_args() == []
+    monkeypatch.delenv(av.RUNTIME_DIR_VAR)
+    monkeypatch.setattr(av.binaries, "ffrwd_av_dir", lambda: None)
+    assert av.spawn_args() == []

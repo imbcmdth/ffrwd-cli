@@ -141,6 +141,7 @@ from pathlib import Path
 from typing import IO, Literal
 
 from . import loudnorm, pipes, redact
+from .av import AV_RUNTIME_FLAG
 from .console import Work, WorkProgress
 from .emit import Emitted, build_ffmpeg_commands, build_process_args
 from .errors import ErrorCode, FfrwdError
@@ -1163,11 +1164,19 @@ def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
     at the time of the frame it coded, and its header says how deep it
     reorders rather than shifting anything, so its packets keep the clock.
     A node network's packets keep the clock its inputs had, and a node
-    reading nothing writes its own, as a source module does.
+    reading nothing writes its own, as a source module does. A region that
+    decodes or encodes itself keeps the clock its inputs had, frames and
+    packets alike: its decoder reads the packets as they arrived.
     """
-    if isinstance(edge.format, DataFormat) or not encoded(edge.format):
+    if isinstance(edge.format, DataFormat):
         return True
-    producer = next(p for p in plan.processes if p.id == edge.source)
+    producer = next((p for p in plan.processes if p.id == edge.source), None)
+    if isinstance(producer, SidecarProcess) and producer.av:
+        return all(
+            keeps_clock(e, plan) for e in plan.stream_edges if e.target == producer.id
+        )
+    if not encoded(edge.format):
+        return True
     if not isinstance(producer, SidecarProcess):
         return False
     if producer.packet_source or producer.codec == "encode":
@@ -2727,7 +2736,7 @@ class _StageRun:
         if player is not None:
             self.watching[pid] = subprocess.Popen(player, stdin=subprocess.PIPE, bufsize=0)
         try:
-            proc = _spawn(command, stdin, stdout, env=_nn_runtime_env(command))
+            proc = _spawn(command, stdin, stdout, env=_runtime_env(command))
         except BaseException:
             if runner_out is not None:
                 runner_out.close()
@@ -3203,29 +3212,37 @@ def _writes_rows_to_stdout(process: Process) -> bool:
 
 
 _NN_RUNTIME_FLAG = "-nn-runtime"
+# The flags naming a directory of libraries a spawned sidecar loads.
+_RUNTIME_FLAGS = (_NN_RUNTIME_FLAG, AV_RUNTIME_FLAG)
 
 
-def _nn_runtime_env(command: Sequence[str]) -> dict[str, str] | None:
+def _runtime_env(command: Sequence[str]) -> dict[str, str] | None:
     """The environment a spawn needs beyond what it would inherit, if any.
 
     A sidecar given ``-nn-runtime <dir>`` fetched ONNX Runtime's CUDA provider
     into that directory, but the provider then dlopens its own CUDA/cuDNN
-    libraries by soname -- not by any path the sidecar passes it. On Windows
-    the sidecar's own loader adds the directory itself; elsewhere only
-    LD_LIBRARY_PATH puts it where the platform loader resolves those sonames,
-    so a non-Windows spawn gets the directory prepended to it. None where
-    there is nothing to add, which leaves the member spawned with the
-    inherited environment untouched.
+    libraries by soname -- not by any path the sidecar passes it. One given
+    ``-av-runtime <dir>`` loads libavcodec from there, and libavcodec its own
+    libraries the same way. On Windows the sidecar's own loader adds each
+    directory itself; elsewhere only LD_LIBRARY_PATH puts it where the
+    platform loader resolves those sonames, so a non-Windows spawn gets each
+    directory the command names prepended to it. None where there is nothing
+    to add, which leaves the member spawned with the inherited environment
+    untouched.
     """
     if sys.platform == "win32":
         return None
-    try:
-        runtime = command[command.index(_NN_RUNTIME_FLAG) + 1]
-    except (ValueError, IndexError):
+    named: list[str] = []
+    for flag in _RUNTIME_FLAGS:
+        try:
+            named.append(command[command.index(flag) + 1])
+        except (ValueError, IndexError):
+            continue
+    if not named:
         return None
     env = dict(os.environ)
     existing = env.get("LD_LIBRARY_PATH")
-    env["LD_LIBRARY_PATH"] = f"{runtime}{os.pathsep}{existing}" if existing else runtime
+    env["LD_LIBRARY_PATH"] = os.pathsep.join([*named, *([existing] if existing else [])])
     return env
 
 

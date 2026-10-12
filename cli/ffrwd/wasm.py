@@ -55,7 +55,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
-from . import binaries, nn, probe
+from . import av, binaries, nn, probe
 from .emit import build_network_graph, build_node_network
 from .errors import ErrorCode, FfrwdError
 from .execute import STDIN, STDOUT
@@ -1969,6 +1969,7 @@ def _argv(
     writes: Sequence[str] = (),
     runtime: Sequence[str] = (),
     jobs: int | None = None,
+    av_runtime: Sequence[str] = (),
 ) -> list[str]:
     """One sidecar process as argv, run by `binary`.
 
@@ -2006,6 +2007,8 @@ def _argv(
     and the target to run on -- and is empty for a printed command, whose
     reader has their own machine's. ``-nn-exclude`` names a provider a bound
     model's own pin denies, ahead of the ``-nn`` table the same way.
+    `av_runtime` is the ``-av-runtime`` a region decoding or encoding itself
+    is told, and is empty for a printed command for the same reason.
 
     ``-http``, ``-udp``, ``-tcp`` and ``-gpu`` grant one module its effects,
     also ahead of the module table: the sidecar denies each to any module the
@@ -2085,6 +2088,7 @@ def _argv(
     if process.reads_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_IN]
     argv += _nn_args(process.models, runtime)
+    argv += list(av_runtime)
     for grant in process.grants:
         argv += [_GRANT_FLAGS[grant.effect], grant.module]
     if process.codec:
@@ -2354,7 +2358,9 @@ def sidecar_argv(
 
     A process binding a model is also told where the fetched ONNX Runtime is
     and what to run it on, which a printed command has no business spelling:
-    the directory is under THIS machine's cache.
+    the directory is under THIS machine's cache. A process decoding or
+    encoding itself is told where the installed libav libraries are, by the
+    same rule.
 
     `jobs` is the worker-thread cap the run asked for, passed to every
     sidecar; None is the default, the sidecar sizing itself to the machine.
@@ -2370,7 +2376,13 @@ def sidecar_argv(
             hint=INSTALL_HINT,
         )
     return _argv(
-        binary, process, reads, writes, nn.spawn_args() if process.models else (), jobs
+        binary,
+        process,
+        reads,
+        writes,
+        nn.spawn_args() if process.models else (),
+        jobs,
+        av.spawn_args() if process.av else (),
     )
 
 

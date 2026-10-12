@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.ir import Graph
+from ffrwd.ir import Graph, Node
 from ffrwd.placement import check_placement
 from ffrwd.placement_cost import (
     PRESETS,
@@ -247,3 +247,27 @@ def test_a_region_that_only_passes_packets_on_costs_next_to_nothing(module: str)
     plan = ProcessPlan(processes=(light, heavy))
     assert process_load(light, plan).cores == pytest.approx(0.05)
     assert process_load(heavy, plan).cores == pytest.approx(0.33)
+
+
+def _av_region(pid: str, codec: str) -> SidecarProcess:
+    """A region decoding its input and encoding its output with `codec`."""
+    graph = Graph(input_paths=["pipe:"], sources={"p": 0})
+    graph.nodes = {
+        "decode0": Node("decode0", "decode", {"format": "rgba"}, ["src:p:v:0"], ["video"]),
+        "e0": Node("e0", "invert", {}, ["decode0"], ["video"]),
+        "encode0": Node("encode0", "encode", {"codec": codec}, ["e0"], ["video"]),
+    }
+    return SidecarProcess(id=pid, module="/m/invert.wasm", node="e0", graph=graph, av=True)
+
+
+def test_a_regions_own_decode_and_hardware_encode_are_sessions() -> None:
+    from ffrwd.placement import needs_gpu
+    from ffrwd.placement_cost import process_load
+
+    hardware, software = _av_region("fx0", "h264_amf"), _av_region("fx1", "ffv1")
+    plan = ProcessPlan(processes=(hardware, software), edges=())
+    load = process_load(hardware, plan)
+    assert (load.gpu_jobs, load.encodes, load.decodes) == (0, 1, 1)
+    assert (process_load(software, plan).encodes, process_load(software, plan).decodes) == (0, 1)
+    assert needs_gpu(hardware)
+    assert not needs_gpu(software)
