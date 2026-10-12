@@ -635,6 +635,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # hosted runner's own default stands.
     run_p.add_argument("--target", choices=_TARGETS, default="local", help=argparse.SUPPRESS)
     run_p.add_argument("--placement", default=None, help=argparse.SUPPRESS)
+    # Hidden, for development: how the streams a per-module placement's cuts
+    # hand from one sidecar to the next are coded (placement.cuts_for).
+    run_p.add_argument("--cut-codec", default=None, help=argparse.SUPPRESS)
     run_p.add_argument(
         "--wait",
         action="store_true",
@@ -1773,6 +1776,13 @@ def _run_media(
     showing = args.show or args.show_only
     try:
         with console.status("compiling"):
+            cuts = None
+            if getattr(args, "target", "local") == "split-local":
+                from . import placement
+
+                cuts = placement.cuts_for(
+                    args.placement or "per-module", getattr(args, "cut_codec", None), describe
+                )
             compiled = compile_all(
                 query.text,
                 packages=packages,
@@ -1780,6 +1790,7 @@ def _run_media(
                 unset=query.unset,
                 owner=query.owner,
                 describe=describe,
+                cuts=cuts,
             )
         graphs: list[Graph] = compiled.graphs
         plan: ProcessPlan | None = compiled.plan

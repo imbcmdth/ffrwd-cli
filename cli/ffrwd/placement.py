@@ -25,8 +25,11 @@ keeps every chain whole, since it keeps everything on one node.
 Strategies:
 
 - ``one``: every process on node 0.
-- ``per-module``: each sidecar region on a node of its own, each ffmpeg
-  process on the node of the first region it feeds, else the first region
+- ``per-module``: each module on a node of its own. A region holding
+  several modules is cut between them before it is placed (:func:`cuts_for`,
+  :class:`~ffrwd.processes.CutAtModules`), so each is a sidecar of its own,
+  wired straight to the next; then each sidecar region on a node of its own,
+  each ffmpeg process on the node of the first region it feeds, else the first region
   feeding it, else the node of an ffmpeg process it is wired to, else node
   0. A node holding a region that computes on a GPU (a ``gpu`` grant, or a
   model bound with ``-nn``) is marked as needing one.
@@ -56,14 +59,17 @@ order, so node 0 is where the stream starts.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import json
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from . import av
+from . import av, wasm
 from .errors import ErrorCode, FfrwdError
 from .ir import is_rows_document
 from .processes import (
+    CutAtModules,
+    CutCoding,
     FeederEdge,
     FfmpegProcess,
     FileEdge,
@@ -84,6 +90,7 @@ __all__ = [
     "check_placement",
     "colocation_groups",
     "cut_key",
+    "cuts_for",
     "file_handoffs",
     "flow_edges",
     "gpu_processes",
@@ -97,6 +104,86 @@ __all__ = [
 
 Strategy = Literal["one", "per-module", "by-hardware", "per-process"]
 STRATEGIES: tuple[Strategy, ...] = ("one", "per-module", "by-hardware", "per-process")
+
+
+def cuts_for(
+    strategy: str,
+    codec: str | None = None,
+    describe: Callable[[str], wasm.Described] = wasm.describe,
+) -> CutAtModules | None:
+    """The cuts a placement asks the partition for before it places a plan:
+    ``per-module`` cuts every region between its modules, and every other
+    strategy cuts nothing.
+
+    `codec` says how each cut stream crosses, spelled as the sidecar's own
+    ``encode`` node is: an encoder the sidecar hosts and its options,
+    ``h264_d3d12va:b=8M``, or a codec package's module and its encoder's
+    params, ``<path>.wasm:bytes_per_frame=125000``. Left out, each crosses as
+    it is.
+    """
+    if strategy != "per-module":
+        if codec:
+            raise FfrwdError(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"--cut-codec codes the streams a cut hands on, and the placement "
+                f"'{strategy}' cuts nothing",
+                hint="place the run per-module, which cuts each region between its "
+                "modules",
+            )
+        return None
+    if not codec:
+        return CutAtModules()
+    # A module's path may hold a drive's colon, so it ends at its ".wasm".
+    cut = codec.find(".wasm")
+    name, _, tail = (
+        (codec[: cut + 5], "", codec[cut + 6 :])
+        if cut >= 0 and codec[cut + 5 : cut + 6] in ("", ":")
+        else codec.partition(":")
+    )
+    rest = tail.split(":") if tail else []
+    options: list[tuple[str, str]] = []
+    for one in rest:
+        key, sep, value = one.partition("=")
+        if not sep or not key:
+            raise FfrwdError(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"--cut-codec {codec}: '{one}' is not an option",
+                hint="write <encoder>:<option>=<value>:..., as h264_d3d12va:b=8M",
+            )
+        options.append((key, value))
+    if not name.endswith(".wasm"):
+        if name not in av.HOSTED_ENCODERS:
+            raise FfrwdError(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"--cut-codec {codec}: the sidecar hosts no encoder '{name}'",
+                hint=f"name one of {', '.join(sorted(av.HOSTED_ENCODERS))}, or a codec "
+                "package's module",
+            )
+        return CutAtModules(CutCoding(encoder=name, options=tuple(options)))
+    described = describe(name)
+    if described.encoder is None or described.decoder is None:
+        raise FfrwdError(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"--cut-codec {codec}: '{name}' is not a codec package's module with "
+            "an encoder and a decoder",
+            hint="name a module exporting both halves of a codec, as pyrowave.wasm",
+        )
+    return CutAtModules(
+        CutCoding(
+            module=name,
+            params=tuple((key, _param(value)) for key, value in options),
+            pix_fmts=described.decoder.pixel_formats,
+            grants=tuple(effect for effect in wasm.EFFECTS if getattr(described, effect)),
+        )
+    )
+
+
+def _param(value: str) -> object:
+    """A codec param as its JSON value where it is one, else as text."""
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
 
 # The effect grant that puts a region on a GPU.
 _GPU = "gpu"

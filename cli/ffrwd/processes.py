@@ -424,6 +424,10 @@ HOSTED_FILTERS = frozenset({ROWFILTER, ROWMERGE, LEAKY, DECODE, ENCODE, DEVICE_F
 # The port a node's own rows leave on, in a network string.
 _EMITTED_ROWS = "@rows"
 
+# The node a cut stands as, between the region making a stream and the one
+# reading it. Never run: the partition dissolves it.
+CUT = "cut"
+
 # The hosted nodes only ever spelled in a network string, even alone.
 _NETWORK_ONLY = frozenset({LEAKY, DECODE, ENCODE, DEVICE_FILTER})
 
@@ -1536,6 +1540,39 @@ def process_from_dict(d: Mapping[str, object]) -> Process:
 
 
 @dataclass(frozen=True)
+class CutCoding:
+    """How a stream crosses a cut between two sidecar regions.
+
+    Empty, it crosses as it is: raw, or as the packets it already was.
+    `encoder` names an encoder the sidecar hosts, with `options` its
+    ``encode`` node's own, by ffmpeg's names (``b``, ``g``, ...): the region
+    making the picture encodes it and the region reading it decodes it.
+    `module` names a codec package's module instead, whose encoder, given
+    `params`, codes the picture at the end of one region and whose decoder
+    reads it at the start of the other; `pix_fmts` are what that decoder may
+    write and `grants` the effects the module needs.
+    """
+
+    encoder: str = ""
+    options: tuple[tuple[str, str], ...] = ()
+    module: str = ""
+    params: tuple[tuple[str, object], ...] = ()
+    pix_fmts: tuple[str, ...] = ()
+    grants: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CutAtModules:
+    """Cut every edge between two modules a region holds, each coded as
+    `coding` says: one module to a sidecar process."""
+
+    coding: CutCoding = field(default_factory=CutCoding)
+
+
+Cuts = Mapping[FrameRef, CutCoding] | CutAtModules
+
+
+@dataclass(frozen=True)
 class Stage:
     """Processes that run at the same time, and their place in the order."""
 
@@ -2201,6 +2238,7 @@ class _Partitioner:
         *,
         coded: Collection[str] = (),
         decoded: Mapping[str, tuple[str, ...]] | None = None,
+        cuts: Cuts | None = None,
     ) -> None:
         self.g = g
         # The pixel formats each codec package's decoder may write.
@@ -2221,6 +2259,11 @@ class _Partitioner:
         self.joined_codecs: set[str] = set()
         # The setparams lowering put behind each decoder, by the decoder.
         self.stamped: dict[str, str] = {}
+        # Each cut, by its node, with the `encode` arguments coding the
+        # stream across it, empty where it crosses as it is.
+        self.cut_coding: dict[str, dict[str, object]] = {}
+        # The nodes a cut put in the graph that only a sidecar runs.
+        self.cut_made: set[str] = set()
         # The frames each such region's encoders hold back, at most.
         self.encode_delays: dict[str, int] = {}
         # The scales putting a picture only timing inputs read at
@@ -2231,7 +2274,7 @@ class _Partitioner:
         self.shapes = shapes or {}
         self.audio_wires = audio_wires or {}
         self.models = models or {}
-        self.effects = effects or {}
+        self.effects = dict(effects or {})
         self.anchors = anchors or {}
         self.live = frozenset(
             alias
@@ -2257,11 +2300,14 @@ class _Partitioner:
             if name in self.node_shapes and not self.node_shapes[name].bounded
         )
         self.g = g = self._host_node_decodes()
+        if cuts:
+            self.g = g = self._cut(cuts)
         self.order = _topological(g)
         # A hosted node is external whoever asked: only the sidecar runs it.
         self.external = {
             name: bool(external(g.nodes[name]))
             or g.nodes[name].filter in HOSTED_FILTERS
+            or name in self.cut_made
             for name in self.order
         }
         self.depth: dict[str, int] = {}
@@ -2338,6 +2384,115 @@ class _Partitioner:
         if not hosted:
             return self.g
         return replace(self.g, nodes={**self.g.nodes, **hosted})
+
+    def _cut(self, cuts: Cuts) -> Graph:
+        """The graph with each stream `cuts` names cut, so the region making
+        it and the region reading it are two sidecar processes, wired to
+        each other with no ffmpeg between, which a placement can put on two
+        nodes.
+
+        This is the one place a region is parted. Nothing decides here when
+        to part one: a caller names the edges, and a cost model weighing what
+        a split saves against what crossing costs would be one more caller.
+
+        A cut stands after the stream as a node of its own, which joins the
+        region making the stream and is dissolved there; its readers take it
+        from that region's pipe (:meth:`_regions`). Coded by a hosted
+        encoder, the stream is encoded at the end of that region and decoded
+        at the start of each reading one (:meth:`_code_cuts`); coded by a
+        codec package, its encoder and decoder stand either side of the cut
+        and join the regions beside them, as any codec package's halves do.
+        """
+        resolved = (
+            {ref: cuts.coding for ref in self._module_boundaries()}
+            if isinstance(cuts, CutAtModules)
+            else dict(cuts)
+        )
+        nodes = dict(self.g.nodes)
+        encoders = list(self.g.encoders)
+        decoders = list(self.g.decoders)
+        for ref, coding in resolved.items():
+            readers = [name for name, node in nodes.items() if ref in node.inputs]
+            maker = _ref_node(ref)
+            if maker is None or maker not in nodes or not readers:
+                raise FfrwdError(
+                    ErrorCode.INTERNAL,
+                    f"a cut names {ref}, which no node makes and another reads",
+                    hint="cut a stream one node of the graph writes and another reads",
+                )
+            kind = ref_type(self.g, ref)
+            base = ref.replace(":", "_")
+            coded = kind == "video" and bool(coding.module)
+            read = ref
+            if coded:
+                read = f"{base}_cut_encode"
+                nodes[read] = Node(
+                    id=read,
+                    filter=coding.module,
+                    args=dict(coding.params),
+                    inputs=[ref],
+                    outputs=[kind],
+                )
+                encoders.append(read)
+                self.cut_made.add(read)
+                self.effects[coding.module] = coding.grants
+                self.decoded[coding.module] = coding.pix_fmts
+            cut = f"{base}_cut"
+            nodes[cut] = Node(id=cut, filter=CUT, args={}, inputs=[read], outputs=[kind])
+            self.cut_coding[cut] = (
+                {"codec": coding.encoder, **dict(coding.options)}
+                if kind == "video" and coding.encoder
+                else {}
+            )
+            handed = cut
+            if coded:
+                handed = f"{base}_cut_decode"
+                nodes[handed] = Node(
+                    id=handed, filter=coding.module, args={}, inputs=[cut], outputs=[kind]
+                )
+                decoders.append(handed)
+                self.cut_made.add(handed)
+            for name in readers:
+                node = nodes[name]
+                nodes[name] = replace(
+                    node, inputs=[handed if one == ref else one for one in node.inputs]
+                )
+        return replace(self.g, nodes=nodes, encoders=encoders, decoders=decoders)
+
+    def _module_boundaries(self) -> list[FrameRef]:
+        """Every stream one module writes as pictures or sound and another
+        module reads as such: where a region holding several modules is cut
+        to give each module a process.
+
+        A stream read as packets (by a packet sink, a packet filter, a node's
+        packets port or a codec package's decoder) is not one: the encoder
+        writing those packets stands in the region beside its reader.
+        """
+        modules = {
+            name
+            for name, node in self.g.nodes.items()
+            if node.filter not in HOSTED_FILTERS
+            and node.filter not in SPLIT_FILTERS
+            and (name in self.node_shapes or node.filter in self.pix_fmts
+                 or node.filter in self.audio_wires or name in self.g.encoders
+                 or name in self.g.decoders)
+        }
+        found: list[FrameRef] = []
+        for name, node in self.g.nodes.items():
+            if name not in modules or name in self.g.decoders:
+                continue
+            if name in self.g.packet_sinks or name in self.g.packet_filters:
+                continue
+            for position, ref in enumerate(node.inputs):
+                maker = _ref_node(self._past_splits(ref))
+                if maker is None or maker not in modules or maker == name:
+                    continue
+                if maker in self.g.encoders or self._coded_output(self._past_splits(ref)):
+                    continue
+                if self._takes_packets(name, position) or ref in found:
+                    continue
+                found.append(ref)
+        return found
 
     def _holds_input_on_the_gpu(self, name: str, position: int) -> bool:
         """True when node `name` holds its input at `position` on the GPU."""
@@ -3278,6 +3433,25 @@ class _Partitioner:
             groups[rep] = [n for n in self.order if n in wanted]
             home[name] = rep
             self.joined_codecs.add(name)
+        # A cut joins the region making its stream, which writes the stream
+        # out; so does a split handing that stream to a cut and to readers
+        # that are not one region with it.
+        for name in self.order:
+            if name not in self.cut_coding:
+                continue
+            chain = [name]
+            maker = _ref_node(self.g.nodes[name].inputs[0])
+            if maker is not None and maker not in home and maker in self.g.nodes and (
+                self.g.nodes[maker].filter in SPLIT_FILTERS
+            ):
+                chain.append(maker)
+                maker = _ref_node(self.g.nodes[maker].inputs[0])
+            if maker is None or maker not in home:
+                continue
+            rep = home[maker]
+            groups[rep] = [n for n in self.order if n in {*groups[rep], *chain}]
+            for one in chain:
+                home[one] = rep
         return [groups[name] for name in self.order if name in groups]
 
     def _codec_neighbour(
@@ -3405,7 +3579,9 @@ class _Partitioner:
     ) -> bool:
         """Merge the split `name` with everything reading it, and the module it
         reads, into one region; False where they cannot be one."""
-        reads = consumers.get(name)
+        reads = [
+            reader for reader in consumers.get(name) or [] if reader not in self.cut_coding
+        ]
         if not reads or any(reader not in home for reader in reads):
             return False
         if any(reader in alone for reader in reads):
@@ -4480,6 +4656,7 @@ class _Partitioner:
                     name in self.node_shapes
                     or name in self.joined_sinks
                     or name in self.joined_codecs
+                    or name in self.cut_coding
                     for name in members
                 ),
                 call_pads=self._joined_pads(members),
@@ -4553,6 +4730,16 @@ class _Partitioner:
                 and producer in self.sidecar_of
                 and not self.external.get(producer, False)
             )
+            if (
+                dissolved
+                and producer in self.cut_coding
+                and any(sidecar.id == target for sidecar in self.sidecars)
+            ):
+                # A cut stream goes from the sidecar making it to the one
+                # reading it.
+                assert producer is not None  # what being in `cut_coding` says
+                self._add_edge(self.sidecar_of[producer], target, ref)
+                continue
             if producer is not None and (self.external.get(producer, False) or dissolved):
                 consumer = self._reader(target, ref)
                 if (
@@ -4624,6 +4811,7 @@ class _Partitioner:
         self._redirect_live_reads()
         self._code_edges()
         self._drop_copying_ffmpegs()
+        self._code_cuts()
         self._add_rows_edges()
         self._add_rows_documents()
         self._bundle_node_edges()
@@ -4704,6 +4892,29 @@ class _Partitioner:
                     self.encode_delays.get(sidecar.id, 0), held
                 )
                 self.edges[index] = replace(edge, format=replace(wire, codec=COPY_CODEC))
+
+    def _code_cuts(self) -> None:
+        """Code each picture a cut hands from one sidecar to another with the
+        encoder its coding names: the region making it encodes it, the one
+        reading it decodes it, onto the device where it holds its pictures
+        there, and the pipe between carries the packets."""
+        sidecars = {sidecar.id for sidecar in self.sidecars}
+        for index, edge in enumerate(self.edges):
+            if edge.source not in sidecars or edge.target not in sidecars:
+                continue
+            cut = _ref_node(edge.ref)
+            coded = self.cut_coding.get(cut) if cut is not None else None
+            wire = edge.format
+            if not coded or not isinstance(wire, VideoFormat) or wire.codec != RAWVIDEO:
+                continue
+            self.encodes.setdefault(edge.source, {})[edge.ref] = dict(coded)
+            meta = self._origin_meta(edge.ref)
+            held = encoder_delay(str(coded["codec"]), {}, meta.height if meta else None)
+            self.encode_delays[edge.source] = max(self.encode_delays.get(edge.source, 0), held)
+            self.decodes.setdefault(edge.target, {})[edge.ref] = wire.pix_fmt
+            if any(self._holds_on_the_gpu(name) for name in self.members[edge.target]):
+                self.decoded_on_device.add(edge.target)
+            self.edges[index] = replace(edge, format=replace(wire, codec=COPY_CODEC))
 
     def _drop_copying_ffmpegs(self) -> None:
         """Wire two sidecars to each other where the ffmpeg between them only
@@ -6667,6 +6878,7 @@ def partition(
     anchors: Mapping[str, tuple[int, int]] | None = None,
     coded: Collection[str] = (),
     decoded: Mapping[str, tuple[str, ...]] | None = None,
+    cuts: Cuts | None = None,
 ) -> ProcessPlan:
     """Partition a logical graph into the processes that run it.
 
@@ -6714,6 +6926,12 @@ def partition(
     its decoder may write: what decides whether a region can hand its
     pictures to the node reading them.
 
+    `cuts` parts sidecar regions: each ref it names, a stream one module
+    writes and another reads, is cut there, so the two run as two sidecar
+    processes wired to each other, coded on the way as its
+    :class:`CutCoding` says (:meth:`_Partitioner._cut`). :class:`CutAtModules`
+    cuts every such edge. Nothing here decides to cut on its own.
+
     Raises ``FfrwdError`` -- unanchored, for the caller to re-anchor on the
     declaration -- for a multi-input module whose streams cannot pair up, and
     ``UNBOUNDED_LIVE_INPUT`` -- already anchored, from `anchors` -- for a live
@@ -6731,14 +6949,14 @@ def partition(
 
     partitioner = _Partitioner(
         g, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors,
-        coded=coded, decoded=decoded,
+        coded=coded, decoded=decoded, cuts=cuts,
     )
     reads = partitioner.timing_reads()
     if reads:
         shrunk, small = partitioner.shrunk(reads)
         partitioner = _Partitioner(
             shrunk, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors,
-            small, coded=coded, decoded=decoded,
+            small, coded=coded, decoded=decoded, cuts=cuts,
         )
     plan = partitioner.run()
     plan = startup.arrange(plan)

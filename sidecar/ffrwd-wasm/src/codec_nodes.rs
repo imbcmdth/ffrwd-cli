@@ -32,9 +32,11 @@ pub struct EncoderNode {
     header: nut::Stream,
     framer: Framer,
     /// The format the encoder reads, where the frames arrive held on the GPU
-    /// in another: each is made it there before it is read back.
+    /// in another, and the colour its YUV is written in: each is made it
+    /// there before it is read back, in the colour the coded stream says,
+    /// which is what a decoder reads it back in.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-    convert: Option<&'static str>,
+    convert: Option<(&'static str, av_nodes::Yuv)>,
 }
 
 impl EncoderNode {
@@ -78,7 +80,7 @@ impl EncoderNode {
                         })?;
                     video.pix_fmt = to;
                     video.frame_len = crate::frame_len_for(to, video.width, video.height)?;
-                    Some(to)
+                    Some((to, av_nodes::yuv_of(video.color.as_ref())))
                 } else {
                     bail!(
                         "{name} reads {wanted}, and its frames arrive in {} in host memory; \
@@ -142,10 +144,10 @@ impl EncoderNode {
     /// A frame's bytes in the format the encoder reads.
     fn bytes(&self, data: &FrameData) -> Result<Vec<u8>> {
         #[cfg(feature = "gpu")]
-        if let (Some(to), FrameData::Gpu(frame)) = (self.convert, data) {
+        if let (Some((to, yuv)), FrameData::Gpu(frame)) = (self.convert, data) {
             use ffrwd_wasm_runtime::gpu::frames::{Layout, Target};
             let layout = Layout::of(to).expect("a wire format the device holds");
-            let target = Target::new(layout, frame.width(), frame.height(), frame.yuv());
+            let target = Target::new(layout, frame.width(), frame.height(), yuv);
             let made = frame
                 .converted(target)
                 .with_context(|| format!("{}: making a frame {to} on the device", self.name))?;
@@ -390,7 +392,7 @@ fn made_on_the_device(
         .copied()
         .find(|f| *f == wanted)
         .ok_or_else(|| anyhow!("{name}: {wanted} is not a format the wire carries"))?;
-    let yuv = av_nodes::read_as(video.color.as_ref()).unwrap_or(av_nodes::Yuv::DEFAULT);
+    let yuv = av_nodes::yuv_of(video.color.as_ref());
     let mut made = nut::Stream::video(to, video.width, video.height, header.time_base)
         .ok_or_else(|| anyhow!("{name}: the wire does not carry {to}"))?;
     made.frame_rate = header.frame_rate;

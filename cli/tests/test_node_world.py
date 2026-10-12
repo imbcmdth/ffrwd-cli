@@ -28,7 +28,14 @@ from ffrwd.ir import Graph
 from ffrwd.lower import lower
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import ProbeResult, StreamMeta
-from ffrwd.processes import ProcessPlan, VideoFormat
+from ffrwd.processes import (
+    CutAtModules,
+    CutCoding,
+    Cuts,
+    ProcessPlan,
+    SidecarProcess,
+    VideoFormat,
+)
 from ffrwd.registry import Registry, load_reference
 from ffrwd.timing import check_live_leads, summary, timing
 from ffrwd.warnings import FfrwdWarning, WarningCode
@@ -818,13 +825,14 @@ def _plan(
     describe: Callable[[str], Described] = _node,
     pix_fmt: str | None = None,
     av_filters: Callable[[], Collection[str] | None] = lambda: None,
+    cuts: Cuts | None = None,
 ) -> ProcessPlan:
     probes = _probes(rate, colour, pix_fmt)
     monkeypatch.setattr(
         "ffrwd.compiler.probe_path", lambda path, args=(), **kw: probes[path[0]]
     )
     compiled = compile_all(
-        _declared(query), describe=describe, shape=_Asked(), av_filters=av_filters
+        _declared(query), describe=describe, shape=_Asked(), av_filters=av_filters, cuts=cuts
     )
     assert compiled.plan is not None
     return compiled.plan
@@ -2401,6 +2409,144 @@ def test_a_codec_packages_halves_run_in_the_regions_beside_them(
     assert [n.filter for n in region.graph.nodes.values()][:2] == ["codec", "box"]
     argv = _shown(compiled.plan)[region.id]
     assert argv[argv.index("-pads") + 1] == 'codec=[{"pix_fmt": "rgba"}]'
+
+
+def _filters_of(region: SidecarProcess) -> list[str]:
+    assert region.graph is not None
+    return [node.filter for node in region.graph.nodes.values()]
+
+
+def _between(plan: ProcessPlan) -> list[tuple[str, str, str]]:
+    """Every pipe from one sidecar to another: its ends and its codec."""
+    sidecars = {sidecar.id for sidecar in plan.sidecars}
+    return [
+        (edge.source, edge.target, getattr(edge.format, "codec", ""))
+        for edge in plan.stream_edges
+        if edge.source in sidecars and edge.target in sidecars
+    ]
+
+
+_TWO_BOXES = "COPY (SELECT box(box(f.video[1])) FROM input('f.mp4') f) TO 'out.mkv' " + (
+    "WITH (video_codec 'ffv1')"
+)
+
+
+def test_a_cut_parts_a_region_into_two_sidecars_wired_to_each_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cut between its two modules, a region is two sidecar processes, the
+    first writing the picture straight to the second: as it is, raw; or as
+    the packets of the hosted encoder the cut names, encoded at the end of
+    the first and decoded onto the device at the start of the second."""
+    plan = _plan(_TWO_BOXES, monkeypatch, cuts=CutAtModules())
+    first, second = plan.sidecars
+    assert (_filters_of(first), _filters_of(second)) == (
+        ["decode", "box"], ["box", "encode"]
+    )
+    assert _between(plan) == [(first.id, second.id, "rawvideo")]
+    (raw,) = [e for e in plan.stream_edges if e.source == first.id]
+    assert isinstance(raw.format, VideoFormat) and raw.format.pix_fmt == "rgba"
+
+    h264 = CutCoding(encoder="h264_nvenc", options=(("b", "6M"),))
+    plan = _plan(_TWO_BOXES, monkeypatch, cuts=CutAtModules(h264))
+    first, second = plan.sidecars
+    assert (_filters_of(first), _filters_of(second)) == (
+        ["decode", "box", "encode"], ["decode", "box", "encode"]
+    )
+    assert first.graph is not None and second.graph is not None
+    assert list(first.graph.nodes.values())[-1].args == {"codec": "h264_nvenc", "b": "6M"}
+    assert list(second.graph.nodes.values())[0].args == {"format": "rgba", "hw": "auto"}
+    assert _between(plan) == [(first.id, second.id, "copy")]
+    assert len(plan.ffmpeg) == 2  # the demuxer and the muxer, nothing between
+
+
+def test_a_cut_coded_by_a_codec_package_puts_its_halves_either_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Coded by a codec package, a cut stream is encoded by the module at the
+    end of the region making it and decoded by it at the start of the one
+    reading it, each told the pixel format its pictures are made in."""
+    coding = CutCoding(
+        module="codec.wasm",
+        params=(("bitrate", 5000),),
+        pix_fmts=("yuv420p", "yuv444p"),
+        grants=("gpu",),
+    )
+    plan = _plan(
+        _TWO_BOXES, monkeypatch, describe=_with_codec, cuts=CutAtModules(coding)
+    )
+    first, second = plan.sidecars
+    assert _filters_of(first)[-1] == "codec" and _filters_of(second)[0] == "codec"
+    assert any(grant.module == "codec.wasm" for grant in first.grants)
+    second_argv = _shown(plan)[second.id]
+    assert second_argv[second_argv.index("-pads") + 1] == 'codec=[{"pix_fmt": "rgba"}]'
+    assert _between(plan) == [(first.id, second.id, "copy")]
+
+
+def test_a_cut_parts_a_region_holding_a_source_and_a_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A region from a node source to a node sink is cut between its modules
+    and nowhere else: the sink stays beside the encoder writing its packets,
+    and no ffmpeg runs anywhere."""
+    monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    plan = _plan(
+        _SUB + _PUBLISH + "COPY (SELECT box(box(v.video[1])) FROM sub('r') v "
+        "WHERE v.height = 720) TO publish('https://relay', 'b') "
+        "WITH (video_codec 'h264_d3d12va')",
+        monkeypatch,
+        describe=_reporting("publish.wasm"),
+        cuts=CutAtModules(),
+    )
+    assert not plan.ffmpeg
+    first, second = plan.sidecars
+    assert (_filters_of(first), _filters_of(second)) == (
+        ["sub", "decode", "box"], ["box", "encode", "publish"]
+    )
+    assert _between(plan) == [(first.id, second.id, "rawvideo")]
+
+
+def test_a_cut_parts_a_region_of_older_frame_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two frame modules of an older world in one region are two sidecars
+    once cut, the first a network of nodes since it writes the cut stream."""
+    query = (
+        _INVERT + "COPY (SELECT invert(invert(f.video[1])) FROM input('f.mp4') f) "
+        "TO 'out.mkv'"
+    )
+    (whole,) = _plan(query, monkeypatch, describe=_framed).sidecars
+    assert _filters_of(whole) == ["invert", "invert"]
+    plan = _plan(query, monkeypatch, describe=_framed, cuts=CutAtModules())
+    first, second = plan.sidecars
+    assert first.node_network
+    assert (_filters_of(first), _filters_of(second)) == (["invert"], ["invert"])
+    assert _between(plan) == [(first.id, second.id, "rawvideo")]
+
+
+def test_a_cut_names_one_stream_of_a_fan_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cut on one leg of a stream two modules read, the region keeps the
+    module and the other reader, and writes the cut leg out to the sidecar
+    reading it; a ref no node makes is refused."""
+    query = (
+        "COPY (WITH x AS (SELECT box(f.video[1]) AS v FROM input('f.mp4') f) "
+        "SELECT box(x.v), box(x.v, 'host') FROM x) TO 'out.mkv'"
+    )
+    whole = _plan(query, monkeypatch)
+    (region,) = whole.sidecars
+    assert region.graph is not None
+    graph = compile_all(_declared(query), describe=_node, shape=_Asked()).graphs[0]
+    split = next(n for n in graph.nodes.values() if n.filter == "split")
+    plan = _plan(query, monkeypatch, cuts={f"{split.id}:0": CutCoding()})
+    assert len(plan.sidecars) == 2
+    assert len(_between(plan)) == 1
+    with pytest.raises(FfrwdError) as caught:
+        _plan(query, monkeypatch, cuts={"nowhere:0": CutCoding()})
+    assert caught.value.code is ErrorCode.INTERNAL
 
 
 def _hand_on(path: str) -> Described:

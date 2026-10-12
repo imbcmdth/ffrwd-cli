@@ -175,8 +175,10 @@ as when it rides alone:
   name for is read as that tag, for such a decoder. The encoder reads the
   format `-pads` names, or its pad's own where the module takes it, else
   the first the module lists; a picture held on the GPU in another
-  format is made that format on the device before it is read back, and
-  one in host memory is refused. The decoder's pictures leave in host
+  format is made that format on the device before it is read back, its
+  YUV in the matrix and range the stream's colour names (BT.601 limited
+  where it names none, as libswscale reads it), which is what a decoder
+  of the stream reads it back in; one in host memory is refused. The decoder's pictures leave in host
   memory, or, where `-pads` names a format, are put on the GPU and made
   that format there. Each is one instance, called in order.
 

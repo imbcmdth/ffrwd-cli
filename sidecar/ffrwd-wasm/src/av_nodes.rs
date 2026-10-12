@@ -181,6 +181,17 @@ pub(crate) fn read_as(_color: Option<&ColorInfo>) -> Option<Yuv> {
     None
 }
 
+/// The colour a stream's YUV is written and read in on the device: as
+/// libswscale reads it, or BT.709 limited for a matrix the device's
+/// conversion does not have.
+#[cfg(feature = "gpu")]
+pub(crate) fn yuv_of(color: Option<&ColorInfo>) -> Yuv {
+    read_as(color).unwrap_or(Yuv::DEFAULT)
+}
+
+#[cfg(not(feature = "gpu"))]
+pub(crate) fn yuv_of(_color: Option<&ColorInfo>) -> Yuv {}
+
 /// A decoder on the process's own device, where `hw` allows the device
 /// it is (`auto`, or that device by name), the wire's format is one its
 /// pictures are made on the device (yuv420p, or rgba in a matrix the

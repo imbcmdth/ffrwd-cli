@@ -64,6 +64,7 @@ from .probe import probe as probe_path
 from .probe import probe_failure as probe_failure_path
 from .processes import (
     AudioFormat,
+    Cuts,
     ModelBinding,
     ModuleShape,
     ProcessPlan,
@@ -673,6 +674,7 @@ def compile_all(
     invoke: wasm.Invoke = wasm.invoke,
     shape: shapes_module.Shape = shapes_module.shape,
     av_filters: Callable[[], Collection[str] | None] = sidecar_filters,
+    cuts: Cuts | None = None,
 ) -> Compiled:
     """Compile SQL `text` into its commands, and the plan that runs them.
 
@@ -690,6 +692,8 @@ def compile_all(
     asked once per distinct call. `av_filters` is the same for the filters
     the sidecar's libavfilter has, asked only where a filter could run on
     the sidecar's device (:func:`~ffrwd.device_filters.filters_on_the_device`).
+    `cuts` parts the plan's sidecar regions where it says
+    (:func:`~ffrwd.processes.partition`); no query asks for it.
 
     Raises ``FfrwdError`` — and nothing else — on every rejection.
     """
@@ -764,6 +768,7 @@ def compile_all(
                     for module, described in describes.items()
                     if described.decoder is not None
                 },
+                cuts=cuts,
             )
             check_spellable(plan)
         except FfrwdError as err:

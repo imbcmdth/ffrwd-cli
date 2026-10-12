@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from ffrwd import wasm
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.ir import FeederCall, Graph, Lateral, LateralConnection, SinkUnit
 from ffrwd.placement import (
@@ -17,11 +18,14 @@ from ffrwd.placement import (
     Placement,
     check_placement,
     colocation_groups,
+    cuts_for,
     place,
     split,
     stdio_chains,
 )
 from ffrwd.processes import (
+    CutAtModules,
+    CutCoding,
     DataFormat,
     EffectGrant,
     FeederEdge,
@@ -329,3 +333,44 @@ def test_every_strategy_numbers_its_nodes_along_the_stream(strategy: str, make: 
     check_placement(plan, placement)
     for source, target in flow_edges(plan):
         assert placement.nodes[source] <= placement.nodes[target], (source, target)
+
+
+def _codec_module(path: str) -> wasm.Described:
+    formats = ("yuv420p", "yuv444p")
+    return wasm.Described(
+        world="ffrwd:av@0.18.0",
+        name="codec",
+        pixel_formats=formats,
+        gpu=True,
+        encoder=wasm.EncoderInfo(codec="c", fourcc="CODE", pixel_formats=formats),
+        decoder=wasm.DecoderInfo(fourccs=("CODE",), pixel_formats=formats),
+    )
+
+
+def test_per_module_asks_the_partition_to_cut_each_region_between_its_modules() -> None:
+    """per-module cuts every region between its modules, coded as
+    --cut-codec spells it, the sidecar's own encode spelling; every other
+    placement cuts nothing, and refuses a codec for cuts it does not make."""
+    assert cuts_for("per-module") == CutAtModules()
+    assert cuts_for("per-process") is None and cuts_for("one") is None
+    assert cuts_for("per-module", "h264_d3d12va:b=8M:g=30") == CutAtModules(
+        CutCoding(encoder="h264_d3d12va", options=(("b", "8M"), ("g", "30")))
+    )
+    assert cuts_for(
+        "per-module", "E:/codecs/pyro.wasm:bytes_per_frame=125000", _codec_module
+    ) == CutAtModules(
+        CutCoding(
+            module="E:/codecs/pyro.wasm",
+            params=(("bytes_per_frame", 125000),),
+            pix_fmts=("yuv420p", "yuv444p"),
+            grants=("gpu",),
+        )
+    )
+    for strategy, codec, needle in [
+        ("per-process", "h264_d3d12va", "cuts nothing"),
+        ("per-module", "libx264", "hosts no encoder"),
+        ("per-module", "h264_d3d12va:b", "is not an option"),
+    ]:
+        with pytest.raises(FfrwdError) as caught:
+            cuts_for(strategy, codec)
+        assert needle in caught.value.message and caught.value.hint
