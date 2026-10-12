@@ -30,6 +30,8 @@ mod convert;
 pub mod d3d12;
 #[cfg(feature = "gpu")]
 pub mod frames;
+#[cfg(feature = "gpu")]
+pub mod tensor;
 
 /// A build without the `gpu` feature holds no frame on a GPU; the type
 /// exists so [`crate::node::FrameData`] has its variant, and is never made.

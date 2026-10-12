@@ -637,7 +637,7 @@ impl Pipelines {
 }
 
 /// A view of one plane as its own format, the aspect it is in.
-fn view(global: &Global, plane: &Plane) -> Result<TextureViewId> {
+pub(super) fn view(global: &Global, plane: &Plane) -> Result<TextureViewId> {
     let (id, err) = global.texture_create_view(
         plane.texture,
         &wgpu_core::resource::TextureViewDescriptor {

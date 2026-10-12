@@ -16,7 +16,7 @@ use wasmtime::Store;
 use wasmtime_wasi_http::WasiHttpCtx;
 
 #[cfg(feature = "gpu")]
-use super::gpu_ext::GpuModule;
+use super::gpu_ext::GpuNnModule as GpuModule;
 use super::world_0191::node::exports::ffrwd::av::node as wit;
 use super::world_0191::node::ffrwd::av::{node_tick, node_types as nt, types as wt};
 use super::world_0191::node::NodeModule;
@@ -57,6 +57,17 @@ impl TickHandle {
                 frames.len()
             ))
         })
+    }
+
+    /// Stream `id`'s frames as `init` bound them, for `ffrwd:gpu/nn`.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn video(&self, id: u32) -> wasmtime::Result<&super::VideoFormat> {
+        match &self.bound(id)?.format {
+            StreamFormat::Video(format) => Ok(format),
+            _ => Err(wasmtime::Error::msg(format!(
+                "stream {id} is not a video stream"
+            ))),
+        }
     }
 
     fn stream(&self, id: u32) -> wasmtime::Result<&TickStream> {

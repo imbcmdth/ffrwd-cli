@@ -68,10 +68,11 @@ ort = { version = "=2.0.0-rc.10", default-features = false, features = ["cuda", 
 windows-sys = { version = "0.59", features = ["Win32_System_ProcessStatus", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Foundation"] }
 
 # The D3D12 objects under the process's wgpu device, for a decoder opened on
-# that device and the frames it writes: wgpu-hal's dx12 types, and the
+# that device and the frames it writes, and the shared buffers and sync
+# object a CUDA session reads through: wgpu-hal's dx12 types, and the
 # `windows` version they are declared in (wgpu-hal 29's).
 wgpu-hal = { version = "29", features = ["dx12"], optional = true }
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi_Common"], optional = true }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi_Common", "Win32_Security"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # CUDA is the only GPU provider the Linux artifacts carry.

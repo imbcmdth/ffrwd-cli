@@ -10,7 +10,11 @@
 //! sidecar has no link-time dependency on it, and a checkout without one
 //! builds and runs everything that does not ask for inference.
 
+#[cfg(all(windows, feature = "gpu"))]
+pub mod cuda;
 pub mod dlls;
+#[cfg(feature = "gpu")]
+pub mod frame_tensor;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -330,6 +334,11 @@ struct Models {
     registry: ModelRegistry,
     names: Vec<String>,
     provider: Provider,
+    /// The provider each model's session engaged, by `-nn` name.
+    placed: HashMap<String, Provider>,
+    /// The CUDA runtime the CUDA provider loads, where the walk took CUDA
+    /// and its preflight found one.
+    cuda_runtime: Option<PathBuf>,
 }
 
 /// Loaded once per process: building a session is expensive and `Graph` is
@@ -353,6 +362,18 @@ pub fn model_names() -> Vec<String> {
         .get()
         .map(|m| m.names.clone())
         .unwrap_or_default()
+}
+
+/// The provider the session of the model bound as `name` engaged; None for
+/// a name no `-nn` binds.
+pub fn provider_of(name: &str) -> Option<Provider> {
+    graph_registry().get()?.placed.get(name).copied()
+}
+
+/// The CUDA runtime library the CUDA provider loads, where the process's
+/// provider is CUDA and its preflight found one.
+pub fn cuda_runtime() -> Option<PathBuf> {
+    graph_registry().get()?.cuda_runtime.clone()
 }
 
 /// Refuses, before instantiation, a component that asks for inference in a
@@ -787,11 +808,24 @@ pub fn configure(config: &Config) -> Result<()> {
 
     report_verdict(&dir, config, &placements);
 
+    let cuda_runtime = match provider {
+        Provider::Cuda => dlls::CUDA_DEPS
+            .first()
+            .and_then(|dep| dlls::locate(&dlls::search_dirs(&dir), dep.file))
+            .map(|found| found.join(dlls::CUDA_DEPS[0].file)),
+        _ => None,
+    };
+    let placed = placements
+        .iter()
+        .map(|p| (p.name.clone(), p.provider))
+        .collect();
     graph_registry()
         .set(Models {
             registry,
             names,
             provider,
+            placed,
+            cuda_runtime,
         })
         .map_err(|_| anyhow::anyhow!("the models were already loaded"))?;
     Ok(())

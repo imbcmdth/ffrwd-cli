@@ -1903,28 +1903,32 @@ impl WasiHttpView for Host {
 }
 
 /// `ffrwd:gpu@0.1.0`, the companion of the node world for frames on the
-/// GPU: `ports` a module exports beside `node`, `frames` it imports. The
-/// webgpu types are the vendored host's, so a texture is one type on both
-/// sides.
+/// GPU: `ports` a module exports beside `node`, `frames` and `nn` it
+/// imports. The webgpu types are the vendored host's, so a texture is one
+/// type on both sides, and the `wasi:nn` tensor is the vendored wasi-nn
+/// host's, so a tensor `nn` makes is one `compute` takes.
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu_ext {
     wasmtime::component::bindgen!({
         path: "../wit-gpu",
-        world: "gpu-module",
+        world: "gpu-nn-module",
         require_store_data_send: true,
         with: {
             "wasi:io": wasmtime_wasi_io::bindings::wasi::io,
             "wasi:webgpu/webgpu": wasi_webgpu_wasmtime::wasi::webgpu::webgpu,
             "wasi:graphics-context/graphics-context": wasi_webgpu_wasmtime::wasi::graphics_context::graphics_context,
+            "wasi:nn/tensor.tensor": wasmtime_wasi_nn::Tensor,
         },
         imports: { default: trappable },
     });
 }
 
 /// The export a module makes beside `node` to say which ports are on the
-/// GPU, and the import it reads frames through.
+/// GPU, the import it reads frames through, and the one it makes model
+/// inputs of frames through.
 pub const GPU_PORTS_EXPORT: &str = "ffrwd:gpu/ports@0.1.0";
 pub const GPU_FRAMES_IMPORT: &str = "ffrwd:gpu/frames@0.1.0";
+pub const GPU_NN_IMPORT: &str = "ffrwd:gpu/nn@0.1.0";
 
 #[cfg(feature = "gpu")]
 impl gpu_ext::ffrwd::gpu::frames::Host for Host {
@@ -2025,6 +2029,69 @@ impl gpu_ext::ffrwd::gpu::frames::Host for Host {
             frame,
         });
         Ok(Ok(()))
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl gpu_ext::ffrwd::gpu::nn::Host for Host {
+    fn frame_tensor(
+        &mut self,
+        id: u32,
+        index: u32,
+        options: gpu_ext::ffrwd::gpu::nn::FrameTensorOptions,
+    ) -> wasmtime::Result<Result<Resource<wasmtime_wasi_nn::Tensor>, String>> {
+        use crate::gpu::frames::{Matrix, Yuv};
+        use crate::gpu::tensor::{Fit, Layout, Order, TensorSpec};
+        use gpu_ext::ffrwd::gpu::nn as wit;
+        let Some(rep) = self.gpu_tick else {
+            return Ok(Err(
+                "frame-tensor is called while process runs, and no call is running".to_string(),
+            ));
+        };
+        let handle: &node_world::TickHandle = self.table.get(&Resource::new_borrow(rep))?;
+        let (frame, format) = match (handle.frame(id, index), handle.video(id)) {
+            (Ok(frame), Ok(format)) => (frame, format),
+            (Err(e), _) | (_, Err(e)) => return Ok(Err(e.to_string())),
+        };
+        let yuv = Yuv {
+            matrix: match format.color.map(|c| c.space) {
+                Some("bt470bg" | "smpte170m" | "bt601") => Matrix::Bt601,
+                _ => Matrix::Bt709,
+            },
+            full_range: format.color.is_some_and(|c| c.range == "pc"),
+        };
+        let spec = TensorSpec {
+            width: options.width,
+            height: options.height,
+            layout: match options.layout {
+                wit::TensorLayout::Nchw => Layout::Nchw,
+                wit::TensorLayout::Nhwc => Layout::Nhwc,
+            },
+            order: match options.order {
+                wit::ChannelOrder::Rgb => Order::Rgb,
+                wit::ChannelOrder::Bgr => Order::Bgr,
+            },
+            fit: match options.fit {
+                wit::Fit::Stretch => Fit::Stretch,
+                wit::Fit::Letterbox => Fit::Letterbox,
+            },
+            scale: options.scale,
+            mean: [options.mean.0, options.mean.1, options.mean.2],
+            std: [options.std.0, options.std.1, options.std.2],
+            yuv,
+        };
+        let made = crate::nn::frame_tensor::frame_tensor(
+            &frame.data,
+            format.pix_fmt,
+            format.width,
+            format.height,
+            &options.model,
+            &spec,
+        );
+        match made {
+            Ok(tensor) => Ok(Ok(self.table.push(tensor)?)),
+            Err(e) => Ok(Err(format!("frame {index} of stream {id}: {e:#}"))),
+        }
     }
 }
 
@@ -2338,6 +2405,11 @@ fn link(
     #[cfg(feature = "gpu")]
     if imports_interface(component, GPU_FRAMES_IMPORT) {
         gpu_ext::ffrwd::gpu::frames::add_to_linker::<_, HasSelf<_>>(&mut linker, |h| h)
+            .map_err(wasm_err)?;
+    }
+    #[cfg(feature = "gpu")]
+    if imports_interface(component, GPU_NN_IMPORT) {
+        gpu_ext::ffrwd::gpu::nn::add_to_linker::<_, HasSelf<_>>(&mut linker, |h| h)
             .map_err(wasm_err)?;
     }
 

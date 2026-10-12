@@ -181,16 +181,18 @@ jobs:
 
           # `ffrwd/gpu` is the companion package a node module includes to
           # hold frames on the GPU; it versions on its own and stages the
-          # same way, its one wit file beside the same deps.
+          # same way, its one wit file beside its own deps: the same ones,
+          # and the wasi:nn its `nn` interface takes a tensor from.
           GPU_ROOT = pathlib.Path("sidecar/wasm-gpu")
+          GPU_DEPS = "sidecar/wit-gpu/deps"
           gpu_manifest = json.loads((GPU_ROOT / "ffrwd.json").read_text())
 
-          def publish(root, wit, request):
+          def publish(root, wit, request, deps=DEPS):
               staged = root / "wit"
               shutil.rmtree(staged, ignore_errors=True)
               staged.mkdir()
               shutil.copyfile(wit, staged / pathlib.Path(wit).name)
-              shutil.copytree(DEPS, staged / "deps")
+              shutil.copytree(deps, staged / "deps")
 
               archive = store.pack(root)
               digest = hashlib.sha256(archive).hexdigest()
@@ -204,7 +206,7 @@ jobs:
                   print("From a checkout of this tag:")
                   print()
                   print(f"    cp {wit} {staged / pathlib.Path(wit).name}")
-                  print(f"    cp -r {DEPS} {staged / 'deps'}")
+                  print(f"    cp -r {deps} {staged / 'deps'}")
                   print(f"    cd {root} && ffrwd publish")
                   print()
                   print(f"which ships the {len(archive)} bytes hashing to {digest}.")
@@ -225,7 +227,7 @@ jobs:
                       )
 
           publish(ROOT, "sidecar/wit/av.wit", f"{WIT_PACKAGE}@{WORLD_VERSION}")
-          publish(GPU_ROOT, "sidecar/wit-gpu/gpu.wit", f"{gpu_manifest['name']}@{gpu_manifest['version']}")
+          publish(GPU_ROOT, "sidecar/wit-gpu/gpu.wit", f"{gpu_manifest['name']}@{gpu_manifest['version']}", GPU_DEPS)
           EOF
 
 

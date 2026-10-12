@@ -890,3 +890,179 @@ fn hand_over(global: &Global, device: &SharedDevice, textures: &[TextureId]) -> 
         .map_err(|(_, e)| anyhow!("{e}"))?;
     Ok(())
 }
+
+// Memory another API reads: a buffer on a shared heap and a shared sync
+// object, each reached through an NT handle (CUDA imports both).
+
+/// An NT handle to a D3D12 object, for another API to import; closed when
+/// dropped.
+pub struct SharedHandle(windows::Win32::Foundation::HANDLE);
+
+// SAFETY: a kernel handle, usable from any thread.
+unsafe impl Send for SharedHandle {}
+unsafe impl Sync for SharedHandle {}
+
+impl SharedHandle {
+    /// The handle, still owned here.
+    pub fn raw(&self) -> *mut std::os::raw::c_void {
+        self.0 .0
+    }
+}
+
+impl Drop for SharedHandle {
+    fn drop(&mut self) {
+        // SAFETY: made by CreateSharedHandle, closed once.
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// An NT handle to `object`, a resource or sync object made shareable.
+fn share(device: &ID3D12Device, object: &ID3D12DeviceChild) -> Result<SharedHandle> {
+    // SAFETY: a COM call on live objects; the handle is owned by the result.
+    let handle = unsafe {
+        device.CreateSharedHandle(
+            object,
+            None,
+            windows::Win32::Foundation::GENERIC_ALL.0,
+            windows::core::PCWSTR::null(),
+        )
+    }
+    .context("CreateSharedHandle")?;
+    Ok(SharedHandle(handle))
+}
+
+/// The LUID of the adapter the process's device is on, as its eight bytes,
+/// which is how CUDA names the same adapter; None unless the device opened
+/// on D3D12.
+pub fn adapter_luid() -> Option<[u8; 8]> {
+    let device = device()?;
+    // SAFETY: a COM call on a live device.
+    let luid = unsafe { device.GetAdapterLuid() };
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&luid.LowPart.to_le_bytes());
+    bytes[4..].copy_from_slice(&luid.HighPart.to_le_bytes());
+    Some(bytes)
+}
+
+/// A `size`-byte buffer of the process's device on a shared heap, handed to
+/// wgpu with `usage`, and the NT handle another API imports it through.
+/// The buffer is wgpu's to drop; the handle keeps nothing alive but itself.
+pub fn shared_buffer(
+    global: &Global,
+    device: &SharedDevice,
+    size: u64,
+    usage: wgpu_types::BufferUsages,
+) -> Result<(wgpu_core::id::BufferId, SharedHandle)> {
+    let raw = self::device().ok_or_else(|| anyhow!("the process's device is not a D3D12 one"))?;
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: 0,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_UNKNOWN,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    };
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: a COM call on a live device with valid descriptions.
+    unsafe {
+        raw.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_SHARED,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut made,
+        )
+    }
+    .with_context(|| format!("a shared {size}-byte buffer"))?;
+    let resource = made.ok_or_else(|| anyhow!("CreateCommittedResource made nothing"))?;
+    let handle = share(&raw, &resource.cast()?)?;
+    // SAFETY: a buffer of this device, `size` bytes, in the common state,
+    // which a buffer leaves for any state it is first used in.
+    let hal = unsafe { wgpu_hal::dx12::Device::buffer_from_raw(resource, size) };
+    let (buffer, err) = unsafe {
+        global.create_buffer_from_hal::<Dx12>(
+            hal,
+            device.device,
+            &wgpu_types::BufferDescriptor {
+                label: Some(std::borrow::Cow::Borrowed("ffrwd shared buffer")),
+                size,
+                usage,
+                mapped_at_creation: false,
+            },
+            None,
+        )
+    };
+    if let Some(e) = err {
+        global.buffer_drop(buffer);
+        bail!("wgpu refused a shared buffer: {e}");
+    }
+    Ok((buffer, handle))
+}
+
+/// A sync object of the process's device that the queue signals after
+/// work another API waits for, and the NT handle that API imports it
+/// through.
+pub struct SharedSync {
+    sync: SyncObject,
+    handle: SharedHandle,
+    signalled: std::sync::Mutex<u64>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the count is behind a lock.
+unsafe impl Send for SharedSync {}
+unsafe impl Sync for SharedSync {}
+
+impl SharedSync {
+    /// The process's one shared sync object, made the first time anything
+    /// asks.
+    pub fn get() -> Result<&'static SharedSync> {
+        static MADE: std::sync::OnceLock<std::result::Result<SharedSync, String>> =
+            std::sync::OnceLock::new();
+        MADE.get_or_init(|| SharedSync::make().map_err(|e| format!("{e:#}")))
+            .as_ref()
+            .map_err(|e| anyhow!("{e}"))
+    }
+
+    fn make() -> Result<SharedSync> {
+        let device = device().ok_or_else(|| anyhow!("the process's device is not a D3D12 one"))?;
+        // SAFETY: a COM call on a live device.
+        let sync: SyncObject = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_SHARED) }
+            .context("a shared sync object")?;
+        let handle = share(&device, &sync.cast()?)?;
+        Ok(SharedSync {
+            sync,
+            handle,
+            signalled: std::sync::Mutex::new(0),
+        })
+    }
+
+    /// The handle another API imports the sync object through.
+    pub fn handle(&self) -> &SharedHandle {
+        &self.handle
+    }
+
+    /// Has the queue signal the next value after everything already given
+    /// to it, and returns that value: the sync object reaches it once that
+    /// work has run.
+    pub fn signal(&self, global: &Global, device: &SharedDevice) -> Result<u64> {
+        let mut signalled = self.signalled.lock().unwrap_or_else(|e| e.into_inner());
+        let next = *signalled + 1;
+        // SAFETY: COM calls on live objects.
+        unsafe { queue(global, device)?.Signal(&self.sync, next) }
+            .context("signalling the shared sync object")?;
+        *signalled = next;
+        Ok(next)
+    }
+}

@@ -43,6 +43,7 @@ use wgpu_core::id::TextureId;
 use wgpu_types::{Extent3d, TextureAspect, TextureFormat};
 
 use super::convert;
+use super::tensor::{DeviceTensor, Source, TensorSpec};
 use super::{shared, shared_device};
 use crate::av::DeviceFrame;
 
@@ -94,6 +95,10 @@ pub struct GpuFrame {
     /// What the frame was converted to, by target (see [`Target::key`]):
     /// made the first time something asks, and kept while the frame is.
     converted: Mutex<Vec<(Target, Arc<GpuFrame>)>>,
+    /// The frame made into model inputs, one entry per spec and per kind of
+    /// buffer (on a shared heap or not): made the first time something
+    /// asks, and kept while the frame is.
+    tensors: Mutex<Vec<(TensorSpec, bool, Arc<DeviceTensor>)>>,
     /// The frame's bytes as the wire lays them out: what it was uploaded
     /// from, or what reading it back gave.
     bytes: OnceLock<Arc<Vec<u8>>>,
@@ -153,6 +158,7 @@ impl GpuFrame {
             owned: planes.iter().map(|p| p.texture).collect(),
             planes,
             converted: Mutex::new(Vec::new()),
+            tensors: Mutex::new(Vec::new()),
             bytes: OnceLock::new(),
             #[cfg(windows)]
             wrapped: Mutex::new(None),
@@ -320,6 +326,29 @@ impl GpuFrame {
 
     fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// The frame made into a model's input tensor as `spec` says, on the
+    /// device, into a buffer of its own (`shared`: on a shared heap, for
+    /// another API to import). Made once per spec, the first time anything
+    /// asks, and kept with the frame.
+    pub fn tensor(&self, spec: &TensorSpec, shared: bool) -> Result<Arc<DeviceTensor>> {
+        let mut made = self.tensors.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, tensor)) = made.iter().find(|(s, k, _)| s == spec && *k == shared) {
+            return Ok(Arc::clone(tensor));
+        }
+        let source = Source::of(self.pix_fmt())
+            .ok_or_else(|| anyhow!("a {} frame is not made into a tensor", self.pix_fmt()))?;
+        let tensor = Arc::new(super::tensor::make(
+            &self.global,
+            &self.device,
+            &self.planes,
+            source,
+            spec,
+            shared,
+        )?);
+        made.push((*spec, shared, Arc::clone(&tensor)));
+        Ok(tensor)
     }
 
     pub fn width(&self) -> u32 {
@@ -650,6 +679,7 @@ impl DecodedPictures {
             planes: taken.planes,
             owned: taken.owned,
             converted: Mutex::new(Vec::new()),
+            tensors: Mutex::new(Vec::new()),
             bytes: OnceLock::new(),
             wrapped: Mutex::new(taken.wrapped),
         }))
