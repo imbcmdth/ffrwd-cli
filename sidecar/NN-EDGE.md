@@ -21,7 +21,9 @@ interface is linked only for the components whose type declares it.
     -nn-runtime <dir>       where ONNX Runtime is, else FFRWD_NN_RUNTIME
     -nn-target <provider>   where sessions run, else FFRWD_NN_TARGET; cpu is
                             the default
-    -nn-exclude <provider>  drop a provider from a `gpu` walk, repeatable
+    -nn-exclude <name>=<provider>
+                            keep one model off a provider, repeatable;
+                            the bare <provider> keeps every model off it
 
 `-nn` is spelled like `-m` and validated the same way: a name is letters,
 digits and underscores, and each name may be bound once.
@@ -59,43 +61,48 @@ Windows takes DirectML first. It runs on any Direct3D 12 adapter and needs
 nothing installed, where CUDA needs a CUDA 12 runtime and cuDNN 9 on the
 machine; CUDA is still reached by naming it.
 
-`-nn-exclude <provider>` drops a provider from that walk for the whole
-process, before its preflight ever runs: `cuda`, `directml` and `coreml` are
-the providers it can name, and `cpu` is refused, since a process always
-keeps somewhere to run. It is repeatable, and every model a process binds
-shares the one walk -- a compiler binding several models on one process
-passes the union of what each one's pin excludes. A provider named outright
-with `-nn-target` is unaffected: `-nn-exclude` only narrows the `gpu` walk.
+The provider is chosen per model. `-nn-exclude <name>=<provider>` keeps
+the model bound as `<name>` off that provider; the bare `-nn-exclude
+<provider>` keeps every model off it. `cuda`, `directml` and `coreml` are
+the providers it can name, `cpu` is refused, since a model always keeps
+somewhere to run, and a name no `-nn` binds is refused. It is repeatable.
+The compiler passes one pair per provider a model's own pin denies. A
+provider named outright with `-nn-target` is unaffected: `-nn-exclude`
+only narrows the `gpu` walk.
 
-    ffrwd-wasm -nn transcribe=whisper.onnx -nn-runtime <dir> \
-      -nn-target gpu -nn-exclude directml \
+    ffrwd-wasm -nn transcribe=whisper.onnx -nn detect=yolo.onnx \
+      -nn-runtime <dir> -nn-target gpu -nn-exclude transcribe=directml \
       --invoke transcribe.wasm run '{...}'
 
-It says in one line why it passed over each provider it did not take,
-whether preflight ruled it out or `-nn-exclude` did:
+One process loads one ONNX Runtime binary, and DirectML's is a different
+binary from the CPU and CUDA one, so the walk still settles one provider
+for the process: the first in the platform's order whose preflight is
+clean and that at least one bound model does not exclude. It says in one
+line why it passed over each earlier candidate, whether preflight ruled
+it out or every model's pin did:
 
     [nn] -nn-target gpu: not DIRECTML, no onnxruntime.dll in
     C:\...\1.22.0\win-x64\directml; `ffrwd setup nn` puts the DirectML build there
-    [nn] execution provider: CUDA
+    [nn] -nn-target gpu: not DIRECTML, excluded by every model's pin
 
-A provider named outright is taken as named. One that cannot engage is a
-warning and a run on the CPU, never a refusal - the answer is the same, and
-slower:
+Each model's session then asks for that provider, or for the CPU where
+the model excludes it, and the ask does not fall back in silence: the
+provider is registered so that a session it cannot engage for fails to
+build, and the host says so and builds the session again on the CPU. The
+verdict is one line per model:
 
-    [nn] -nn-target directml was requested but the DIRECTML execution provider
-    did not load; yolo runs on the CPU
+    [nn] -nn-exclude: transcribe=directml
+    [nn] transcribe: execution provider CPU, DIRECTML excluded by its pin
+    [nn] detect: execution provider DIRECTML
 
-Every `-nn-exclude` is named once, ahead of the verdict, regardless of the
-walk's outcome:
+    [nn] detect: CUDA did not engage (Error loading "...\onnxruntime_providers_shared.dll" which is missing); runs on the CPU
+    [nn] detect: execution provider CPU, CUDA did not engage
 
-    [nn] -nn-exclude: directml
-    [nn] execution provider: CUDA
+    [nn] detect: execution provider CPU, no GPU execution provider was available
 
-A walk left with only `cpu` because every candidate was excluded says so
-once at startup, naming what excluded them, so a user knows why the run is
-slow without reading the per-candidate notes above it:
-
-    [nn] transcribe runs on cpu: directml excluded by its pin
+A provider that registers is reported as engaged; ONNX Runtime may still
+run a node it cannot place on the CPU (see "A silent fall back to CPU"
+below), which no verdict here catches.
 
 A spelling that is not a target is refused, since a misspelling would
 otherwise run on the CPU in silence:
