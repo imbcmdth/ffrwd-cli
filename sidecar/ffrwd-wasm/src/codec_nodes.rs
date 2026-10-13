@@ -37,7 +37,9 @@ pub struct EncoderNode {
     /// The format the encoder reads, where the frames arrive held on the GPU
     /// in another, and the colour its YUV is written in: each is made it
     /// there before it is read back, in the colour the coded stream says,
-    /// which is what a decoder reads it back in.
+    /// which is what a decoder reads it back in. An rgba picture is made
+    /// YUV in the matrix and range its stream names, BT.709 limited where it
+    /// names none, and the encoder is told that colour.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     convert: Option<(&'static str, av_nodes::Yuv)>,
     /// Where the frames arrive held on the GPU and the module reads
@@ -154,6 +156,13 @@ impl EncoderNode {
                         .ok_or_else(|| {
                             anyhow!("{name} reads {wanted}, which the wire does not carry")
                         })?;
+                    #[cfg(feature = "gpu")]
+                    if video.pix_fmt == "rgba" && to != "rgba" {
+                        // The encoder is told the colour its YUV is made in,
+                        // which the coded stream then says.
+                        let yuv = av_nodes::yuv_of(video.color.as_ref());
+                        video.color = Some(av_nodes::made_yuv_color(video.color, yuv));
+                    }
                     video.pix_fmt = to;
                     video.frame_len = crate::frame_len_for(to, video.width, video.height)?;
                     Some((to, av_nodes::yuv_of(video.color.as_ref())))

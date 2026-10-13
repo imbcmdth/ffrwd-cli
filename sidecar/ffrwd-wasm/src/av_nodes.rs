@@ -230,6 +230,27 @@ pub(crate) fn yuv_of(color: Option<&ColorInfo>) -> Yuv {
 #[cfg(not(feature = "gpu"))]
 pub(crate) fn yuv_of(_color: Option<&ColorInfo>) -> Yuv {}
 
+/// The colour of YUV made on the device from an RGB picture in `color`:
+/// `yuv`'s matrix and range, in the picture's primaries and transfer.
+#[cfg(feature = "gpu")]
+pub(crate) fn made_yuv_color(color: Option<ColorInfo>, yuv: Yuv) -> ColorInfo {
+    use ffrwd_wasm_runtime::gpu::frames::Matrix;
+    let color = color.unwrap_or(ColorInfo {
+        range: "unknown",
+        primaries: "unknown",
+        trc: "unknown",
+        space: "unknown",
+    });
+    ColorInfo {
+        range: if yuv.full_range { "pc" } else { "tv" },
+        space: match yuv.matrix {
+            Matrix::Bt709 => "bt709",
+            Matrix::Bt601 => "bt470bg",
+        },
+        ..color
+    }
+}
+
 /// A decoder on the process's own device, where `hw` allows the device
 /// it is (`auto`, or that device by name: `d3d12va` on Windows,
 /// `videotoolbox` on macOS), the wire's format is one its pictures are made

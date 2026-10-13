@@ -50,7 +50,10 @@ nodes in a region. A build of one on `ffrwd:gpu` is handed the planes of the
 pictures `decode` leaves on the device, and hands its own pictures back as
 textures, so a region that decodes with `decode` and codes with such a
 module, or decodes with it and encodes with `encode`, holds no picture in
-host memory.
+host memory. An encoder of either build whose pictures are rgba on the
+device is told the colour its YUV is made in there, BT.709 limited where the
+stream names none, and so is the coded stream it writes, which is what its
+decoder reads the YUV back in.
 
 libavcodec is loaded at run time, never linked. The sidecar loads
 `libavutil`, `libswresample`, `libavcodec` and `libswscale` by full path,
