@@ -59,6 +59,8 @@ def _holds(read: int, write: int) -> bool:
 
 
 def test_a_sized_pipe_holds_what_a_default_one_cannot() -> None:
+    if sys.platform != "win32" and not hasattr(__import__("fcntl"), "F_SETPIPE_SZ"):
+        pytest.skip("this platform sizes its pipes itself, and a pipe holds what it is given")
     for make, holds in ((lambda: pipes.anonymous(1 << 20), True), (os.pipe, False)):
         read, write = make()
         try:

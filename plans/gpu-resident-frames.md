@@ -2380,3 +2380,53 @@ release:
 
 These four numbers are what every acceptance line above is measured
 against.
+
+## macOS
+
+What follows was run on the owner's MacBook (2026-10-13): an M1 Max with 32
+GB, macOS 27.0, Homebrew's ffmpeg 9.0.1, ffrwd-av v1.2.0's macos-aarch64
+libav, and ONNX Runtime 1.22.0 with CoreML. Nothing of this work had run on
+a Mac before.
+
+### The first run
+
+The branch did not build off Windows: the output texture's read had one
+match arm there, and its result type could not be inferred; clippy also
+read the frame tensor's one-armed route match as needless. With that fixed,
+wgpu opens on Metal and `gpu_frames` passes with an adapter required, and
+gpu_box, invert, depth_gpu, segment_gpu and blitz's `compose` run. Three
+things did not:
+
+- **Every run that loaded ONNX Runtime ended in SIGABRT.** ONNX Runtime's
+  C++ static destructors abort ("mutex lock failed") while a session's
+  worker threads still run, after the outputs are written. Every exit from
+  `main` now goes through one function, which on macOS with ONNX Runtime
+  loaded flushes stdout and stderr and calls `_exit`. Nothing is lost by
+  it: `std::process::exit` runs no Rust destructors either, a run that
+  succeeded has joined its writers and finished every output before it
+  reaches that function, and what `_exit` skips beyond that, C's `atexit`
+  handlers and stdio buffers, carries no output. A run binding a model and
+  writing NUT to a file is checked to write every frame and end the file.
+- **The provider line named no library.** It reads the loaded images, which
+  only Windows and Linux listed; macOS lists them from dyld now.
+- **The relay crawled.** A FIFO on macOS holds 8 KB and cannot be made
+  bigger. While the process on the other end is in a blocking write larger
+  than that, which is every ffmpeg writing raw video, `poll` and kqueue on
+  the FIFO miss the wakeup, so each of the relay's reads waited out its
+  whole tenth of a second: 1.3 MB took 9.4 s to cross. `select` wakes on
+  time, and the relay now waits with it on macOS. The relay's suite went
+  from 4 of 13 failing (52 s) to all passing (3.3 s), and the exec tier
+  from 57 minutes, with every relay plan timing out, to 8.5.
+
+Two tests held for Windows' and Linux's providers and the 4090's rounding
+only: CoreML needs nothing on disk, so the walk takes it even with an empty
+runtime directory; and full-range chroma made on Metal is 0.501 levels from
+ffmpeg's on average, where the 4090 measured 0.488. The stdio test that
+asks for a 1 MiB pipe is skipped where pipes cannot be sized, as
+`ffrwd/pipes.py` already said of every platform but Windows and Linux.
+
+What still fails in the exec tier on this machine is Homebrew's ffmpeg and
+code this work did not touch: no SRT (5 tests), the HLS and DASH ladders
+refused at compile time (11), no `subtitles`, `drawtext` or `frei0r`
+(recipes 11, 58 and 62), channelsplit and the centred overlay, and one plan
+whose consumer never opens its input. 495 pass.
