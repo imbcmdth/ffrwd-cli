@@ -2287,8 +2287,14 @@ the same; the shot vectors agree with the host build's at a cosine of
 after its resize and its nearest-neighbour chroma; the host build fed
 rgba instead of yuv420p differs from itself by as much.
 
-Still open: a host-memory module reading frames a region decodes is told
-the colour is unknown, so it converts BT.709 as BT.601.
+A host-memory module reading frames a region decodes was told the colour
+was unknown, so it converted BT.709 as BT.601. Fixed the same day: a coded
+edge into a region's `decode` carries the source's colour in `-pad`, the
+decoder is opened in it (a colour the bitstream itself names still wins),
+and the pictures are told it: a yuv420p picture the source's colour, an
+rgba one full-range RGB with the source's primaries and transfer, as a raw
+rgba edge is told. The software and device decodes of a VUI-less BT.709
+stream now both match ffmpeg's BT.709 conversion.
 
 ## 5. Risks and open questions
 
