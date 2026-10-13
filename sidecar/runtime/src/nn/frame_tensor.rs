@@ -158,6 +158,8 @@ pub fn frame_tensor(
         }
         FrameData::Gpu(gpu) => gpu,
     };
+    // Off Windows a model's only route is the download.
+    #[cfg_attr(not(windows), allow(clippy::infallible_destructuring_match))]
     let why = match route(model, provider) {
         #[cfg(windows)]
         Route::Bound(binder) => match binder.bind(gpu, spec, &crops) {
