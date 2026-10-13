@@ -436,6 +436,15 @@ struct Models {
 /// Loaded once per process: building a session is expensive and `Graph` is
 /// reference-counted, so every store shares the one session. `Backend` is not
 /// shared, and is rebuilt for each store.
+/// Whether this process has loaded ONNX Runtime.
+static LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process has loaded ONNX Runtime: a run binding no model never
+/// does.
+pub fn runtime_loaded() -> bool {
+    LOADED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn graph_registry() -> &'static OnceLock<Models> {
     static MODELS: OnceLock<Models> = OnceLock::new();
     &MODELS
@@ -994,6 +1003,7 @@ pub fn configure(config: &Config) -> Result<()> {
     ort::init_from(lib.to_string_lossy().to_string())
         .commit()
         .map_err(|e| anyhow::anyhow!("initialising ONNX Runtime from {}: {e}", lib.display()))?;
+    LOADED.store(true, std::sync::atomic::Ordering::Release);
 
     let cuda_runtime = match provider {
         Provider::Cuda => dlls::locate(&dlls::search_dirs(&dir), dlls::CUDA_RUNTIME)

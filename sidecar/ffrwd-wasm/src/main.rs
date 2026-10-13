@@ -4185,7 +4185,7 @@ fn main() {
     // so it has to answer on a machine that has none yet.
     if argv.first().map(String::as_str) == Some("--nn-info") {
         println!("{}", nn::info());
-        std::process::exit(0);
+        exit(0);
     }
 
     // The same for libav: the majors this build demands, and what the
@@ -4196,31 +4196,31 @@ fn main() {
             Ok((config, _)) => av::configure(&config),
             Err(e) => {
                 eprintln!("ffrwd-wasm: {e:#}");
-                std::process::exit(2);
+                exit(2);
             }
         }
         println!("{}", av::info());
-        std::process::exit(0);
+        exit(0);
     }
 
     // The relay runs no module, so it reads none of the flags a module run
     // takes, and its edges arrive on stdin rather than argv.
     if argv.first().map(String::as_str) == Some("relay") {
-        std::process::exit(relay::main(&argv[1..]));
+        exit(relay::main(&argv[1..]));
     }
 
     // The egress policy is read before anything runs: a bad value is a
     // configuration error even for a run granting no network.
     if let Err(e) = ffrwd_wasm_runtime::egress::net_policy() {
         eprintln!("ffrwd-wasm: {e:#}");
-        std::process::exit(2);
+        exit(2);
     }
 
     let (nn_config, raw_args) = match take_nn_args(argv) {
         Ok(split) => split,
         Err(e) => {
             eprintln!("ffrwd-wasm: {e:#}");
-            std::process::exit(2);
+            exit(2);
         }
     };
     // Only where libav comes from is recorded; nothing loads until a decoder
@@ -4232,7 +4232,7 @@ fn main() {
         }
         Err(e) => {
             eprintln!("ffrwd-wasm: {e:#}");
-            std::process::exit(2);
+            exit(2);
         }
     };
     // Effect grants register before anything is instantiated, like models,
@@ -4242,7 +4242,7 @@ fn main() {
         Ok(rest) => rest,
         Err(e) => {
             eprintln!("ffrwd-wasm: {e:#}");
-            std::process::exit(2);
+            exit(2);
         }
     };
 
@@ -4250,23 +4250,23 @@ fn main() {
     // none touches no ONNX Runtime.
     if let Err(e) = nn::configure(&nn_config) {
         eprintln!("ffrwd-wasm: {e:#}");
-        std::process::exit(2);
+        exit(2);
     }
 
     if raw_args.first().map(String::as_str) == Some("--describe") {
         match raw_args.get(1) {
             None => {
                 eprintln!("ffrwd-wasm: --describe requires a module path");
-                std::process::exit(2);
+                exit(2);
             }
             Some(module_path) => match describe_module(module_path) {
                 Ok(json) => {
                     println!("{json}");
-                    std::process::exit(0);
+                    exit(0);
                 }
                 Err(e) => {
                     eprintln!("ffrwd-wasm: {e:#}");
-                    std::process::exit(1);
+                    exit(1);
                 }
             },
         }
@@ -4276,24 +4276,24 @@ fn main() {
         match raw_args.get(1) {
             None => {
                 eprintln!("ffrwd-wasm: --probe requires a module path");
-                std::process::exit(2);
+                exit(2);
             }
             Some(module_path) => {
                 let params = match parse_probe_args(&raw_args[2..]) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("ffrwd-wasm: {e:#}");
-                        std::process::exit(2);
+                        exit(2);
                     }
                 };
                 match probe_module(module_path, &params) {
                     Ok(json) => {
                         println!("{json}");
-                        std::process::exit(0);
+                        exit(0);
                     }
                     Err(e) => {
                         eprintln!("ffrwd-wasm: {e:#}");
-                        std::process::exit(1);
+                        exit(1);
                     }
                 }
             }
@@ -4303,16 +4303,16 @@ fn main() {
     if raw_args.first().map(String::as_str) == Some("--shape") {
         let Some(module_path) = raw_args.get(1) else {
             eprintln!("ffrwd-wasm: --shape requires a module path");
-            std::process::exit(2);
+            exit(2);
         };
         match shape_json::run(module_path, &raw_args[2..]) {
             Ok(json) => {
                 println!("{json}");
-                std::process::exit(0);
+                exit(0);
             }
             Err(e) => {
                 eprintln!("ffrwd-wasm: {e:#}");
-                std::process::exit(1);
+                exit(1);
             }
         }
     }
@@ -4323,11 +4323,11 @@ fn main() {
                 match invoke_module(module_path, function, args_json) {
                     Ok(result) => {
                         println!("{result}");
-                        std::process::exit(0);
+                        exit(0);
                     }
                     Err(e) => {
                         eprintln!("ffrwd-wasm: {e:#}");
-                        std::process::exit(1);
+                        exit(1);
                     }
                 }
             }
@@ -4335,7 +4335,7 @@ fn main() {
                 eprintln!(
                     "ffrwd-wasm: --invoke requires a module path, a function name, and args JSON"
                 );
-                std::process::exit(2);
+                exit(2);
             }
         }
     }
@@ -4344,7 +4344,7 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("ffrwd-wasm: {e:#}");
-            std::process::exit(2);
+            exit(2);
         }
     };
 
@@ -4354,8 +4354,29 @@ fn main() {
     }
     if let Err(e) = outcome {
         eprintln!("ffrwd-wasm: {e:#}");
-        std::process::exit(1);
+        exit(1);
     }
+    exit(0);
+}
+
+/// Ends the process with `code`. On macOS, once ONNX Runtime is loaded, its
+/// static destructors abort ("mutex lock failed") while a session's worker
+/// threads still run, so the process flushes stdout and stderr and leaves
+/// without running them. Nothing else is lost: `std::process::exit` runs no
+/// Rust destructors either, and a run that succeeded has joined its writers
+/// and finished every output before it returns here. What `_exit` skips
+/// beyond that is C's `atexit` handlers and stdio buffers, which no output
+/// is written through.
+fn exit(code: i32) -> ! {
+    #[cfg(target_os = "macos")]
+    if nn::runtime_loaded() {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // SAFETY: ends the process; nothing after it runs.
+        unsafe { libc::_exit(code) }
+    }
+    std::process::exit(code)
 }
 
 #[cfg(test)]
