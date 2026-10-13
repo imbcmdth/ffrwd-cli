@@ -423,25 +423,57 @@ impl Lib {
         width: c_int,
         height: c_int,
     ) -> std::result::Result<BufferRef, AvErr> {
-        let f = &self.f;
         let d3d12 = self.pix_fmt("d3d12").ok_or_else(|| AvErr {
             code: 0,
             why: "libavutil has no d3d12 pixel format".to_string(),
         })?;
-        let mut device_ref = if device.is_null() {
-            let mut made: *mut AVBufferRef = ptr::null_mut();
-            // SAFETY: the out-pointer is ours; null name and options ask
-            // for the default device.
-            let ret = unsafe {
-                (f.av_hwdevice_ctx_create)(&mut made, device_type, ptr::null(), ptr::null_mut(), 0)
-            };
-            if ret < 0 || made.is_null() {
-                return Err(self.err(ret));
-            }
-            made
+        let device_ref = if device.is_null() {
+            self.default_device(device_type)?
         } else {
             self.d3d12_device(device_type, device)?
         };
+        self.frames_on(device_ref, d3d12, sw_format, width, height)
+    }
+
+    /// A frames context of `format` pictures holding `sw_format` of `width`
+    /// x `height`, on a default device of `device_type` of its own: a
+    /// `videotoolbox` one's pictures are IOSurface-backed `CVPixelBuffer`s.
+    pub fn device_frames(
+        &'static self,
+        device_type: c_int,
+        format: c_int,
+        sw_format: c_int,
+        width: c_int,
+        height: c_int,
+    ) -> std::result::Result<BufferRef, AvErr> {
+        let device_ref = self.default_device(device_type)?;
+        self.frames_on(device_ref, format, sw_format, width, height)
+    }
+
+    /// A default device of `device_type`, as a new reference.
+    fn default_device(&self, device_type: c_int) -> std::result::Result<*mut AVBufferRef, AvErr> {
+        let mut made: *mut AVBufferRef = ptr::null_mut();
+        // SAFETY: the out-pointer is ours; null name and options ask for
+        // the default device.
+        let ret = unsafe {
+            (self.f.av_hwdevice_ctx_create)(&mut made, device_type, ptr::null(), ptr::null_mut(), 0)
+        };
+        if ret < 0 || made.is_null() {
+            return Err(self.err(ret));
+        }
+        Ok(made)
+    }
+
+    /// A frames context on `device_ref`, whose one reference moves in.
+    fn frames_on(
+        &'static self,
+        mut device_ref: *mut AVBufferRef,
+        format: c_int,
+        sw_format: c_int,
+        width: c_int,
+        height: c_int,
+    ) -> std::result::Result<BufferRef, AvErr> {
+        let f = &self.f;
         // SAFETY: the frames reference av_hwframe_ctx_alloc returns has an
         // AVHWFramesContext as its data, holding its own reference to the
         // device; ours is given up either way. On failure the frames
@@ -456,7 +488,7 @@ impl Lib {
                 });
             }
             let ctx = (*frames).data as *mut AVHWFramesContext;
-            (*ctx).format = d3d12;
+            (*ctx).format = format;
             (*ctx).sw_format = sw_format;
             (*ctx).width = width;
             (*ctx).height = height;
@@ -684,6 +716,16 @@ impl Lib {
     pub fn pix_fmt_name(&self, fmt: c_int) -> String {
         // SAFETY: an out-of-range value returns null; names are static.
         unsafe { text((self.f.av_get_pix_fmt_name)(fmt)) }.unwrap_or_else(|| "none".to_string())
+    }
+
+    /// Whether a pixel format is a hardware device's, its pictures held
+    /// there rather than in host memory (`d3d12`, `videotoolbox_vld`).
+    pub fn pix_fmt_is_hw(&self, fmt: c_int) -> bool {
+        // SAFETY: an out-of-range value returns null; descriptors are static.
+        unsafe {
+            let desc = (self.f.av_pix_fmt_desc_get)(fmt);
+            !desc.is_null() && (*desc).flags & AV_PIX_FMT_FLAG_HWACCEL != 0
+        }
     }
 
     /// Whether a pixel format is rgb rather than yuv.
@@ -1628,8 +1670,34 @@ impl CodecCtx {
         Ok(())
     }
 
-    /// A picture from the pool `attach_d3d12_frames` gave the context, in
-    /// `frame`, which held nothing.
+    /// Gives an encoder the pool it reads its pictures from: `format`
+    /// pictures holding `sw_format` of `width` x `height`, on a default
+    /// device of `device_type`. The context's pixel format becomes
+    /// `format`.
+    pub fn attach_device_frames(
+        &mut self,
+        device_type: c_int,
+        format: c_int,
+        sw_format: c_int,
+        width: c_int,
+        height: c_int,
+    ) -> std::result::Result<(), AvErr> {
+        let frames = self
+            .lib
+            .device_frames(device_type, format, sw_format, width, height)?;
+        // SAFETY: a fresh context has no frames context; the reference
+        // moves in.
+        unsafe {
+            (*self.ptr).hw_frames_ctx = frames.into_raw();
+            (*self.ptr).pix_fmt = format;
+            (*self.ptr).sw_pix_fmt = sw_format;
+        }
+        Ok(())
+    }
+
+    /// A picture from the pool `attach_d3d12_frames` or
+    /// `attach_device_frames` gave the context, in `frame`, which held
+    /// nothing.
     pub fn pool_frame(&self, frame: &mut Frame) -> std::result::Result<(), AvErr> {
         frame.unref();
         // SAFETY: a live context and a live frame; the pool is the

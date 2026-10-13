@@ -386,6 +386,9 @@ pub struct AVPixFmtDescriptor {
     pub flags: u64,
 }
 
+/// `AV_PIX_FMT_FLAG_HWACCEL`.
+pub const AV_PIX_FMT_FLAG_HWACCEL: u64 = 1 << 3;
+
 /// `AV_PIX_FMT_FLAG_RGB`.
 pub const AV_PIX_FMT_FLAG_RGB: u64 = 1 << 5;
 

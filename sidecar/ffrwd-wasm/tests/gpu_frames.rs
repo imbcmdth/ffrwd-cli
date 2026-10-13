@@ -363,6 +363,19 @@ fn decoded_line(device: &str) -> String {
     format!("[gpu] decode h264: {device}, frames ")
 }
 
+/// The device a decoder shares the process's device through, the h264
+/// encoder that reads its pool there, and the libav directory:
+/// `h264_d3d12va` on Windows, `h264_videotoolbox` on macOS.
+fn shared_encoder(test: &str) -> Option<(&'static str, &'static str, PathBuf)> {
+    let (device, dir) = shared_decoder(test)?;
+    let encoder = if cfg!(windows) {
+        "h264_d3d12va"
+    } else {
+        "h264_videotoolbox"
+    };
+    Some((device, encoder, dir))
+}
+
 #[test]
 fn pictures_decoded_on_the_device_reach_gpu_box_unuploaded_and_as_software_decodes_them() {
     let test =
@@ -606,12 +619,15 @@ fn plane_means(picture: &[u8], width: usize, height: usize) -> [f64; 3] {
 }
 
 const SIZE: (usize, usize) = (320, 240);
-const FROM_THE_DEVICE: &str = "[av] encode h264_d3d12va: 320x240 nv12, from the device";
+/// What `encoder` says when it is opened on the device for 320x240.
+fn from_the_device(encoder: &str) -> String {
+    format!("[av] encode {encoder}: 320x240 nv12, from the device")
+}
 
 #[test]
-fn h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back() {
-    let test = "h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back";
-    let Some(dir) = d3d12va_libav(test) else {
+fn an_encoder_on_the_device_takes_the_decoders_pictures_with_nothing_read_back() {
+    let test = "an_encoder_on_the_device_takes_the_decoders_pictures_with_nothing_read_back";
+    let Some((device, encoder, dir)) = shared_encoder(test) else {
         return;
     };
     let Some(()) = ffmpeg(test) else {
@@ -650,8 +666,9 @@ fn h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back
         return;
     }
     let out = scratch("d3d12va_out.nut");
-    let chain = "[0:v]decode=format=yuv420p:hw=d3d12va[d];[d]encode=codec=h264_d3d12va:b=2M[out0]";
-    let output = run_chain(&dir, &source, chain, &out, None);
+    let chain =
+        format!("[0:v]decode=format=yuv420p:hw={device}[d];[d]encode=codec={encoder}:b=2M[out0]");
+    let output = run_chain(&dir, &source, &chain, &out, None);
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
         return;
@@ -662,12 +679,14 @@ fn h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back
         "exited {:?}:\n{stderr}",
         output.status.code()
     );
-    assert!(stderr.contains(FROM_THE_DEVICE), "{stderr}");
+    assert!(stderr.contains(&from_the_device(encoder)), "{stderr}");
     assert!(
-        stderr.contains("[gpu] encode h264_d3d12va: from the device, each frame "),
+        stderr.contains(&format!(
+            "[gpu] encode {encoder}: from the device, each frame "
+        )),
         "the copy is said:\n{stderr}"
     );
-    assert!(stderr.contains(&decoded_line("d3d12va")), "{stderr}");
+    assert!(stderr.contains(&decoded_line(device)), "{stderr}");
     let row = profile_row(&stderr);
     for stage in ["upload", "download"] {
         assert_eq!(row[stage]["bytes"], 0, "nothing crosses to the host: {row}");
@@ -743,9 +762,9 @@ fn h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back
 }
 
 #[test]
-fn h264_d3d12va_takes_a_modules_rgba_as_nv12_made_on_the_device() {
-    let test = "h264_d3d12va_takes_a_modules_rgba_as_nv12_made_on_the_device";
-    let Some(dir) = d3d12va_libav(test) else {
+fn an_encoder_on_the_device_takes_a_modules_rgba_as_nv12_made_there() {
+    let test = "an_encoder_on_the_device_takes_a_modules_rgba_as_nv12_made_there";
+    let Some((_, encoder, dir)) = shared_encoder(test) else {
         return;
     };
     let Some(()) = ffmpeg(test) else {
@@ -772,9 +791,10 @@ fn h264_d3d12va_takes_a_modules_rgba_as_nv12_made_on_the_device() {
         "making an rgba stream",
     );
     let encoded = scratch("d3d12va_boxed.nut");
-    let chain = "[v=0:v]gpu_box=memory=gpu:out=gpu:size=40[out=b];\
-                 [b]encode=codec=h264_d3d12va:b=8M[out0]";
-    let output = run_chain(&dir, &source, chain, &encoded, Some(&module));
+    let chain = format!(
+        "[v=0:v]gpu_box=memory=gpu:out=gpu:size=40[out=b];[b]encode=codec={encoder}:b=8M[out0]"
+    );
+    let output = run_chain(&dir, &source, &chain, &encoded, Some(&module));
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
         return;
@@ -785,7 +805,7 @@ fn h264_d3d12va_takes_a_modules_rgba_as_nv12_made_on_the_device() {
         "exited {:?}:\n{stderr}",
         output.status.code()
     );
-    assert!(stderr.contains(FROM_THE_DEVICE), "{stderr}");
+    assert!(stderr.contains(&from_the_device(encoder)), "{stderr}");
     assert!(
         stderr.contains("made NV12 from rgba first"),
         "the conversion is said:\n{stderr}"

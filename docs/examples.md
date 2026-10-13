@@ -1942,3 +1942,37 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
 ```
 
 The command is the same on every machine; what `hw=auto` opens is decided where it runs. VideoToolbox in the bundled libav decodes h264, hevc and prores. Another codec, or a picture smaller than VideoToolbox decodes (64x48 is refused, 96x64 is not), is decoded in software, stderr says so, and the reader uploads the picture.
+
+## 166. Encode from the GPU on a Mac
+
+Recipe 165 with `h264_videotoolbox` as the encoder, which the sidecar hosts, so the exit is coded too and the picture never leaves the device. VideoToolbox is opened on a pool of IOSurface pictures; each frame is made NV12 on the device (`gpu_box` hands back rgba), copied into one of the pool's pictures, and the copy is waited for before the encoder is handed the picture:
+
+```pgsql
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT gpu_box(f.video[1])
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'boxed.mp4' WITH (video_codec 'h264_videotoolbox', video_bitrate '6M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
+  -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];'\
+'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
+'[n1]encode=codec=h264_videotoolbox:b=6M:color_range=tv:colorspace=bt709[out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
+  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
+  copy -color_range:0 tv -colorspace:0 bt709 boxed.mp4
+```
+
+With the frames in host memory, a module holding them there or no GPU at all, the same encoder reads NV12 converted by libswscale. `hevc_videotoolbox` is the HEVC one. A `decode` read only by such an encoder decodes onto the device too, so a region that only re-encodes copies nothing to host memory.

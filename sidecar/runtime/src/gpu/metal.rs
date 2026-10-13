@@ -12,6 +12,14 @@
 //! after the frame is dropped until every command queued by then has run,
 //! so the decoder's pool does not write the surface again while a pass
 //! still reads it.
+//!
+//! A VideoToolbox encoder opened on a pool of IOSurface-backed pictures
+//! ([`EncoderFeed`]) is written the same way the other way round: the
+//! picture's planes are made Metal textures, the frame's NV12 planes are
+//! copied into them on the device, and the copy is waited for before the
+//! picture is sent, since VideoToolbox reads it with nothing to wait on.
+
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use objc2_core_foundation::CFRetained;
@@ -29,8 +37,8 @@ use wgpu_core::id::TextureId;
 use wgpu_hal::api::Metal;
 use wgpu_types::{Extent3d, TextureAspect, TextureFormat};
 
-use super::frames::Plane;
-use super::shared_device;
+use super::frames::{GpuFrame, Layout, Plane, Target, Yuv};
+use super::{shared, shared_device};
 use crate::av::{self, DeviceFrame};
 
 /// `'420v'` and `'420f'`: 8-bit NV12 in video and in full range.
@@ -207,6 +215,9 @@ impl Taker {
 const READ: wgpu_types::TextureUsages =
     wgpu_types::TextureUsages::TEXTURE_BINDING.union(wgpu_types::TextureUsages::COPY_SRC);
 
+/// What an encoder's plane is used for: copied into.
+const WRITE: wgpu_types::TextureUsages = wgpu_types::TextureUsages::COPY_DST;
+
 /// Plane `index` of `buffer` as a Metal texture over the same surface, and
 /// that texture as a wgpu texture of the process's device in `format`, for
 /// `usage`.
@@ -253,7 +264,8 @@ fn plane_texture(
         depth_or_array_layers: 1,
     };
     // SAFETY: a 2D, single-level, single-sample texture of this device in
-    // `format`, written by the decoder before the picture was handed over.
+    // `format`: a decoder's, written before the picture was handed over, or
+    // an encoder's, which reads it only once the copy into it has run.
     let hal = unsafe {
         wgpu_hal::metal::Device::texture_from_raw(
             raw,
@@ -301,6 +313,126 @@ impl Wrapped {
             global.texture_drop(texture);
         }
         global.queue_on_submitted_work_done(*device.queue, Box::new(move || drop(held)));
+    }
+}
+
+/// Writes frames on the process's device into the pictures of a
+/// VideoToolbox encoder's pool.
+#[derive(Default)]
+pub struct EncoderFeed {
+    cache: Option<CFRetained<CVMetalTextureCache>>,
+}
+
+// SAFETY: as for `Taker`.
+unsafe impl Send for EncoderFeed {}
+
+impl EncoderFeed {
+    /// Writes `frame` into `picture`, a picture of a VideoToolbox encoder's
+    /// pool: the frame as NV12 ([`GpuFrame::converted`], an rgba frame made
+    /// NV12 in `yuv` first), its two planes copied into the picture's on
+    /// the device, and the copy waited for.
+    pub fn feed(
+        &mut self,
+        frame: &Arc<GpuFrame>,
+        yuv: Yuv,
+        picture: &mut DeviceFrame,
+    ) -> Result<()> {
+        let (global, device) = (
+            shared(),
+            shared_device().ok_or_else(|| anyhow!("no GPU: the process has no device"))?,
+        );
+        if frame.backend() != wgpu_types::Backend::Metal {
+            bail!(
+                "the frame is on a {:?} device, not a Metal one",
+                frame.backend()
+            );
+        }
+        let nv12 = frame.converted(Target::new(
+            Layout::Nv12,
+            frame.width(),
+            frame.height(),
+            yuv,
+        ))?;
+        let [y, uv] = nv12.planes() else {
+            bail!(
+                "an NV12 frame has two planes, and this one has {}",
+                nv12.planes().len()
+            );
+        };
+        let buffer = nv12_buffer(picture, "encoder's")?;
+        let cache = cache(&mut self.cache, global, device)?;
+        let specs = [
+            (y, 0, MTLPixelFormat::R8Unorm, TextureFormat::R8Unorm),
+            (uv, 1, MTLPixelFormat::RG8Unorm, TextureFormat::Rg8Unorm),
+        ];
+        let mut targets = Vec::with_capacity(2);
+        let mut kept = Vec::with_capacity(2);
+        let written = (|| -> Result<()> {
+            for (_, index, mtl, format) in specs {
+                let (texture, cv) =
+                    plane_texture(global, device, cache, buffer, index, mtl, format, WRITE)?;
+                targets.push(texture);
+                kept.push(cv);
+            }
+            let (encoder, err) = global.device_create_command_encoder(
+                device.device,
+                &wgpu_types::CommandEncoderDescriptor { label: None },
+                None,
+            );
+            if let Some(e) = err {
+                bail!("a command encoder for the copy: {e}");
+            }
+            for ((plane, ..), target) in specs.iter().zip(&targets) {
+                global
+                    .command_encoder_copy_texture_to_texture(
+                        encoder,
+                        &wgpu_types::TexelCopyTextureInfo {
+                            texture: plane.texture,
+                            mip_level: 0,
+                            origin: wgpu_types::Origin3d::ZERO,
+                            aspect: plane.aspect,
+                        },
+                        &wgpu_types::TexelCopyTextureInfo {
+                            texture: *target,
+                            mip_level: 0,
+                            origin: wgpu_types::Origin3d::ZERO,
+                            aspect: TextureAspect::All,
+                        },
+                        &Extent3d {
+                            width: plane.width,
+                            height: plane.height,
+                            depth_or_array_layers: 1,
+                        },
+                    )
+                    .map_err(|e| anyhow!("copying a plane into the encoder's picture: {e}"))?;
+            }
+            let (commands, err) = global.command_encoder_finish(
+                encoder,
+                &wgpu_types::CommandBufferDescriptor { label: None },
+                None,
+            );
+            if let Some((_, e)) = err {
+                bail!("finishing the copy's commands: {e}");
+            }
+            let index = global
+                .queue_submit(*device.queue, &[commands])
+                .map_err(|(_, e)| anyhow!("submitting the copy: {e}"))?;
+            global
+                .device_poll(
+                    device.device,
+                    wgpu_types::PollType::Wait {
+                        submission_index: Some(index),
+                        timeout: None,
+                    },
+                )
+                .map_err(|e| anyhow!("waiting for the copy: {e}"))?;
+            Ok(())
+        })();
+        for texture in targets {
+            global.texture_drop(texture);
+        }
+        drop(kept);
+        written
     }
 }
 

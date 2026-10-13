@@ -1539,7 +1539,12 @@ fn read_on_gpu(
         if reads
             && call.module == av_nodes::ENCODE
             && call.options.iter().any(|(key, value)| {
-                key == "codec" && ffrwd_wasm_runtime::av::Encoder::reads_d3d12(value)
+                use ffrwd_wasm_runtime::av::Encoder;
+                // A VideoToolbox encoder reads its pool on the device on
+                // macOS, where the device is Metal.
+                key == "codec"
+                    && (Encoder::reads_d3d12(value)
+                        || (cfg!(target_os = "macos") && Encoder::reads_videotoolbox(value)))
             })
         {
             return Ok(true);

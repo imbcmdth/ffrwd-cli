@@ -2464,3 +2464,22 @@ spawn: the port is up at 2.39 s, the feeder connects at 2.50 s,
 VideoToolbox hands back its first picture at 3.04 s (0.53 s after it was
 opened, its session's start and the fixture's B-frames), and that picture
 lands on the programme's 16th frame.
+
+### Encoding from the pool
+
+`h264_videotoolbox` and `hevc_videotoolbox` whose frames are on the Metal
+device are opened on a frames context of IOSurface-backed NV12 pictures
+(`attach_device_frames`). Each frame is made NV12 on the device where it is
+not, its planes are copied into a pool picture's two Metal textures, and
+the copy is waited for before the picture is sent, since VideoToolbox reads
+it with nothing to wait on. A `decode` read only by such an encoder decodes
+onto the device too. Frames in host memory reach the encoder as NV12 made
+by libswscale: before this, the host path chose the encoder's first pixel
+format, `videotoolbox_vld`, and every `_videotoolbox` encode in the sidecar
+failed in `av_frame_get_buffer`. The compiler counts `_videotoolbox` as a
+hardware encode session and keeps its rgba colour to the matrices the
+device converts in, as for `_d3d12va`. Recipe 166.
+
+Measured: gpu_box over testsrc into h264_videotoolbox moves 0 bytes up or
+down; the file is within 41 dB of ffmpeg's interpolating reference, the
+same as the libx264 path, and is tagged BT.709 limited.
