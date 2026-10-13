@@ -2117,6 +2117,115 @@ Deciding when to cut is open: a cost model weighing what a split frees
 encode and a decode, the generation loss above) would call `_cut` with the
 streams it picks, beside or instead of the per-module placement.
 
+## Pyrowave on textures
+
+**What changed (2026-10-13, owner's machine).** ffrwd/pyrowave's encoder and
+decoder read and write textures of the sidecar's device, so a stream coded
+with it between two GPU regions never crosses host memory as pictures.
+
+- **The spelling.** `ffrwd:gpu` gains `encoder` and `decoder` interfaces and
+  a `codec-module` world (`sidecar/wit-gpu/gpu.wit`, still 0.1.0, extended in
+  place). A codec module exports them beside `ffrwd:av`'s `encoder` and
+  `decoder`, which still describe and open it. `encode` takes each picture
+  as a record of its planes, `own<gpu-texture>` handles the host made for
+  the call; `decode` answers each picture the same way, textures the module
+  made, which the host takes over. This is smaller than a node module with
+  coded ports: the compiler's codec handling (describe, `RETURNS encoder`,
+  the tag, the extradata header, `-codec encode|decode`) stays as it is, and
+  the module needs no shape, tick or port declarations. Handing the planes
+  in the call, rather than a frame id read through `frames.planes`, needs no
+  tick on the host side, and handing them back as planes, rather than
+  through `frames.emit`, keeps the decoder's yuv420p, where `emit` takes
+  rgba only.
+- **The fork.** Branch `gpu-textures` of imbcmdth/pyrowave (f856bf6, not
+  pushed) adds `pyrowave_webgpu_decoder_decode_gpu`, which copies the decoded
+  planes into three `r8unorm` textures on the device. The planes buffer now
+  pads rows to 256 bytes and starts each plane on 512 bytes so the copy needs
+  no repacking. The encoder already had `encode_gpu`.
+- **The package.** Branch `gpu` of ffrwd-package-pyrowave builds
+  `pyrowave_gpu.wasm` from the same source as `pyrowave.wasm`, with
+  `PYROWAVE_GPU` and bindings for a world including both codec worlds. The
+  `webgpu-wasi` shim gains `webgpu/wasi.h`, which turns a texture handle
+  another interface carries into a `WGPUTexture` and back. The lib gains
+  `encode_gpu` and `decode_gpu`, following the other packages' `_gpu` names.
+  The package's own checks run both texture paths on wgpu-native.
+- **The sidecar.** `runtime::Encoder::encode_gpu` and `Decoder::decode_gpu`
+  (`runtime/src/runtime/gpu_codec.rs`); `GpuFrame::adopt_planes` takes a
+  decoder's planes. In a network (`codec_nodes.rs`), an encoder whose
+  pictures arrive on the GPU is handed them made its format on the device,
+  and a decoder told a `pix_fmt` by `-pads` (which the compiler names only
+  where the reader holds its pictures on the GPU) leaves its pictures there.
+  `--describe` says `textures` for each half a module builds so.
+  `tests/gpu_codec.rs` runs both paths with `testcodec_gpu`, the test
+  codec's GPU build, against `testcodec`, and joins CI's lavapipe step.
+- **The compiler** places a GPU build's halves exactly as a bytes build's:
+  the network already tells each half where its pictures are. What changed is
+  the decoder used unasked: with both builds declared, both read `PYRW`, and
+  a tag two decoders read was refused. A decoder that hands back textures is
+  now left out of a tag its host build (same module name) reads, so `decode`
+  decodes unasked and `decode_gpu` where the input names it. Recipe 170
+  pins the encoder in a GPU region.
+- **Colour.** A codec package's encoder fed rgba on the device made its YUV
+  in BT.709 limited (the stream's rgba says `pc`, `gbr`, which the
+  conversion reads as nothing) and told the encoder the rgba's colour, so the
+  coded stream said full range and its decoder read the YUV back as BT.601
+  full. The split below measured 34.0 dB against the uncut run with the
+  bytes build at 1ae16ae, and the same with the GPU build before the fix.
+  The encoder is now told the colour its YUV is made in, and the coded
+  stream says it.
+
+**Measured.** RTX 4090, D3D12, quiet (under 5% from others), median of
+three. Pyrowave's shaders still need `dxcompiler.dll` on the path and
+`WGPU_DX12_COMPILER=dxc`; without them the device has no subgroups and the
+codec refuses to open.
+
+- Exactness. At 1080p, 30 frames of testsrc2 through `gpu_box` into the
+  encoder at 125,000 bytes a frame, the GPU build's packets are the bytes
+  build's byte for byte, and each build's packets decode on the other to the
+  same pictures; decoded into a GPU region, as yuv420p or made rgba there,
+  the pictures are the same as the bytes build's. The package's native check
+  gives the same at 4:2:0 and 4:4:4 at 200x120. On a busy picture at a budget
+  that binds, two 4:4:4 encodes of the same bytes, bytes build against bytes
+  build, can keep different coefficients (up to 124 levels apart in places);
+  4:2:0 did not, and neither did either layout under a budget the picture
+  does not reach. This is PyroWave's rate control, not the texture path.
+- The split (900 frames of 1080p30 testsrc2 h264, `gpu_box` into `gpu_box`,
+  `--target split-local --placement per-module --cut-codec
+  <module>:bytes_per_frame=125000`):
+
+  | run | out | upload / download, node 0 | node 1 | wall |
+  |---|---|---|---|---|
+  | uncut | ffv1 | | | 8.86 s |
+  | cut, `pyrowave.wasm` | ffv1 | 0 / 2.80 GB | 2.80 GB / 7.46 GB | 11.46 s |
+  | cut, `pyrowave_gpu.wasm` | ffv1 | 0 / 0 | 0 / 7.46 GB | 11.57 s |
+  | uncut | h264_d3d12va | | | 3.55 s |
+  | cut, `pyrowave.wasm` | h264_d3d12va | 0 / 2.80 GB | 2.80 GB / 0 | 9.68 s |
+  | cut, `pyrowave_gpu.wasm` | h264_d3d12va | 0 / 0 | 0 / 0 | 6.51 s |
+
+  The 7.46 GB on node 1 with ffv1 is the rgba picture read back for the
+  ffmpeg that encodes it. Against the uncut run, the cut's ffv1 output is
+  41.35 dB (Y 41.20, U 42.37, V 41.05), the same for both builds; pyrowave
+  alone on this source at this rate is 41.17 dB. The earlier 14.9 s was on
+  another source and a busier machine; the uncut run then took 11.4 s, and
+  8.86 s now. With ffv1 out the time is the ffmpeg's; with the encoder in
+  the region, the GPU build takes a third off the cut.
+- The round trip at 4K (120 calls of 3840x2160 yuv420p testsrc2 at 500,000
+  bytes a frame, through `runtime::Encoder` and `Decoder` as the codec nodes
+  call them, pipelines warm): the GPU build's encode call takes 1.7 ms, which
+  waits for the packet, and its decode call 0.36 ms, which submits; one of
+  each takes 2.1 ms, about 400 a second, the decode's GPU work landing inside
+  the next encode's wait. The bytes build through the same host takes 8.4 ms
+  to encode and 6.6 ms to decode, 14.8 ms together; `pyrowave_roundtrip`'s
+  call took 32 ms.
+
+**Open.** The fork's branch (`gpu-textures` of imbcmdth/pyrowave) and the
+package's (`gpu` of ffrwd-package-pyrowave) are pushed, unpublished. The package's
+manifest still says `ffrwd >= 0.24.0`: an ffrwd before this change refuses
+an unasked `PYRW` stream once both builds are declared, so a release of the
+package with `decode_gpu` needs the ffrwd that carries this, and a version
+to name. The compiler could pick the GPU build itself where it places a
+codec beside a GPU region; today the query names it.
+
 ## Faces, ages and a blur on the GPU
 
 **What was ported (2026-10-12, owner's machine).** The chain in faceage's
