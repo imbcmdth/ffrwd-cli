@@ -1535,6 +1535,12 @@ input's `-i`, in the order written.
   `bwdif`) and `hwupload`, and a picture that came down for a CPU segment
   goes up again before the encoder, which reads only the card's frames.
   Recipe [156](examples.md#156-stay-on-the-card-from-decode-to-encode).
+  `hwaccel => 'videotoolbox'` to a `_videotoolbox` encoder is the same path
+  on macOS with `scale_vt` and `transpose_vt`: frames stay
+  `videotoolbox_vld`, and a CPU segment goes back up through `hwupload` to
+  a device the compiler makes for it (`init_hw_device videotoolbox=up`,
+  `filter_hw_device up`). `yadif_videotoolbox` is not used. Recipe
+  [167](examples.md#167-stay-on-the-device-on-a-mac).
 
 `format` is the option that changes what the path means: with a demuxer
 named, the path is that demuxer's to interpret and need not exist on disk.

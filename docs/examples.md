@@ -1976,3 +1976,24 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
 ```
 
 With the frames in host memory, a module holding them there or no GPU at all, the same encoder reads NV12 converted by libswscale. `hevc_videotoolbox` is the HEVC one. A `decode` read only by such an encoder decodes onto the device too, so a region that only re-encodes copies nothing to host memory.
+
+## 167. Stay on the device on a Mac
+
+Recipe 156 with VideoToolbox. `hwaccel => 'videotoolbox'` decodes onto the device and a `_videotoolbox` encoder encodes there, so the input is told `hwaccel_output_format videotoolbox_vld` and `scale` becomes `scale_vt`. `hflip` has no VideoToolbox variant and runs on the CPU between one `hwdownload` and one `hwupload`. `hwupload` makes no device of its own, so the command makes one and names it for the filtergraph (`init_hw_device`, `filter_hw_device`):
+
+```pgsql
+COPY (
+  SELECT scale(hflip(f.video[1]), 1280, -2), f.audio[1]
+  FROM input('tests/fixtures/av.mp4', hwaccel => 'videotoolbox') f
+) TO 'small.mp4' WITH (video_codec 'h264_videotoolbox', video_bitrate '6M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -init_hw_device videotoolbox=up -filter_hw_device up -hwaccel videotoolbox \
+  -hwaccel_output_format videotoolbox_vld -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0]hwdownload,format=pix_fmts=nv12,hflip,hwupload,scale_vt=w=1280:h=-2[out0]' \
+  -map '[out0]' -map 0:a:0 -c:1 copy -c:0 h264_videotoolbox -b:0 6M small.mp4
+```
+
+The variants are `scale_vt` and `transpose_vt`, and the pass uses them only where the compiling machine's ffmpeg has them. `yadif_videotoolbox` is not used. A VideoToolbox encoder also reads frames in host memory, so a picture that comes down for a CPU filter last is not sent up again.

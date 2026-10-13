@@ -318,3 +318,51 @@ def test_the_vulkan_family_sends_a_picture_up_again_before_its_encoder() -> None
         [_node("n1", "hflip", {}, ["src:f:v:0"])], [_sink("out.mp4", ["n1"], "h264_vulkan")]
     )
     assert keep_on_the_card(mixed, _reference(), _FILM) is mixed
+
+
+def test_the_videotoolbox_family_uploads_to_a_device_it_names() -> None:
+    """On macOS `scale` and `transpose` have VideoToolbox variants; `hflip`
+    has none, so the picture comes down for it and goes back up through
+    `hwupload`, which makes no device of its own, so the command names one
+    for the filtergraph. The encoder reads either memory, so nothing goes up
+    for it."""
+    g = _graph(
+        [
+            _node("n1", "scale", {"width": 1280, "height": -2}, ["src:f:v:0"]),
+            _node("n2", "hflip", {}, ["n1"]),
+            _node("n3", "transpose", {"dir": 1}, ["n2"]),
+            _node("n4", "hflip", {}, ["n3"]),
+        ],
+        [_sink("out.mp4", ["n4"], "h264_videotoolbox")],
+        options={"f": {"hwaccel": "videotoolbox"}},
+    )
+    kept = keep_on_the_card(g, _unknown(), _FILM)
+    assert kept.input_options == {
+        "f": {
+            "init_hw_device": "videotoolbox=up",
+            "filter_hw_device": "up",
+            "hwaccel": "videotoolbox",
+            "hwaccel_output_format": "videotoolbox_vld",
+        }
+    }
+    assert _filters(kept) == [
+        ("n1", "scale_vt", {"w": 1280, "h": -2}, ["src:f:v:0"]),
+        ("n1_hwdownload", "hwdownload", {}, ["n1"]),
+        ("n1_hwdownload_format", "format", {"pix_fmts": "nv12"}, ["n1_hwdownload"]),
+        ("n2", "hflip", {}, ["n1_hwdownload_format"]),
+        ("n2_hwupload", "hwupload", {}, ["n2"]),
+        ("n3", "transpose_vt", {"dir": 1}, ["n2_hwupload"]),
+        ("n3_hwdownload", "hwdownload", {}, ["n3"]),
+        ("n3_hwdownload_format", "format", {"pix_fmts": "nv12"}, ["n3_hwdownload"]),
+        ("n4", "hflip", {}, ["n3_hwdownload_format"]),
+    ]
+    assert kept.sinks[0].outputs[0].ref == "n4"
+    # With nothing going up, no device is named.
+    plain = _graph(
+        [_node("n1", "scale", {"width": 1280, "height": -2}, ["src:f:v:0"])],
+        [_sink("out.mp4", ["n1"], "h264_videotoolbox")],
+        options={"f": {"hwaccel": "videotoolbox"}},
+    )
+    assert keep_on_the_card(plain, _unknown(), _FILM).input_options == {
+        "f": {"hwaccel": "videotoolbox", "hwaccel_output_format": "videotoolbox_vld"}
+    }

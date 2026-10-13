@@ -44,7 +44,8 @@ from pathlib import Path
 
 import pytest
 
-from ffrwd import binaries, cli
+from ffrwd import av, binaries, cli, device_filters, hardware
+from ffrwd import registry as registry_module
 from ffrwd.errors import FfrwdError
 from ffrwd.parser import parse, resolve
 from ffrwd.registry import Registry
@@ -422,12 +423,36 @@ def _require_modules(example: Example) -> None:
             pytest.skip(f"module missing: {function.module}")
 
 
+def _require_device_filters(example: Example) -> None:
+    """Skip a recipe whose pin names a device's filter variant this machine
+    lacks: one of ffmpeg's (`scale_cuda`, `scale_vt`), which the card pass
+    writes only where the compiling ffmpeg has it, or one of the sidecar's
+    libavfilter (`scale_d3d12`), which a region's `filter` node runs only
+    where the compiling sidecar has it. The pin holds only there."""
+    _, expected = _split_command(example)
+    tokens = set(re.findall(r"[a-z0-9]+_[a-z0-9]+", expected))
+    in_ffmpeg = tokens & {
+        f"{name}{family.filter_suffix}" for family in hardware._FAMILIES for name in family.variants
+    }
+    in_sidecar = tokens & {variant.name for variant in device_filters._VARIANTS.values()}
+    missing: set[str] = set()
+    machine = registry_module.load()
+    if in_ffmpeg and machine.available():
+        missing |= {name for name in in_ffmpeg if machine.get(name) is None}
+    sidecar = av.sidecar_filters()
+    if in_sidecar and sidecar is not None:
+        missing |= in_sidecar - sidecar
+    if missing:
+        pytest.skip(f"this machine has no {', '.join(sorted(missing))}")
+
+
 @pytest.mark.exec
 @pytest.mark.parametrize("example", _EXEC, ids=_ids(_EXEC))
 def test_exec_example_compiles_to_the_shown_command(
     example: Example, tmp_path: Path, _fixtures: None
 ) -> None:
     _require_modules(example)
+    _require_device_filters(example)
     actual = _run(example, tmp_path)
     expected = _split_command(example)[1]
     assert "\n".join(wrap_command(line) for line in actual.split("\n")) == expected

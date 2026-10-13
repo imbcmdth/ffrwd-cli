@@ -1976,6 +1976,11 @@ run; each item names what it takes, and the notes above have the detail.
 6. **The acceptance lines that name the L4**: the benchmark recipe (160)
    at real time there, and section 3's harness run there for its GPU and
    readback columns.
+7. **The card pass's Vulkan upload**: `hwupload` makes no device of its
+   own. The VideoToolbox family's commands make one for it
+   (`init_hw_device`, `filter_hw_device`); the Vulkan family's do not and
+   have never run, and are left as they are until a card shows whether
+   they need the same.
 
 ## Packets inside the region, and sidecar to sidecar
 
@@ -2483,3 +2488,26 @@ device converts in, as for `_d3d12va`. Recipe 166.
 Measured: gpu_box over testsrc into h264_videotoolbox moves 0 bytes up or
 down; the file is within 41 dB of ffmpeg's interpolating reference, the
 same as the libx264 path, and is tagged BT.709 limited.
+
+### The card pass
+
+`hwaccel => 'videotoolbox'` to a `_videotoolbox` encoder keeps the picture
+as `videotoolbox_vld` and spells `scale` and `transpose` as `scale_vt` and
+`transpose_vt`. A CPU segment goes back up through `hwupload`, which makes
+no device of its own, so the command makes one and names it for the
+filtergraph (`init_hw_device videotoolbox=up -filter_hw_device up`, written
+as input options of the first kept input, since ffmpeg reads global options
+anywhere). `yadif_videotoolbox` is left out: its name is not the family's
+suffix. Those three are FFmpeg 9.0's VideoToolbox filters. The sidecar's
+own libavfilter in ffrwd-av v1.2.0 carries none of them on macOS, so the
+`filter` node has no route there until that build adds them. Recipe 167,
+run here: av.mp4 decoded by VideoToolbox, flipped on the CPU, scaled by
+`scale_vt` and encoded by `h264_videotoolbox`.
+
+A pinned recipe whose command names a device filter the compiling machine
+lacks is skipped, naming the filter, rather than failing. Before, 156 and
+158 were checked wherever they were compiled; 167 is new. On CI's Linux
+runner, whose static ffmpeg has `scale_cuda` and `scale_vulkan` and no
+`_vt` filters, and whose sidecar loads no libav, 156 and 158 are still
+checked and 167 skips. On the owner's Windows machine 167 is the one skip.
+Here 156 (`scale_cuda`) and 158 (`scale_d3d12`) skip.
