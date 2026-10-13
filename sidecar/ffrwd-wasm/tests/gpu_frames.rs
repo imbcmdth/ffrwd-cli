@@ -1040,6 +1040,153 @@ fn pictures_decoded_on_the_device_reach_an_rgba_reader_converted_there() {
     assert!(mean < 0.03, "mean {mean}");
 }
 
+/// `source`, h264, decoded to rgba by the sidecar with a BT.709 `-pad`, on
+/// `hw`, through gpu_box on the GPU: the pictures, and the run's stderr.
+fn decoded_bt709(
+    dir: &Path,
+    module: &str,
+    source: &Path,
+    hw: &str,
+) -> (Vec<(i64, Vec<u8>)>, Output) {
+    let out = scratch(&format!("bt709_{hw}.nut"));
+    let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .env("FFRWD_AV_RUNTIME", dir)
+        .args(["-gpu", module, "-f", "nut", "-i"])
+        .arg(source)
+        .args([
+            "-pad",
+            r#"{"color": [{"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}]}"#,
+            "-m",
+            &format!("gpu_box={module}"),
+            "-filter_complex",
+            &format!(
+                "[0:v]decode=format=rgba:hw={hw}[d];\
+                 [v=d]gpu_box=memory=gpu:out=gpu:size=5[out=out0]"
+            ),
+            "-map",
+            "[out0]",
+            "-f",
+            "nut",
+        ])
+        .arg(&out)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffrwd-wasm");
+    let pictures = if output.status.success() {
+        frames_in(&out)
+    } else {
+        Vec::new()
+    };
+    (pictures, output)
+}
+
+#[test]
+fn a_picture_decoded_on_the_device_is_made_rgba_in_the_colour_the_software_decoder_reads() {
+    let test =
+        "a_picture_decoded_on_the_device_is_made_rgba_in_the_colour_the_software_decoder_reads";
+    let Some(dir) = d3d12va_libav(test) else {
+        return;
+    };
+    let Some(()) = ffmpeg(test) else {
+        return;
+    };
+    let module = module();
+    // The fixture's bitstream says nothing of its colour, so both read it in
+    // the pad's BT.709 limited; one whose bitstream says BT.601 is read in
+    // BT.601 by both, whatever the pad says.
+    let said = scratch("bitstream_bt601.nut");
+    ffmpeg_ok(
+        &[
+            "-i",
+            path_str(&h264_fixture()),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "bt470bg",
+            "-f",
+            "nut",
+            path_str(&said),
+        ],
+        "re-encoding the fixture with BT.601 in its bitstream",
+    );
+    for (source, read_in, other) in [
+        (h264_fixture(), "bt709", "bt601"),
+        (said.clone(), "bt601", "bt709"),
+    ] {
+        let (device, output) = decoded_bt709(&dir, &module, &source, "d3d12va");
+        if no_gpu(&output) {
+            eprintln!("skipped: this machine has no GPU adapter");
+            return;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("[gpu] convert nv12 64x48 to rgba 64x48"),
+            "the decoder's NV12 is made rgba on the device:\n{stderr}"
+        );
+        let (software, output) = decoded_bt709(&dir, &module, &source, "none");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // ffmpeg's conversion in `matrix`, with `flags` the scaler's.
+        let in_matrix = |matrix: &str, flags: &str| {
+            ffmpeg_ok(
+                &[
+                    "-i",
+                    path_str(&source),
+                    "-fps_mode",
+                    "passthrough",
+                    "-vf",
+                    &format!("scale=in_color_matrix={matrix}:in_range=tv{flags},format=rgba"),
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                "ffmpeg's yuv420p to rgba",
+            )
+        };
+        // The device's conversion is ffmpeg's bilinear one with the chroma
+        // interpolated; the software decoder's is libswscale's default.
+        let bilinear = ":flags=bilinear+full_chroma_int+accurate_rnd";
+        let len = 64 * 48 * 4;
+        let worst = |ours: &[(i64, Vec<u8>)], theirs: &[u8]| {
+            assert_eq!(theirs.len(), ours.len() * len, "as many pictures");
+            let (mut max, mut mean) = (0u8, 0f64);
+            for ((_, ours), theirs) in ours.iter().zip(theirs.chunks(len)) {
+                let (m, a) = apart_outside_the_box(ours, theirs, 64, 5);
+                max = max.max(m);
+                mean = mean.max(a);
+            }
+            (max, mean)
+        };
+        let on_device = worst(&device, &in_matrix(read_in, bilinear));
+        let on_device_other = worst(&device, &in_matrix(other, bilinear));
+        let in_software = worst(&software, &in_matrix(read_in, ""));
+        let in_software_other = worst(&software, &in_matrix(other, ""));
+        eprintln!(
+            "against ffmpeg's {read_in} ({other}), at most apart and mean in the worst \
+             picture: the device {on_device:?} ({on_device_other:?}), the software decode \
+             {in_software:?} ({in_software_other:?})"
+        );
+        // Measured on an RTX 4090: the device at most 1 apart, a mean of
+        // 0.031; the software decode the same bytes; the other matrix over 3
+        // apart on average.
+        assert!(on_device.0 <= 1 && on_device.1 < 0.05, "{on_device:?}");
+        assert_eq!(
+            in_software.0, 0,
+            "the software decode is ffmpeg's {read_in}"
+        );
+        assert!(on_device_other.1 > 1.0 && in_software_other.1 > 1.0);
+    }
+    let _ = std::fs::remove_file(&said);
+}
+
 /// `frames` of `width` x `height` rgba as a NUT file at `path`, 25 a
 /// second.
 fn write_rgba_nut(path: &Path, frames: &[Vec<u8>], width: u32, height: u32) {

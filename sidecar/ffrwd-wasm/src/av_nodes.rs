@@ -135,23 +135,56 @@ fn decoder_codec(coded: &CodedStream, fourcc: Option<&[u8]>) -> String {
         .map_or_else(|| coded.codec.clone(), str::to_string)
 }
 
+/// A colour as libav's shim takes it.
+pub(crate) fn av_color(color: &ColorInfo) -> av::Color {
+    av::Color {
+        range: color.range.to_string(),
+        primaries: color.primaries.to_string(),
+        trc: color.trc.to_string(),
+        space: color.space.to_string(),
+    }
+}
+
+/// The colour a picture `decode` writes in `pix_fmt` is told, of a stream
+/// in `color`: rgba is RGB, so full range with no matrix, in the stream's
+/// primaries and transfer; YUV keeps the stream's.
+fn written_color(pix_fmt: &str, color: Option<ColorInfo>) -> Option<ColorInfo> {
+    if pix_fmt != "rgba" {
+        return color;
+    }
+    let color = color.unwrap_or(ColorInfo {
+        range: "unknown",
+        primaries: "unknown",
+        trc: "unknown",
+        space: "unknown",
+    });
+    Some(ColorInfo {
+        range: "pc",
+        space: "gbr",
+        ..color
+    })
+}
+
 /// The decoder `decode` opens: on the process's own device when a reader
 /// holds its pictures on the GPU and `hw` allows that device, else as `hw`
 /// says. With it, how the pictures left on the device become frames.
+/// `color` is the stream's, which a picture whose bitstream says none
+/// carries.
 fn open_decoder(
     codec: &str,
     extradata: &[u8],
     hw: Hw,
     want: &'static str,
+    color: Option<&av::Color>,
     yuv: Option<Yuv>,
     on_gpu: bool,
 ) -> av::Result<(Decoder, Option<OnDevice>)> {
     if on_gpu {
-        if let Some(opened) = open_on_shared_device(codec, extradata, &hw, want, yuv) {
+        if let Some(opened) = open_on_shared_device(codec, extradata, &hw, want, color, yuv) {
             return Ok(opened);
         }
     }
-    Ok((Decoder::open(codec, extradata, hw, want)?, None))
+    Ok((Decoder::open(codec, extradata, hw, want, color)?, None))
 }
 
 /// How a decoder's pictures on the process's device become frames.
@@ -203,6 +236,7 @@ pub(crate) fn open_on_shared_device(
     extradata: &[u8],
     hw: &Hw,
     want: &'static str,
+    color: Option<&av::Color>,
     yuv: Option<Yuv>,
 ) -> Option<(Decoder, Option<OnDevice>)> {
     use ffrwd_wasm_runtime::gpu;
@@ -238,7 +272,7 @@ pub(crate) fn open_on_shared_device(
         );
         return None;
     };
-    match Decoder::open_shared(codec, extradata, device, want) {
+    match Decoder::open_shared(codec, extradata, device, want, color) {
         Ok(decoder) => Some((
             decoder,
             Some(gpu::frames::DecodedPictures::new(codec, DEVICE)),
@@ -256,6 +290,7 @@ pub(crate) fn open_on_shared_device(
     _extradata: &[u8],
     _hw: &Hw,
     _want: &'static str,
+    _color: Option<&av::Color>,
     _yuv: Option<Yuv>,
 ) -> Option<(Decoder, Option<OnDevice>)> {
     None
@@ -270,10 +305,11 @@ pub struct Decode {
     /// stay there.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     on_device: Option<OnDevice>,
-    /// The pictures as the stream's header declares them.
+    /// The pictures as the stream's header declares them, in the colour they
+    /// are written in.
     format: VideoFormat,
     /// The colour the decoder's YUV is read in when a reader is handed
-    /// rgba made on the device.
+    /// rgba made on the device, until the decoder says what it found.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     yuv: Option<Yuv>,
     /// How long a picture lasts, where the frame rate says in whole ticks.
@@ -352,6 +388,7 @@ impl Decode {
             &coded.extradata,
             hw.unwrap_or_default(),
             want,
+            color.as_ref().map(av_color).as_ref(),
             yuv,
             on_gpu,
         )
@@ -361,7 +398,7 @@ impl Decode {
             height,
             pix_fmt: want,
             frame_len: crate::frame_len_for(want, width, height)?,
-            color,
+            color: written_color(want, color),
         };
         // The pictures the decoder holds back, as seconds of the stream: a
         // lockstep reader is told to wait that long past a tick.
@@ -442,7 +479,14 @@ impl Decode {
                 self.name
             )
         })?;
-        let yuv = self.yuv.unwrap_or(Yuv::DEFAULT);
+        // The colour the decoder found, the bitstream's where it says one,
+        // as the software decoder converts in.
+        let yuv = self
+            .decoder
+            .format()
+            .and_then(|found| Yuv::read_as(&found.color.space, &found.color.range))
+            .or(self.yuv)
+            .unwrap_or(Yuv::DEFAULT);
         let frame = pictures
             .hold(picture, self.format.pix_fmt, yuv)
             .map_err(|e| anyhow!("{}: {e:#}", self.name))?;
@@ -468,7 +512,8 @@ impl Node for Decode {
     }
 
     /// The header's geometry and colour until a picture has decoded, and
-    /// what the decoder made of the stream after.
+    /// what the decoder made of the stream after, each as its pictures are
+    /// written.
     fn settled_format(&self, _port: usize) -> Option<StreamFormat> {
         let Some(decoded) = self.decoder.format() else {
             return Some(StreamFormat::Video(self.format));
@@ -484,7 +529,7 @@ impl Node for Decode {
             height: decoded.height,
             frame_len: crate::frame_len_for(self.format.pix_fmt, decoded.width, decoded.height)
                 .ok()?,
-            color: Some(color),
+            color: written_color(self.format.pix_fmt, Some(color)),
             ..self.format
         }))
     }
@@ -1442,6 +1487,35 @@ impl Node for AvFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_decoded_picture_is_told_the_colour_it_is_written_in() {
+        let tv = ColorInfo {
+            range: "tv",
+            primaries: "bt709",
+            trc: "bt709",
+            space: "bt709",
+        };
+        let rgb = |primaries, trc| ColorInfo {
+            range: "pc",
+            primaries,
+            trc,
+            space: "gbr",
+        };
+        let cases = [
+            ("yuv420p", Some(tv), Some(tv)),
+            ("yuv420p", None, None),
+            ("rgba", Some(tv), Some(rgb("bt709", "bt709"))),
+            ("rgba", None, Some(rgb("unknown", "unknown"))),
+        ];
+        for (pix_fmt, stream, told) in cases {
+            assert_eq!(
+                written_color(pix_fmt, stream),
+                told,
+                "{pix_fmt} of {stream:?}"
+            );
+        }
+    }
 
     fn coded(codec: &str) -> CodedStream {
         CodedStream {

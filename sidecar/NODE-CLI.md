@@ -151,10 +151,12 @@ run on the libavcodec `AV-EDGE.md` describes. `[0:v]decode=format=rgba[d]`
 turns a coded picture into frames in the format named (`rgba`, `yuv420p`,
 `yuv422p`, `yuv444p` or `gray`), with `hw=<device>` choosing a hardware
 decoder (`none`, `auto`, or a device type; `none` without it); its codec
-and extradata come from the input's NUT header, and its frames carry the
-colour `-pad` gives the coded picture, else the range and matrix that
-header declares, which is all NUT carries of a stream's colour.
-`[n1]encode=codec=h264_nvenc:b=6M[out0]` turns frames
+and extradata come from the input's NUT header. Its colour is the one
+`-pad` gives the coded picture, else the range and matrix that header
+declares, which is all NUT carries of a stream's colour; the decoder reads
+the YUV in it where the bitstream says none. Its yuv420p frames carry that
+colour, and its rgba frames full range with no matrix (`pc`, `gbr`) in its
+primaries and transfer. `[n1]encode=codec=h264_nvenc:b=6M[out0]` turns frames
 into that codec's packets; every option beside `codec` is handed to the
 encoder under the name ffmpeg's command line uses (`b`, `g`, `crf`,
 `preset`, `profile`, `level`, `maxrate`, `bufsize`, `keyint_min`, `tune`,

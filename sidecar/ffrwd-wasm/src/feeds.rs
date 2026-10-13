@@ -501,13 +501,14 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
                                 &stream.extradata,
                                 &Hw::Auto,
                                 pix_fmt,
+                                None,
                                 yuv,
                             )
                         });
                         let (decoder, on_device) = match shared {
                             Some(opened) => opened,
                             None => (
-                                Decoder::open(codec, &stream.extradata, Hw::None, pix_fmt)
+                                Decoder::open(codec, &stream.extradata, Hw::None, pix_fmt, None)
                                     .map_err(|e| {
                                         anyhow!("decoding the feeder's {codec} picture: {e}")
                                     })?,

@@ -3025,9 +3025,9 @@ def test_a_coded_node_region_decodes_into_its_port_and_encodes_its_output() -> N
     assert (entry.format.codec, leaving.format.codec) == (COPY_CODEC, COPY_CODEC)
     argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)
     sidecar = argv[region.id]
-    # The pad says the colour the source was probed in, which the decoded
-    # pictures carry, and how far ahead of the source's clock the packets
-    # cross.
+    # The pad says the colour the source was probed in, its YUV's even where
+    # the decode makes rgba, since the decoder reads the YUV in it; and how
+    # far ahead of the source's clock the packets cross.
     assert _pad_of(sidecar) == {
         "color": [{"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}],
         "offset": CODED_CLOCK_OFFSET,

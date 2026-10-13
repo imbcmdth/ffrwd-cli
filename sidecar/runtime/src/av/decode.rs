@@ -2,9 +2,10 @@
 
 use std::os::raw::c_void;
 
+use super::encode::unset;
 use super::error::{Error, Result};
 use super::ffi::{
-    add_ref_com, release_com, AvErr, Codec, CodecCtx, Frame, Lib, Packet, Scaler, Status,
+    add_ref_com, release_com, AvErr, Codec, CodecCtx, Frame, Lib, Packet, RawColor, Scaler, Status,
 };
 use super::picture::{self, WIRE_PIX_FMTS};
 use super::Color;
@@ -244,10 +245,24 @@ fn call<'a>(call: &'static str, codec: &'a str) -> impl FnOnce(AvErr) -> Error +
     }
 }
 
+/// `color` as libavutil's values, a field it leaves unsaid unspecified.
+fn raw_color(lib: &Lib, color: Option<&Color>, codec: &str) -> Result<RawColor> {
+    let Some(c) = color else {
+        return Ok(RawColor::UNSPECIFIED);
+    };
+    let names =
+        [&c.range, &c.primaries, &c.trc, &c.space].map(|n| if unset(n) { "" } else { n.as_str() });
+    lib.color_values(names).map_err(|(key, value)| Error::Call {
+        call: "avcodec_parameters_to_context",
+        codec: codec.to_string(),
+        why: format!("libavutil has no {key} called {value}"),
+    })
+}
+
 /// Opens a software decoder.
-fn open_software(codec: Codec, extradata: &[u8], name: &str) -> Result<CodecCtx> {
+fn open_software(codec: Codec, extradata: &[u8], color: RawColor, name: &str) -> Result<CodecCtx> {
     let mut ctx = CodecCtx::new(codec).map_err(call("avcodec_alloc_context3", name))?;
-    ctx.set_stream(extradata)
+    ctx.set_stream(extradata, color)
         .map_err(call("avcodec_parameters_to_context", name))?;
     // ffmpeg's command line decodes with as many threads as it has cores.
     ctx.set_option("threads", "auto")
@@ -262,6 +277,7 @@ fn open_on_device(
     lib: &'static Lib,
     preferred: Codec,
     extradata: &[u8],
+    color: RawColor,
     name: &str,
     device: &str,
 ) -> std::result::Result<CodecCtx, String> {
@@ -276,7 +292,7 @@ fn open_on_device(
         return Err(format!("no {name} decoder here decodes on {device}"));
     };
     let mut ctx = CodecCtx::new(codec).map_err(|e| e.why)?;
-    ctx.set_stream(extradata).map_err(|e| e.why)?;
+    ctx.set_stream(extradata, color).map_err(|e| e.why)?;
     ctx.attach_device(device_type)
         .map_err(|e| format!("no device: {}", e.why))?;
     ctx.set_option("threads", "auto").map_err(|e| e.why)?;
@@ -289,14 +305,22 @@ impl Decoder {
     /// `av1`, `vp9`, `mpeg2video`, `prores`, `mjpeg`, `ffv1`, `mpeg4`), or a
     /// particular decoder's own name (`libdav1d`). `extradata` is the
     /// codec's out-of-band header, as the container carried it; `want` is
-    /// the wire format pictures come out in.
+    /// the wire format pictures come out in. `color` is the stream's colour
+    /// as the container said it, which the decoder's pictures carry where
+    /// the bitstream says none, as ffmpeg's own decode does.
     ///
     /// Says on stderr, once, where it decodes:
     /// `[av] decode h264: d3d11va`, or
     /// `[av] decode h264: software (d3d11va: <why>; cuda: <why>)`.
     /// A device named outright that cannot be had is a refusal, not a fall
     /// back.
-    pub fn open(codec: &str, extradata: &[u8], hw: Hw, want: &str) -> Result<Decoder> {
+    pub fn open(
+        codec: &str,
+        extradata: &[u8],
+        hw: Hw,
+        want: &str,
+        color: Option<&Color>,
+    ) -> Result<Decoder> {
         let lib = super::runtime()?;
         let Some(want) = picture::wire_pix_fmt(want) else {
             return Err(Error::PixelFormat {
@@ -313,29 +337,32 @@ impl Decoder {
                 name: codec.to_string(),
             });
         };
+        let color = raw_color(lib, color, codec)?;
 
         let (ctx, engaged, unconfirmed, passed_over) = match &hw {
             Hw::None => (
-                open_software(preferred, extradata, codec)?,
+                open_software(preferred, extradata, color, codec)?,
                 "software".to_string(),
                 None,
                 Vec::new(),
             ),
-            Hw::Device(device) => match open_on_device(lib, preferred, extradata, codec, device) {
-                Ok(ctx) => (ctx, device.clone(), Some(device.clone()), Vec::new()),
-                Err(why) => {
-                    return Err(Error::Hardware {
-                        codec: codec.to_string(),
-                        device: device.clone(),
-                        why,
-                    })
+            Hw::Device(device) => {
+                match open_on_device(lib, preferred, extradata, color, codec, device) {
+                    Ok(ctx) => (ctx, device.clone(), Some(device.clone()), Vec::new()),
+                    Err(why) => {
+                        return Err(Error::Hardware {
+                            codec: codec.to_string(),
+                            device: device.clone(),
+                            why,
+                        })
+                    }
                 }
-            },
+            }
             Hw::Auto => {
                 let mut passed_over = Vec::new();
                 let mut opened = None;
                 for &device in Hw::AUTO_ORDER {
-                    match open_on_device(lib, preferred, extradata, codec, device) {
+                    match open_on_device(lib, preferred, extradata, color, codec, device) {
                         Ok(ctx) => {
                             opened = Some((ctx, device));
                             break;
@@ -351,7 +378,7 @@ impl Decoder {
                         passed_over,
                     ),
                     None => (
-                        open_software(preferred, extradata, codec)?,
+                        open_software(preferred, extradata, color, codec)?,
                         "software".to_string(),
                         None,
                         passed_over,
@@ -389,7 +416,8 @@ impl Decoder {
     /// [`receive_any`](Decoder::receive_any) can hand them over where they
     /// are. An `nv12` picture stays there for a `want` the caller makes of
     /// it on the device ([`ON_DEVICE`]); any other is copied back and
-    /// converted as [`open`](Decoder::open)'s are.
+    /// converted as [`open`](Decoder::open)'s are. `color` is as
+    /// [`open`](Decoder::open) takes it.
     ///
     /// Says on stderr, once: `[av] decode h264: d3d12va, on the host's
     /// device`. A decoder or device that refuses is a refusal, and the
@@ -399,6 +427,7 @@ impl Decoder {
         extradata: &[u8],
         device: Shared,
         want: &str,
+        color: Option<&Color>,
     ) -> Result<Decoder> {
         let lib = super::runtime()?;
         let Some(want) = picture::wire_pix_fmt(want) else {
@@ -437,7 +466,9 @@ impl Decoder {
             )));
         };
         let mut ctx = CodecCtx::new(found).map_err(|e| refused(e.why))?;
-        ctx.set_stream(extradata).map_err(|e| refused(e.why))?;
+        let color = raw_color(lib, color, codec)?;
+        ctx.set_stream(extradata, color)
+            .map_err(|e| refused(e.why))?;
         match device {
             Shared::D3d12(raw) => ctx
                 .attach_d3d12_device(device_type, raw.into_raw())

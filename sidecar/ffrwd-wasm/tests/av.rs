@@ -156,8 +156,8 @@ fn decode_fixture(hw: Hw) -> (Stream, Vec<av::DecodedFrame>, String) {
     let stream = demuxer.stream().clone();
     assert_eq!(stream.codec_name(), Some("h264"));
 
-    let mut decoder =
-        Decoder::open("h264", &stream.extradata, hw, "yuv420p").expect("open an h264 decoder");
+    let mut decoder = Decoder::open("h264", &stream.extradata, hw, "yuv420p", None)
+        .expect("open an h264 decoder");
     let mut frames = Vec::new();
     let mut buf = Vec::new();
     while let Some(packet) = demuxer.read_packet(&mut buf).expect("read a NUT packet") {
@@ -407,9 +407,15 @@ fn a_named_device_this_libav_lacks_is_refused_by_name() {
         announce_skip("a_named_device_this_libav_lacks_is_refused_by_name");
         return;
     }
-    let err = Decoder::open("h264", &[], Hw::Device("nosuchdevice".into()), "yuv420p")
-        .err()
-        .expect("no such device");
+    let err = Decoder::open(
+        "h264",
+        &[],
+        Hw::Device("nosuchdevice".into()),
+        "yuv420p",
+        None,
+    )
+    .err()
+    .expect("no such device");
     assert!(
         matches!(&err, av::Error::Hardware { device, .. } if device == "nosuchdevice"),
         "{err}"
@@ -800,46 +806,138 @@ fn decode_hands_its_pictures_the_colour_the_pad_gives_the_stream() {
         announce_skip(test);
         return;
     };
-    // The fixture's header and bitstream say nothing of its colour.
-    let rows = scratch("decoded_colour.ndjson");
-    let output = sidecar(
-        &[
-            "-f",
-            "nut",
-            "-i",
-            fixture().to_str().expect("UTF-8"),
-            "-pad",
-            r#"{"color": [{"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}]}"#,
-            "-m",
-            &module("colour_probe"),
-            "-filter_complex",
-            "[0:v]decode=format=yuv420p[d];[v=d]colour_probe=pix_fmt=yuv420p[colour=out0]",
-            "-map",
-            "[out0]",
-            "-f",
-            "ndjson",
-            rows.to_str().expect("UTF-8"),
-        ],
-        Some(&dir),
-    );
-    assert!(output.status.success(), "{}", stderr_of(&output));
-    let text = std::fs::read_to_string(&rows).expect("read the rows");
-    let _ = std::fs::remove_file(&rows);
-    let told: Vec<serde_json::Value> = text
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("a JSON row"))
-        .collect();
-    assert!(!told.is_empty(), "a row a picture");
-    for row in &told {
-        for (key, said) in [
-            ("range", "tv"),
-            ("primaries", "bt709"),
-            ("trc", "bt709"),
-            ("space", "bt709"),
-        ] {
-            assert_eq!(row[key], said, "{key} of the picture at pts {}", row["pts"]);
+    // The fixture's header and bitstream say nothing of its colour. yuv420p
+    // keeps the stream's; rgba is full range with no matrix, in the stream's
+    // primaries and transfer.
+    for (pix_fmt, told) in [
+        ("yuv420p", ["tv", "bt709", "bt709", "bt709"]),
+        ("rgba", ["pc", "bt709", "bt709", "gbr"]),
+    ] {
+        let rows = scratch(&format!("decoded_colour_{pix_fmt}.ndjson"));
+        let chain = format!(
+            "[0:v]decode=format={pix_fmt}[d];[v=d]colour_probe=pix_fmt={pix_fmt}[colour=out0]"
+        );
+        let output = sidecar(
+            &[
+                "-f",
+                "nut",
+                "-i",
+                fixture().to_str().expect("UTF-8"),
+                "-pad",
+                r#"{"color": [{"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}]}"#,
+                "-m",
+                &module("colour_probe"),
+                "-filter_complex",
+                &chain,
+                "-map",
+                "[out0]",
+                "-f",
+                "ndjson",
+                rows.to_str().expect("UTF-8"),
+            ],
+            Some(&dir),
+        );
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        let text = std::fs::read_to_string(&rows).expect("read the rows");
+        let _ = std::fs::remove_file(&rows);
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON row"))
+            .collect();
+        assert!(!rows.is_empty(), "a row a picture");
+        for row in &rows {
+            for (key, said) in ["range", "primaries", "trc", "space"].into_iter().zip(told) {
+                assert_eq!(
+                    row[key], said,
+                    "{key} of the {pix_fmt} picture at pts {}",
+                    row["pts"]
+                );
+            }
         }
     }
+}
+
+/// `path` decoded by ffmpeg to rgba, its YUV read in `matrix`, limited
+/// range.
+fn ffmpeg_rgba_in(path: &Path, matrix: &str) -> Vec<u8> {
+    run_ok(
+        Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-fps_mode", "passthrough", "-vf"])
+            .arg(format!(
+                "scale=in_color_matrix={matrix}:in_range=tv,format=rgba"
+            ))
+            .args(["-f", "rawvideo", "-"])
+            .stdin(Stdio::null()),
+        "ffmpeg",
+    )
+    .stdout
+}
+
+#[test]
+fn decode_reads_a_bitstream_saying_no_colour_in_the_colour_the_pad_gives() {
+    let test = "decode_reads_a_bitstream_saying_no_colour_in_the_colour_the_pad_gives";
+    let Some(dir) = libav_and_ffmpeg(test) else {
+        return;
+    };
+    // The fixture's bitstream carries no colour, so the pad's BT.709 is the
+    // matrix its YUV is made rgba in, as ffmpeg's decode reads a container's.
+    // One whose bitstream says BT.601 is read in BT.601 whatever the pad says.
+    let said = scratch("bitstream_bt601.nut");
+    run_ok(
+        Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(fixture())
+            .args([
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "bt470bg",
+                "-f",
+                "nut",
+            ])
+            .arg(&said)
+            .stdin(Stdio::null()),
+        "ffmpeg",
+    );
+    for (source, read_in) in [(fixture(), "bt709"), (said.clone(), "bt601")] {
+        let out = scratch("pad_bt709_rgba.nut");
+        let output = sidecar(
+            &[
+                "-f",
+                "nut",
+                "-i",
+                source.to_str().expect("UTF-8"),
+                "-pad",
+                r#"{"color": [{"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}]}"#,
+                "-filter_complex",
+                "[0:v]decode=format=rgba[out0]",
+                "-map",
+                "[out0]",
+                "-f",
+                "nut",
+                out.to_str().expect("UTF-8"),
+            ],
+            Some(&dir),
+        );
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        let (_, frames) = demux(&out);
+        let _ = std::fs::remove_file(&out);
+        let ours: Vec<u8> = frames.into_iter().flat_map(|(_, data)| data).collect();
+        let (bt709, bt601) = (
+            ffmpeg_rgba_in(&source, "bt709"),
+            ffmpeg_rgba_in(&source, "bt601"),
+        );
+        assert_ne!(bt709, bt601, "the two matrices make the picture apart");
+        let theirs = if read_in == "bt709" { bt709 } else { bt601 };
+        assert!(ours == theirs, "the pictures ffmpeg makes in {read_in}");
+    }
+    let _ = std::fs::remove_file(&said);
 }
 
 #[test]

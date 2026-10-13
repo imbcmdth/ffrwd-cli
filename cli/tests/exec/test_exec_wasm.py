@@ -1576,25 +1576,31 @@ def test_a_region_decoding_packets_hands_on_the_times_ffmpegs_decode_gives(
 
 
 def test_a_picture_the_region_decodes_is_told_the_sources_colour(tmp_path: Path) -> None:
-    """A limited-range BT.709 source decoded in the region, beside a coded
-    `invert` of another input, and read there as yuv420p: the reading is told
-    what ffprobe says of the source."""
+    """A limited-range BT.709 source decoded in the region twice, as yuv420p
+    for one `colour_probe` and as rgba for a coded `invert` another reads: the
+    yuv420p reading is told what ffprobe says of the source, and the rgba one
+    full-range RGB in the source's primaries and transfer."""
     for module in (_COLOUR_PROBE, _INVERT):
         if not module.exists():
             pytest.skip(f"module missing: {module}")
-    source, other = tmp_path / "tv.mp4", tmp_path / "other.mp4"
-    for path, tags in ((source, ["-color_range", "tv", "-colorspace", "bt709"]), (other, [])):
-        subprocess.run(
-            [
-                "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
-                "testsrc2=size=64x48:rate=10", "-t", "1", "-c:v", "libx264",
-                "-pix_fmt", "yuv420p", *tags, str(path),
-            ],
-            check=True,
-            timeout=_SUBPROCESS_TIMEOUT,
-        )
-    probed = _colour(source)
-    assert probed == {"color_range": "tv", "color_space": "bt709"}
+    # Two copies, so each reading is an input's own picture and is decoded.
+    source, again = tmp_path / "tv.mp4", tmp_path / "tv-again.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10",
+            "-t", "1", "-vf",
+            "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+        ],
+        check=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    shutil.copyfile(source, again)
+    probed = _tags(source)
+    assert probed == {
+        "color_range": "tv", "color_space": "bt709",
+        "color_primaries": "bt709", "color_transfer": "bt709",
+    }
     out_path = tmp_path / "colour.ndjson"
     colour = "STRUCT(pix_fmt text, range text, primaries text, trc text, space text)[]"
     compiled = compile_all(
@@ -1606,13 +1612,16 @@ def test_a_picture_the_region_decodes_is_told_the_sources_colour(tmp_path: Path)
         f"  AS '{_INVERT.as_posix()}', 'invert' LANGUAGE wasm SET ffrwd.edges = 'coded';\n"
         "COPY (SELECT colour_probe(f.video[1], 'yuv420p',\n"
         "                          colour_probe(invert(g.video[1]), 'rgba'))\n"
-        f"      FROM input('{source.as_posix()}') f, input('{other.as_posix()}') g)\n"
+        f"      FROM input('{source.as_posix()}') f, input('{again.as_posix()}') g)\n"
         f"TO '{out_path.as_posix()}'"
     )
     assert compiled.plan is not None
     (sidecar,) = compiled.plan.sidecars
-    decoded = [node.args for node in sidecar.graph.nodes.values() if node.filter == "decode"]
-    assert {"format": "yuv420p"} in decoded, "the region decodes the source itself"
+    decoded = sorted(
+        str(node.args["format"]) for node in sidecar.graph.nodes.values()
+        if node.filter == "decode"
+    )
+    assert decoded == ["rgba", "yuv420p"], "the region decodes both readings itself"
     result = execute_plan(
         compiled.plan, sidecar_argv=wasm.sidecar_argv, overwrite=True,
         timeout=_SUBPROCESS_TIMEOUT,
@@ -1623,11 +1632,14 @@ def test_a_picture_the_region_decodes_is_told_the_sources_colour(tmp_path: Path)
         for member in stage.members
     )
     told = {
-        (row["range"], row["space"])
+        (row["pix_fmt"], row["range"], row["primaries"], row["trc"], row["space"])
         for row in map(json.loads, out_path.read_text().splitlines())
-        if row["pix_fmt"] == "yuv420p"
     }
-    assert told == {(probed["color_range"], probed["color_space"])}
+    primaries, trc = probed["color_primaries"], probed["color_transfer"]
+    assert told == {
+        ("yuv420p", probed["color_range"], primaries, trc, probed["color_space"]),
+        ("rgba", "pc", primaries, trc, "gbr"),
+    }
 
 
 # -- the colour an encoder in the region makes reaches the file ----------------

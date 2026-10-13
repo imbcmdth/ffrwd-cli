@@ -161,7 +161,7 @@ fn sent(status: Status, name: &str) -> Result<()> {
 }
 
 /// Whether a colour name leaves the value unspecified.
-fn unset(name: &str) -> bool {
+pub(super) fn unset(name: &str) -> bool {
     matches!(name, "" | "unknown" | "unspecified")
 }
 

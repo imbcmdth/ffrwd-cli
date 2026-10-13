@@ -1511,9 +1511,14 @@ impl CodecCtx {
     }
 
     /// Describes the stream a decoder is about to read: video, this codec,
-    /// and the out-of-band header the container carried, through
-    /// `avcodec_parameters_to_context`.
-    pub fn set_stream(&mut self, extradata: &[u8]) -> std::result::Result<(), AvErr> {
+    /// the out-of-band header the container carried, and the colour it
+    /// said, through `avcodec_parameters_to_context`. A colour the bitstream
+    /// carries takes its place as the decoder reads it.
+    pub fn set_stream(
+        &mut self,
+        extradata: &[u8],
+        color: RawColor,
+    ) -> std::result::Result<(), AvErr> {
         let f = &self.lib.f;
         let size = c_int::try_from(extradata.len()).map_err(|_| AvErr {
             code: 0,
@@ -1532,6 +1537,10 @@ impl CodecCtx {
             }
             (*par).codec_type = AVMEDIA_TYPE_VIDEO;
             (*par).codec_id = self.codec.id();
+            (*par).color_range = color.range;
+            (*par).color_primaries = color.primaries;
+            (*par).color_trc = color.trc;
+            (*par).color_space = color.space;
             if size > 0 {
                 let buf = (f.av_mallocz)(extradata.len() + AV_INPUT_BUFFER_PADDING_SIZE) as *mut u8;
                 if buf.is_null() {

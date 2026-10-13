@@ -27,8 +27,13 @@ pictures carry the times ffmpeg's decode of the input gives.
 
 The NUT the copying ffmpeg writes carries none of the input's colour, so
 the same `-pad` says the colour the input was probed in (`"color"`,
-"unknown" in a field the probe leaves unsaid), and `decode`'s pictures
-carry it to every reader, in host memory or on the GPU.
+"unknown" in a field the probe leaves unsaid). `decode` opens its decoder
+in it, as ffmpeg's decode opens one in what the container says, so a
+bitstream that says no colour is read in it and one that says its own is
+read in that; the device's conversion to rgba and libswscale's read the
+same matrix. Every reader of the pictures, in host memory or on the GPU, is
+told that colour, an rgba picture as full-range RGB (`pc`, `gbr`) in its
+primaries and transfer.
 
 `encode` takes `color_range`, `color_primaries`, `color_trc` and
 `colorspace`, by ffmpeg's names, as the colour it makes its pictures in and
