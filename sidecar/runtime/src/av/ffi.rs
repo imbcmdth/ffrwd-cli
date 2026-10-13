@@ -1913,6 +1913,14 @@ impl Frame {
         (f.format == d3d12 && !f.data[0].is_null()).then(|| f.data[0] as *mut AVD3D12VAFrame)
     }
 
+    /// The `CVPixelBufferRef` a `videotoolbox_vld` frame's fourth data
+    /// pointer names; None for any other frame.
+    pub fn videotoolbox(&self) -> Option<*mut c_void> {
+        let f = self.get();
+        let videotoolbox = self.lib.pix_fmt("videotoolbox_vld")?;
+        (f.format == videotoolbox && !f.data[3].is_null()).then(|| f.data[3] as *mut c_void)
+    }
+
     /// Moves the picture `from` holds into this frame, which held nothing,
     /// leaving `from` empty.
     pub fn take(&mut self, from: &mut Frame) -> std::result::Result<(), AvErr> {

@@ -13,10 +13,11 @@
 //!
 //! A `decode` whose pictures are read by an input held on the GPU, or by an
 //! encoder that reads D3D12 pictures, decodes on the process's own device
-//! where it can (`d3d12va` on Windows), and hands its pictures on as frames
-//! on that device, so nothing is copied to host memory and back. Asked for
-//! rgba, it still leaves the decoder's NV12 there, and a reader of the
-//! frames is handed rgba converted on the device once per picture.
+//! where it can (`d3d12va` on Windows, `videotoolbox` on macOS), and hands
+//! its pictures on as frames on that device, so nothing is copied to host
+//! memory and back. Asked for rgba, it still leaves the decoder's NV12
+//! there, and a reader of the frames is handed rgba converted on the device
+//! once per picture.
 //!
 //! An `encode` whose encoder reads D3D12 pictures (`h264_d3d12va`,
 //! `hevc_d3d12va`, `av1_d3d12va`) and whose frames arrive on the process's
@@ -226,11 +227,12 @@ pub(crate) fn yuv_of(color: Option<&ColorInfo>) -> Yuv {
 pub(crate) fn yuv_of(_color: Option<&ColorInfo>) -> Yuv {}
 
 /// A decoder on the process's own device, where `hw` allows the device
-/// it is (`auto`, or that device by name), the wire's format is one its
-/// pictures are made on the device (yuv420p, or rgba in a matrix the
-/// conversion has: `yuv`), and the device opens. None, having said why on
-/// stderr where it is not obvious, otherwise.
-#[cfg(all(feature = "gpu", windows))]
+/// it is (`auto`, or that device by name: `d3d12va` on Windows,
+/// `videotoolbox` on macOS), the wire's format is one its pictures are made
+/// on the device (yuv420p, or rgba in a matrix the conversion has: `yuv`),
+/// and the device opens. None, having said why on stderr where it is not
+/// obvious, otherwise.
+#[cfg(all(feature = "gpu", any(windows, target_os = "macos")))]
 pub(crate) fn open_on_shared_device(
     codec: &str,
     extradata: &[u8],
@@ -240,7 +242,14 @@ pub(crate) fn open_on_shared_device(
     yuv: Option<Yuv>,
 ) -> Option<(Decoder, Option<OnDevice>)> {
     use ffrwd_wasm_runtime::gpu;
+    #[cfg(windows)]
     const DEVICE: &str = "d3d12va";
+    #[cfg(windows)]
+    const API: &str = "D3D12";
+    #[cfg(target_os = "macos")]
+    const DEVICE: &str = "videotoolbox";
+    #[cfg(target_os = "macos")]
+    const API: &str = "Metal";
     let allowed = match hw {
         Hw::Auto => true,
         Hw::Device(named) => named == DEVICE,
@@ -265,9 +274,13 @@ pub(crate) fn open_on_shared_device(
         );
         return None;
     }
-    let Some(device) = gpu::d3d12::av_device() else {
+    #[cfg(windows)]
+    let device = gpu::d3d12::av_device();
+    #[cfg(target_os = "macos")]
+    let device = gpu::metal::av_device();
+    let Some(device) = device else {
         eprintln!(
-            "[gpu] decode {codec}: the process's device is not a D3D12 one, so {DEVICE} \
+            "[gpu] decode {codec}: the process's device is not a {API} one, so {DEVICE} \
              cannot share it"
         );
         return None;
@@ -284,7 +297,7 @@ pub(crate) fn open_on_shared_device(
     }
 }
 
-#[cfg(not(all(feature = "gpu", windows)))]
+#[cfg(not(all(feature = "gpu", any(windows, target_os = "macos"))))]
 pub(crate) fn open_on_shared_device(
     _codec: &str,
     _extradata: &[u8],

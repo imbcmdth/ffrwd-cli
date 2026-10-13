@@ -163,8 +163,8 @@ macOS: videotoolbox), skipping a device type the build does not have, and
 falls back to software. The frames come back to host memory, with one
 exception: when the node reading them holds its frames on the GPU
 (`NODE-SHAPE.md`) and the device is the sidecar's own, `d3d12va` on
-Windows, the decoder writes straight into the sidecar's frame pool and
-nothing comes back. A coded port feed into an input held on the GPU is
+Windows or `videotoolbox` on macOS, the decoder writes straight into the
+sidecar's frame pool and nothing comes back. A coded port feed into an input held on the GPU is
 decoded the same way, where the device allows. One line on stderr says
 what engaged, and a second says whether the decoder's own images were
 taken as they are or copied once on the device:
@@ -173,6 +173,15 @@ taken as they are or copied once on the device:
     [av] decode h264: software (d3d11va: no device)
     [av] decode h264: d3d12va, on the host's device
     [gpu] decode h264: d3d12va, frames wrapped
+    [av] decode h264: videotoolbox, on the host's device
+    [gpu] decode h264: videotoolbox, frames wrapped
+
+On macOS VideoToolbox writes each picture into an IOSurface, and CoreVideo's
+texture cache makes its two planes Metal textures over that surface, so a
+picture is always wrapped. A picture is kept until the device has run
+everything queued while it was read, then handed back. VideoToolbox in the
+bundled libav decodes h264, hevc and prores, and refuses a picture as small
+as 64x48, which then decodes in software.
 
 That holds for `format=yuv420p` and `format=rgba`. The decoder writes
 NV12 either way; a reader of yuv420p is handed its planes split on the

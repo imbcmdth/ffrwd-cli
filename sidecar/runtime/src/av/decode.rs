@@ -53,6 +53,10 @@ impl Hw {
 pub enum Shared {
     /// An `ID3D12Device`, which becomes the `d3d12va` device.
     D3d12(ComDevice),
+    /// A `videotoolbox` device. VideoToolbox takes no device of the
+    /// caller's: it writes IOSurface-backed pictures, which any Metal device
+    /// on the machine reads.
+    VideoToolbox,
 }
 
 impl Shared {
@@ -60,6 +64,7 @@ impl Shared {
     pub fn device_type(&self) -> &'static str {
         match self {
             Shared::D3d12(_) => "d3d12va",
+            Shared::VideoToolbox => "videotoolbox",
         }
     }
 
@@ -67,6 +72,7 @@ impl Shared {
     pub fn share(&self) -> Shared {
         match self {
             Shared::D3d12(device) => Shared::D3d12(device.share()),
+            Shared::VideoToolbox => Shared::VideoToolbox,
         }
     }
 }
@@ -154,6 +160,12 @@ impl DeviceFrame {
                 sync_value: p.sync_ctx.sync_value,
             })
         }
+    }
+
+    /// The picture's `CVPixelBufferRef`, valid while it is; None for a
+    /// picture of another device.
+    pub fn cv_pixel_buffer(&self) -> Option<*mut c_void> {
+        self.frame.videotoolbox()
     }
 
     /// Says the reader signals the picture's sync object with `value` once
@@ -473,6 +485,7 @@ impl Decoder {
             Shared::D3d12(raw) => ctx
                 .attach_d3d12_device(device_type, raw.into_raw())
                 .map_err(|e| refused(format!("the host's device: {}", e.why)))?,
+            Shared::VideoToolbox => ctx.attach_device(device_type).map_err(|e| refused(e.why))?,
         }
         ctx.set_option("threads", "auto")
             .map_err(|e| refused(e.why))?;
@@ -599,12 +612,15 @@ impl Decoder {
     }
 
     /// The format a picture just received stays on the device in, where
-    /// it does: an `nv12` D3D12 picture, wanted as one of [`ON_DEVICE`].
+    /// it does: an `nv12` D3D12 or VideoToolbox picture, wanted as one of
+    /// [`ON_DEVICE`].
     fn held_as(&self) -> Option<&'static str> {
         if !self.shared || !ON_DEVICE.contains(&self.want) {
             return None;
         }
-        self.frame.d3d12()?;
+        if self.frame.d3d12().is_none() && self.frame.videotoolbox().is_none() {
+            return None;
+        }
         let nv12 = self.lib.pix_fmt("nv12")?;
         (self.frame.sw_format()? == nv12).then_some("nv12")
     }

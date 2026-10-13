@@ -120,6 +120,17 @@ pub(super) struct Taken {
     pub why: Option<String>,
 }
 
+impl Taken {
+    /// What the line on stderr says of how pictures are taken.
+    pub(super) fn how(&self) -> String {
+        match (self.path, &self.why) {
+            (Path::Wrapped, _) => "frames wrapped".to_string(),
+            (Path::Copied, Some(why)) => format!("frames copied ({why})"),
+            (Path::Copied, None) => "frames copied".to_string(),
+        }
+    }
+}
+
 /// One decoder's way of taking its pictures: whether wrapping still
 /// works, and the command lists copies are recorded into.
 pub struct Taker {

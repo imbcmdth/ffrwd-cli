@@ -437,6 +437,14 @@ impl Encoder {
         if let (Some((device_type, nv12)), Some(device)) = (on_device, device) {
             let raw = match device {
                 Some(Shared::D3d12(raw)) => raw.into_raw(),
+                Some(Shared::VideoToolbox) => {
+                    return Err(Error::Call {
+                        call: "av_hwframe_ctx_init",
+                        codec: name.clone(),
+                        why: "it reads D3D12 pictures, and the device is a VideoToolbox one"
+                            .to_string(),
+                    })
+                }
                 None => std::ptr::null_mut(),
             };
             ctx.attach_d3d12_frames(device_type, raw, nv12, w, h)

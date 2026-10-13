@@ -1584,7 +1584,7 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
   copy -color_range:0 tv -colorspace:0 bt709 boxed.mp4
 ```
 
-With `memory => 'host'` the same module holds nothing on the GPU, and its region takes raw frames on both pipes unless the declaration says `SET ffrwd.edges = 'coded'`. The region's `decode` is told `hw=auto`: where the machine's decoder and the device share one (D3D12 on Windows) the decoder's frames land on the device directly; elsewhere the decoded picture reaches it through the sidecar's own upload at the module's input and comes back through one download at the output, which the `upload` and `download` rows of `--profile` count.
+With `memory => 'host'` the same module holds nothing on the GPU, and its region takes raw frames on both pipes unless the declaration says `SET ffrwd.edges = 'coded'`. The region's `decode` is told `hw=auto`: where the machine's decoder and the device share one (D3D12 on Windows, Metal on macOS) the decoder's frames land on the device directly; elsewhere the decoded picture reaches it through the sidecar's own upload at the module's input and comes back through one download at the output, which the `upload` and `download` rows of `--profile` count.
 
 ## 158. Scale on the device, inside the region
 
@@ -1909,3 +1909,36 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
 ```
 
 The first three frames write no row. With `memory => 'gpu'` each frame's tensor is made on the device. Where the model's session binds the device's memory in place, CUDA or DirectML on the sidecar's device, the slots are copied together on the device and the joined tensor is bound the same way, so nothing is read back. Elsewhere each frame's tensor is read back once, when it is made, and the slots are joined in host memory. `sidecar/NN-EDGE.md`, "Tensors of several ticks", has the rules.
+
+## 165. Decode onto the GPU on a Mac
+
+On macOS the sidecar's device is Metal, and a region's `decode` with `hw=auto` runs VideoToolbox. Where the pictures are read by an input held on the GPU, VideoToolbox's own pictures become the module's textures: the two planes of each IOSurface it wrote are handed to the device as they are, and nothing is copied or uploaded. `gpu_box` draws on them there. `libx264` is not an encoder the sidecar hosts, so the exit is raw and each picture is read back once on its way out:
+
+```pgsql
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT gpu_box(f.video[1])
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'boxed.mp4' WITH (video_codec 'libx264', crf 20)
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
+  -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];'\
+'[v=decode0]gpu_box=memory=gpu:size=8[out=out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
+  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
+  libx264 -crf:0 20 boxed.mp4
+```
+
+The command is the same on every machine; what `hw=auto` opens is decided where it runs. VideoToolbox in the bundled libav decodes h264, hevc and prores. Another codec, or a picture smaller than VideoToolbox decodes (64x48 is refused, 96x64 is not), is decoded in software, stderr says so, and the reader uploads the picture.

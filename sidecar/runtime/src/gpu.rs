@@ -30,6 +30,8 @@ mod convert;
 pub mod d3d12;
 #[cfg(feature = "gpu")]
 pub mod frames;
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+pub mod metal;
 #[cfg(feature = "gpu")]
 pub mod output;
 #[cfg(feature = "gpu")]

@@ -2430,3 +2430,37 @@ code this work did not touch: no SRT (5 tests), the HLS and DASH ladders
 refused at compile time (11), no `subtitles`, `drawtext` or `frei0r`
 (recipes 11, 58 and 62), channelsplit and the centred overlay, and one plan
 whose consumer never opens its input. 495 pass.
+
+### Decoding into the pool
+
+`decode` with `hw=auto` or `hw=videotoolbox`, read by an input held on the
+GPU, opens VideoToolbox on the process's device
+(`av::Shared::VideoToolbox`; VideoToolbox takes no device of the caller's).
+Its pictures are IOSurface-backed `CVPixelBuffer`s, `420v` or `420f`;
+`gpu/metal.rs` makes each plane a Metal texture over the surface through
+CoreVideo's texture cache, R8 for luma and RG8 for chroma, and hands both
+to wgpu as textures of the shared device. Nothing is copied. A picture is
+kept after its frame drops until the queue has run everything queued by
+then (`queue_on_submitted_work_done`), so the decoder's pool does not
+rewrite a surface a pass still reads. A coded port feed into an input held
+on the GPU decodes the same way. Recipe 165.
+
+Measured: gpu_box over testsrc into libx264 uploads nothing where it
+uploaded every frame before (18.4 MB for 60 frames of 320x240 rgba); the
+one readback left is the picture leaving for libx264. The picture matches
+ffmpeg's interpolating conversion as the software path matches ffmpeg's
+plain one (41 dB each, the box in both). A yuv420p reader gets the software
+decode byte for byte. VideoToolbox refuses the 64x48 fixture (libavcodec
+falls back to software and says so), so the macOS tests read a 96x64 one.
+
+The two feed tests paced their programme from the spawn. On this machine
+the sidecar's feed port comes up 2.4 s after the spawn, once the device is
+open and the module compiled, so 60 of the programme's 75 frames were
+already queued when the feeder connected, and the run ended before
+VideoToolbox's first picture. Both tests now write the programme's first
+frame at once and pace the rest from when the port is up, with the same
+bounds, and the coded one runs on macOS with VideoToolbox. Timed from the
+spawn: the port is up at 2.39 s, the feeder connects at 2.50 s,
+VideoToolbox hands back its first picture at 3.04 s (0.53 s after it was
+opened, its session's start and the fixture's B-frames), and that picture
+lands on the programme's 16th frame.

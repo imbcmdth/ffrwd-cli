@@ -45,6 +45,10 @@ use wgpu_core::id::TextureId;
 use wgpu_types::{Extent3d, TextureAspect, TextureFormat};
 
 use super::convert;
+#[cfg(windows)]
+use super::d3d12 as platform;
+#[cfg(target_os = "macos")]
+use super::metal as platform;
 use super::tensor::{DeviceTensor, Rect, Source, TensorSpec};
 use super::{shared, shared_device};
 use crate::av::DeviceFrame;
@@ -105,8 +109,8 @@ pub struct GpuFrame {
     /// from, or what reading it back gave.
     bytes: OnceLock<Arc<Vec<u8>>>,
     /// The decoder's own texture, where the frame is it.
-    #[cfg(windows)]
-    wrapped: Mutex<Option<super::d3d12::Wrapped>>,
+    #[cfg(any(windows, target_os = "macos"))]
+    wrapped: Mutex<Option<platform::Wrapped>>,
 }
 
 /// A tensor made of a frame: its spec, its crops, whether its buffer is on
@@ -166,7 +170,7 @@ impl GpuFrame {
             converted: Mutex::new(Vec::new()),
             tensors: Mutex::new(Vec::new()),
             bytes: OnceLock::new(),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             wrapped: Mutex::new(None),
         }
     }
@@ -599,7 +603,7 @@ impl Drop for GpuFrame {
         for texture in &self.owned {
             self.global.texture_drop(*texture);
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         if let Some(wrapped) = self
             .wrapped
             .lock()
@@ -618,8 +622,8 @@ pub struct DecodedPictures {
     /// What the line on stderr names: `decode h264: d3d12va`.
     who: String,
     said: Option<String>,
-    #[cfg(windows)]
-    taker: super::d3d12::Taker,
+    #[cfg(any(windows, target_os = "macos"))]
+    taker: platform::Taker,
 }
 
 impl DecodedPictures {
@@ -629,7 +633,7 @@ impl DecodedPictures {
         DecodedPictures {
             who: format!("decode {codec}: {device_type}"),
             said: None,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             taker: Default::default(),
         }
     }
@@ -642,7 +646,9 @@ impl DecodedPictures {
             who: format!("filter {filters}: {device_type}"),
             said: None,
             #[cfg(windows)]
-            taker: super::d3d12::Taker::for_filter(),
+            taker: platform::Taker::for_filter(),
+            #[cfg(target_os = "macos")]
+            taker: Default::default(),
         }
     }
 
@@ -674,7 +680,7 @@ impl DecodedPictures {
         self.take(picture, held, wire, yuv)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn take(
         &mut self,
         picture: DeviceFrame,
@@ -685,11 +691,7 @@ impl DecodedPictures {
         let (global, device) = device()?;
         let (width, height) = (picture.width, picture.height);
         let taken = self.taker.take(&global, &device, picture)?;
-        let how = match (taken.path, &taken.why) {
-            (super::d3d12::Path::Wrapped, _) => "frames wrapped".to_string(),
-            (super::d3d12::Path::Copied, Some(why)) => format!("frames copied ({why})"),
-            (super::d3d12::Path::Copied, None) => "frames copied".to_string(),
-        };
+        let how = taken.how();
         if self.said.as_deref() != Some(how.as_str()) {
             eprintln!("[gpu] {}, {how}", self.who);
             self.said = Some(how);
@@ -711,7 +713,7 @@ impl DecodedPictures {
         }))
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn take(
         &mut self,
         picture: DeviceFrame,
@@ -721,7 +723,7 @@ impl DecodedPictures {
     ) -> Result<Arc<GpuFrame>> {
         let _ = (&self.who, &self.said, picture);
         let _ = (held, wire, yuv);
-        bail!("a decoder's pictures are taken on the device on Windows only, so far")
+        bail!("a decoder's pictures are taken on the device on Windows and macOS only, so far")
     }
 }
 
