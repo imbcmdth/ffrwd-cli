@@ -3025,9 +3025,13 @@ def test_a_coded_node_region_decodes_into_its_port_and_encodes_its_output() -> N
     assert (entry.format.codec, leaving.format.codec) == (COPY_CODEC, COPY_CODEC)
     argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)
     sidecar = argv[region.id]
-    # The decoder reads the colour off the codec itself: the pad says only how
-    # far ahead of the source's clock the packets cross.
-    assert _pad_of(sidecar) == {"offset": CODED_CLOCK_OFFSET}
+    # The pad says the colour the source was probed in, which the decoded
+    # pictures carry, and how far ahead of the source's clock the packets
+    # cross.
+    assert _pad_of(sidecar) == {
+        "color": [{"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}],
+        "offset": CODED_CLOCK_OFFSET,
+    }
     # The encoder makes its YUV in the source's colour, and is told so.
     assert sidecar[sidecar.index("-filter_complex") + 1] == (
         "[0:v]decode=format=rgba[decode0];[v=decode0]compose[v=c0];"
@@ -3095,10 +3099,9 @@ def test_a_filtered_picture_beside_a_coded_one_stays_raw_with_its_colour() -> No
     assert isinstance(raw, VideoFormat)
     assert (raw.codec, raw.pix_fmt) == (RAWVIDEO, "yuv420p")
     sidecar = plan_argv(plan, sidecar_argv=wasm.shown_argv)[region.id]
-    # The coded picture's colour is the decoder's to read; the raw one's is the pad's.
-    assert _pad_of(sidecar) == {
-        "color": [None, {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}],
-        "offset": CODED_CLOCK_OFFSET,
-    }
+    # Each picture is told its own colour: the coded one the source's, which
+    # its decoded pictures carry, and the raw one what reached the pipe.
+    tv = {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}
+    assert _pad_of(sidecar) == {"color": [tv, tv], "offset": CODED_CLOCK_OFFSET}
     network = sidecar[sidecar.index("-filter_complex") + 1]
     assert network.startswith("[0:v]decode=format=rgba[decode0];[v=decode0][over=0:v:1]compose")

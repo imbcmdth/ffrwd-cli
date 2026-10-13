@@ -1349,8 +1349,8 @@ class SidecarProcess:
     listens: tuple[tuple[int, str, str], ...] = ()
     # The colour of each picture each ``-i`` of a node network carries, by
     # the ``-pad`` key and its position among the input's pictures, in ``-i``
-    # order: None for a picture no ffmpeg wrote raw, and empty for an input
-    # with none.
+    # order: None for a picture no ffmpeg wrote raw and the region does not
+    # decode, and empty for an input with none.
     colors: tuple[tuple[tuple[tuple[str, str], ...] | None, ...], ...] = ()
     # The tags the query wrote on what each ``-i`` of a node network carries,
     # in ``-i`` order: empty for an input it wrote none on.
@@ -6677,24 +6677,31 @@ class _Partitioner:
         NUT writes none, so each raw picture an ffmpeg writes is told its own:
         what the probe and the filters on the way say
         (:func:`stream_colorimetry`), and full-range RGB where the edge
-        converts it to an RGB format. A field nothing settles is "unknown".
+        converts it to an RGB format. A coded picture the region decodes is
+        told the source's, which its `decode` hands its pictures. A field
+        nothing settles is "unknown".
         """
         sidecars = {sidecar.id for sidecar in self.sidecars}
         modules = {name for name, external in self.external.items() if external}
         found: dict[str, list[tuple[tuple[str, str], ...] | None]] = {}
         for edge in incoming:
             wire = edge.format
+            decoded = edge.ref in self.decodes.get(edge.target, {})
             if (
                 edge.ref not in read_as
                 or edge.source in sidecars
                 or not isinstance(wire, VideoFormat)
-                or wire.codec != RAWVIDEO
+                or (wire.codec != RAWVIDEO and not decoded)
             ):
                 continue
             said = stream_colorimetry(
-                self.g, edge.ref, self._origin_meta, wire.pix_fmt, opaque=modules
+                self.g,
+                edge.ref,
+                self._origin_meta,
+                None if decoded else wire.pix_fmt,
+                opaque=modules,
             )
-            if wire.pix_fmt.startswith(RGB_PREFIXES):
+            if not decoded and wire.pix_fmt.startswith(RGB_PREFIXES):
                 said.update(_RGB_WIRE_COLOR)
             alias, _, index = src_parts(read_as[edge.ref])
             colours = found.setdefault(alias, [])

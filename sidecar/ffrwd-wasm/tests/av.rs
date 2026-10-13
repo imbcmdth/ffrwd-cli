@@ -546,6 +546,8 @@ fn built_modules() {
                 "invert",
                 "-p",
                 "shape-switch",
+                "-p",
+                "colour-probe",
             ])
             .current_dir(sidecar_root().join("modules"))
             .output()
@@ -788,6 +790,55 @@ fn decode_keeps_the_sources_times_and_drops_what_its_edit_list_hides() {
             theirs.time_base
         );
         assert!(data == bytes, "the picture at pts {pts} is ffmpeg's");
+    }
+}
+
+#[test]
+fn decode_hands_its_pictures_the_colour_the_pad_gives_the_stream() {
+    let test = "decode_hands_its_pictures_the_colour_the_pad_gives_the_stream";
+    let Some(dir) = runtime_dir() else {
+        announce_skip(test);
+        return;
+    };
+    // The fixture's header and bitstream say nothing of its colour.
+    let rows = scratch("decoded_colour.ndjson");
+    let output = sidecar(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            fixture().to_str().expect("UTF-8"),
+            "-pad",
+            r#"{"color": [{"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}]}"#,
+            "-m",
+            &module("colour_probe"),
+            "-filter_complex",
+            "[0:v]decode=format=yuv420p[d];[v=d]colour_probe=pix_fmt=yuv420p[colour=out0]",
+            "-map",
+            "[out0]",
+            "-f",
+            "ndjson",
+            rows.to_str().expect("UTF-8"),
+        ],
+        Some(&dir),
+    );
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let text = std::fs::read_to_string(&rows).expect("read the rows");
+    let _ = std::fs::remove_file(&rows);
+    let told: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON row"))
+        .collect();
+    assert!(!told.is_empty(), "a row a picture");
+    for row in &told {
+        for (key, said) in [
+            ("range", "tv"),
+            ("primaries", "bt709"),
+            ("trc", "bt709"),
+            ("space", "bt709"),
+        ] {
+            assert_eq!(row[key], said, "{key} of the picture at pts {}", row["pts"]);
+        }
     }
 }
 

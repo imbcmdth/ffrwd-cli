@@ -2035,12 +2035,13 @@ def _argv(
     SINK pad carrying rendition metadata (:attr:`SidecarProcess.pads`) gets a
     ``-pad '<json>'`` right after its own ``-i``, ``{"row": ..., "rendition":
     {...}}`` with absent attributes omitted -- a pad with none gets no flag.
-    A node network's input carrying a raw picture gets the ``"color"`` of
-    each of its pictures there too, by position, null for one it says nothing
-    of (:attr:`SidecarProcess.colors`), since NUT writes none, and the
-    ``"geometry"`` of each picture crossing smaller than it is
-    (:attr:`SidecarProcess.geometries`), and the ``"offset"`` in seconds its
-    clock runs ahead of its source's (:attr:`SidecarProcess.offsets`).
+    A node network's input carrying a raw picture, or a coded one the region
+    decodes, gets the ``"color"`` of each of its pictures there too, by
+    position, null for one it says nothing of (:attr:`SidecarProcess.colors`),
+    since NUT writes none, and the ``"geometry"`` of each picture crossing
+    smaller than it is (:attr:`SidecarProcess.geometries`), and the
+    ``"offset"`` in seconds its clock runs ahead of its source's
+    (:attr:`SidecarProcess.offsets`).
 
     `writes` is the mirror on the other side: one path per rows document the
     process writes, in document order, since a process writing several of

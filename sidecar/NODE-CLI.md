@@ -32,11 +32,12 @@ one a packets port, a data stream a data port.
 
     -pad '{"color": [{"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}], "tags": {"smart_timed": "1"}}'
 
-after an `-i` says what its NUT does not carry: the colour of each raw
-picture, in ffmpeg's names, by position among its video streams as
-`geometry` is (null says nothing of that picture, and one object is the
-first picture's), and tags for its streams beside their own, which reach a
-node in `stream-info.tags` (a hold input anchored `tagged` reads them). One
+after an `-i` says what its NUT does not carry: the colour of each
+picture, raw or coded, in ffmpeg's names, by position among its video
+streams as `geometry` is (null says nothing of that picture, and one
+object is the first picture's), and tags for its streams beside their
+own, which reach a node in `stream-info.tags` (a hold input anchored
+`tagged` reads them). One
 input carrying a picture twice, as rgba and as yuv420p, gives each its own
 colour.
 
@@ -151,8 +152,9 @@ turns a coded picture into frames in the format named (`rgba`, `yuv420p`,
 `yuv422p`, `yuv444p` or `gray`), with `hw=<device>` choosing a hardware
 decoder (`none`, `auto`, or a device type; `none` without it); its codec
 and extradata come from the input's NUT header, and its frames carry the
-range and matrix that header declares, which is all NUT carries of a
-stream's colour. `[n1]encode=codec=h264_nvenc:b=6M[out0]` turns frames
+colour `-pad` gives the coded picture, else the range and matrix that
+header declares, which is all NUT carries of a stream's colour.
+`[n1]encode=codec=h264_nvenc:b=6M[out0]` turns frames
 into that codec's packets; every option beside `codec` is handed to the
 encoder under the name ffmpeg's command line uses (`b`, `g`, `crf`,
 `preset`, `profile`, `level`, `maxrate`, `bufsize`, `keyint_min`, `tune`,

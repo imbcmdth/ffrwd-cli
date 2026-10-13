@@ -1572,9 +1572,10 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
   -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"offset": 1001}' -gpu ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm \
-  -m gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm \
-  -filter_complex \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
   '[0:v]decode=format=rgba:hw=auto[decode0];'\
 '[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
 '[n1]encode=codec=h264_nvenc:b=6M:color_range=tv:colorspace=bt709[out0]' -bound \
@@ -1605,9 +1606,10 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
   -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"offset": 1001}' -gpu ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm \
-  -m gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm \
-  -filter_complex \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
   '[0:v]decode=format=rgba:hw=auto[decode0];'\
 '[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
 '[n1]filter=graph=scale_d3d12\\=w\\=160\\:h\\=120:format=yuv420p[n2];'\
@@ -1718,9 +1720,14 @@ $ ffrwd compile -f query.sql -v programme=tests/fixtures/testsrc.mp4 -v left=tes
 4. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts \
   disabled -output_ts_offset 1001 -f nut '<named pipe ffmpeg3-sidecar0 src:b:v:0 write>'
 5. sidecar: ffrwd-wasm -f nut -i '<named pipe ffmpeg1-sidecar0 src:p:v:0 read>' -pad \
-  '{"offset": 1001}' -f nut -i '<named pipe ffmpeg2-sidecar0 src:a:v:0 read>' -pad \
-  '{"offset": 1001}' -f nut -i '<named pipe ffmpeg3-sidecar0 src:b:v:0 read>' -pad \
-  '{"offset": 1001}' -nn \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -f nut -i \
+  '<named pipe ffmpeg2-sidecar0 src:a:v:0 read>' -pad \
+  '{"color": [{"range": "tv", "primaries": "unknown", "trc": "unknown",'\
+' "space": "bt470bg"}], "offset": 1001}' -f nut -i \
+  '<named pipe ffmpeg3-sidecar0 src:b:v:0 read>' -pad \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -nn \
   depth=../sidecar/modules/target/wasm32-wasip2/release/depth.onnx -gpu \
   ../../ffrwd-package-blitz/target/wasm32-wasip2/release/compose.wasm -gpu \
   ../sidecar/modules/target/wasm32-wasip2/release/depth_gpu.wasm -m \
@@ -1774,8 +1781,10 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
   -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"offset": 1001}' -gpu ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm \
-  -m gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
   packet_stats=../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm \
   -filter_complex \
   '[0:v]decode=format=rgba:hw=auto[decode0];'\
@@ -1850,7 +1859,8 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
   -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"offset": 1001}' -nn \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -nn \
   nn_frames=../sidecar/modules/target/wasm32-wasip2/release/nn_frames.onnx -gpu \
   ../sidecar/modules/target/wasm32-wasip2/release/nn_frames.wasm -m \
   nn_frames=../sidecar/modules/target/wasm32-wasip2/release/nn_frames.wasm \
@@ -1886,7 +1896,8 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
   -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"offset": 1001}' -nn \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -nn \
   nn_frames=../sidecar/modules/target/wasm32-wasip2/release/nn_frames.onnx -gpu \
   ../sidecar/modules/target/wasm32-wasip2/release/nn_frames.wasm -m \
   nn_frames=../sidecar/modules/target/wasm32-wasip2/release/nn_frames.wasm \

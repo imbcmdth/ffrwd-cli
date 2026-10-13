@@ -25,6 +25,11 @@ list starts on a picture before zero. `decode` drops every picture before
 zero, as ffmpeg's own decode drops what an edit list hides, so the region's
 pictures carry the times ffmpeg's decode of the input gives.
 
+The NUT the copying ffmpeg writes carries none of the input's colour, so
+the same `-pad` says the colour the input was probed in (`"color"`,
+"unknown" in a field the probe leaves unsaid), and `decode`'s pictures
+carry it to every reader, in host memory or on the GPU.
+
 `encode` takes `color_range`, `color_primaries`, `color_trc` and
 `colorspace`, by ffmpeg's names, as the colour it makes its pictures in and
 tags them with: an rgba input is made YUV in that matrix and range. The

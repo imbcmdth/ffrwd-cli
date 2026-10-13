@@ -204,10 +204,20 @@ fn pad_color(c: &crate::PadColor) -> Result<runtime::ColorInfo> {
 }
 
 /// `def` with the colour `-pad` gives its picture, which the wire does not
-/// carry.
+/// carry: a raw picture's own, or a coded one's, which `decode` hands its
+/// pictures.
 fn coloured(mut def: StreamDef, color: Option<&crate::PadColor>) -> Result<StreamDef> {
-    if let (Some(c), StreamFormat::Video(video)) = (color, &mut def.format) {
-        video.color = Some(pad_color(c)?);
+    let Some(c) = color else {
+        return Ok(def);
+    };
+    match &mut def.format {
+        StreamFormat::Video(video) => video.color = Some(pad_color(c)?),
+        StreamFormat::Packets(coded) => {
+            if let runtime::CodedFormat::Video { color, .. } = &mut coded.format {
+                *color = Some(pad_color(c)?);
+            }
+        }
+        StreamFormat::Audio(_) | StreamFormat::Data(_) => {}
     }
     Ok(def)
 }
@@ -520,13 +530,13 @@ fn open(
             match input_stream(args, input, index, stream) {
                 Ok(def) => {
                     let class = classes.entry(class_of(&def.format)).or_default();
-                    // What `-pad` says of this picture, by its position among
-                    // the input's pictures.
+                    // What `-pad` says of this picture, raw or coded, by its
+                    // position among the input's pictures.
                     let pad = args
                         .pads
                         .get(input)
                         .and_then(Option::as_ref)
-                        .filter(|_| matches!(def.format, StreamFormat::Video(_)));
+                        .filter(|_| class_of(&def.format) == StreamClass::Video);
                     let geometry =
                         pad.and_then(|pad| pad.geometry.get(class.len()).copied().flatten());
                     let color = pad
