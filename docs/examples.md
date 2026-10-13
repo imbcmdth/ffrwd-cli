@@ -2093,3 +2093,44 @@ $ ffrwd compile -f query.sql
 ```
 
 The ffmpeg in front of the region copies the packets, `-c:0 copy`, and the region's `decode` is told `hw=auto`, as in recipe 157. An input that one process opens for all its readers, as a live input is, is copied onto the region's pipe from the input itself, and the split in that process feeds only its other readers. A region holding nothing on the GPU, and not declared with `SET ffrwd.edges = 'coded'`, takes its leg raw.
+
+## 170. Encode with a codec package's GPU build
+
+ffrwd/pyrowave builds its codec twice: `pyrowave.wasm` reads and writes bytes, and `pyrowave_gpu.wasm` also takes and hands back its pictures as textures of the sidecar's device. `gpu_box` holds its pictures on the GPU, so the encoder runs in its region, and the sidecar makes each picture yuv420p on the device and hands the encoder its three planes as textures. Only the packets leave the device. The package is declared from a checkout of ffrwd-package-pyrowave beside this one, as recipe 160 declares blitz:
+
+```pgsql
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+CREATE FUNCTION pyrowave(bitrate number DEFAULT 200000000, bytes_per_frame number DEFAULT NULL)
+  RETURNS encoder
+  AS '../../ffrwd-package-pyrowave/modules/pyrowave_gpu.wasm', 'encode' LANGUAGE wasm;
+
+COPY (
+  SELECT gpu_box(f.video[1])
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'boxed.nut' WITH (video_codec pyrowave(bytes_per_frame => 125000))
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
+  -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -gpu \
+  ../../ffrwd-package-pyrowave/modules/pyrowave_gpu.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  pyrowave_gpu=../../ffrwd-package-pyrowave/modules/pyrowave_gpu.wasm -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];'\
+'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
+'[n1]pyrowave_gpu=bitrate=200000000:bytes_per_frame=125000[out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -pads \
+  'pyrowave_gpu=[{"pix_fmt": "yuv420p"}]' -map '[out0]' -f nut pipe:1 | ffmpeg -f nut \
+  -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 copy \
+  -chroma_sample_location:0 left boxed.nut
+```
+
+`-pads` tells the encoder the format its pictures are made in on the device. Declared from `pyrowave.wasm`, the command differs only in the module, whose encoder is handed bytes, so each picture is read back once on its way in; `ffrwd run --profile` counts that under `download`. The decoder works the same way: `input('enc.nut', decoder => ffrwd.pyrowave.decode_gpu())`, read by a module holding its pictures on the GPU, decodes into textures in that module's region. Since both builds read `PYRW`, a stream whose decoder is not named is decoded by `decode`, the bytes build.

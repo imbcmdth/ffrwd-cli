@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,17 @@ def test_a_codec_modules_describe_is_read() -> None:
     )
     assert described.encoder == wasm.EncoderInfo(codec="pyrowave", fourcc="PYRW")
     assert described.decoder == wasm.DecoderInfo(fourccs=("PYRW",))
+    on_gpu = wasm._described(
+        "m_gpu.wasm",
+        {
+            "world": "ffrwd:av@0.18.0",
+            "name": "pyrowave",
+            "encoder": {"codec": "pyrowave", "fourcc": "PYRW", "textures": True},
+            "decoder": {"fourccs": ["PYRW"], "textures": True},
+        },
+    )
+    assert on_gpu.encoder is not None and on_gpu.encoder.textures
+    assert on_gpu.decoder is not None and on_gpu.decoder.textures
     assert wasm.hosts_codec(described.world)
     assert not wasm.hosts_codec("ffrwd:av@0.17.0")
     plain = wasm._described("m.wasm", {"world": "ffrwd:av@0.18.0", "name": "p"})
@@ -578,6 +590,35 @@ def test_a_named_decoder_that_does_not_read_the_tag_is_refused() -> None:
             describes={CODEC: other},
         )
     assert "names the decoder 'dec', which does not read its video, FTST" in caught.value.message
+
+
+def test_a_tag_read_by_a_codecs_two_builds_is_decoded_by_the_host_build_unasked() -> None:
+    """A codec's build on ffrwd:gpu, whose decoder hands its pictures back as
+    textures, reads the tag its host build reads: a stream is decoded by the
+    host build unasked, and by the GPU build where the input names it."""
+    host = _codec()
+    assert host.decoder is not None
+    on_gpu = replace(host, decoder=replace(host.decoder, textures=True))
+    query = (
+        _DECODER
+        + "CREATE FUNCTION dec_gpu() RETURNS decoder AS 'codec_gpu.wasm', 'decode' "
+        "LANGUAGE wasm;\n"
+        "COPY (SELECT scale(f.video[1], 32, 24) FROM input('coded.nut'{}) f) "
+        "TO 'out.nut' WITH (video_codec 'ffv1')"
+    )
+
+    def decoded_by(option: str) -> str:
+        graph = lower(
+            resolve(parse(query.format(option))),
+            _coded(),
+            registry=_registry(),
+            describes={CODEC: host, "codec_gpu.wasm": on_gpu},
+        )
+        (decoder,) = graph.decoders
+        return graph.nodes[decoder].filter
+
+    assert decoded_by("") == CODEC
+    assert decoded_by(", decoder => dec_gpu()") == "codec_gpu.wasm"
 
 
 def test_a_decoder_is_a_sidecar_reading_the_copied_stream() -> None:

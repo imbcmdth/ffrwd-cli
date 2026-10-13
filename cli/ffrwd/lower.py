@@ -4793,7 +4793,12 @@ class _Lowerer:
         return found
 
     def _decoders_by_tag(self) -> dict[str, list[WasmFunction]]:
-        """Every declared decoder, keyed by each tag its module reads."""
+        """Every declared decoder, keyed by each tag its module reads.
+
+        A codec's build on ``ffrwd:gpu`` (its decoder hands back textures)
+        is left out of a tag its host build reads too, a module of the same
+        name: a stream is decoded unasked by the host build, and by the
+        GPU build where the input names it."""
         found: dict[str, list[WasmFunction]] = {}
         for declared in self.res.wasm.values():
             if not declared.is_decoder:
@@ -4805,7 +4810,24 @@ class _Lowerer:
                 listed = found.setdefault(tag, [])
                 if all(one.module != declared.module for one in listed):
                     listed.append(declared)
+        for tag, listed in found.items():
+            hosts = {
+                self.describes[one.module].name
+                for one in listed
+                if not self._decodes_textures(one)
+            }
+            found[tag] = [
+                one
+                for one in listed
+                if not (self._decodes_textures(one) and self.describes[one.module].name in hosts)
+            ]
         return found
+
+    def _decodes_textures(self, declared: WasmFunction) -> bool:
+        """True for a decoder whose module hands its pictures back as
+        textures: a codec's build on ``ffrwd:gpu``."""
+        decoder = self.describes[declared.module].decoder
+        return decoder is not None and decoder.textures
 
     def _check_every_data_output_read(self) -> None:
         """Refuse a data filter output nothing reads.

@@ -446,7 +446,8 @@ class EncoderInfo:
     since ffmpeg knows no codec a package brings. `delay` is how many frames
     go in before the first packet leaves; `decode_delay` how deep its packets
     reorder; `frame_samples`, for audio, the samples every frame holds (0 is
-    any).
+    any). `textures` says it also takes its pictures as textures where they
+    are held on the GPU: a build on ``ffrwd:gpu``.
     """
 
     codec: str
@@ -459,6 +460,7 @@ class EncoderInfo:
     params_schema: Mapping[str, object] = field(default_factory=dict)
     pixel_formats: tuple[str, ...] = ()
     sample_formats: tuple[str, ...] = ()
+    textures: bool = False
 
     @property
     def kind(self) -> StreamType | None:
@@ -469,13 +471,15 @@ class EncoderInfo:
 @dataclass(frozen=True)
 class DecoderInfo:
     """What a codec package's decoder reads: the tags, its delay, its own
-    parameters and the frames it writes."""
+    parameters and the frames it writes. `textures` says it also hands its
+    pictures back as textures where its reader holds them on the GPU."""
 
     fourccs: tuple[str, ...]
     delay: int = 0
     params_schema: Mapping[str, object] = field(default_factory=dict)
     pixel_formats: tuple[str, ...] = ()
     sample_formats: tuple[str, ...] = ()
+    textures: bool = False
 
     @property
     def kind(self) -> StreamType | None:
@@ -901,6 +905,7 @@ def _encoder_info(value: object) -> EncoderInfo | None:
         params_schema=schema if isinstance(schema, dict) else {},
         pixel_formats=_strings(value.get("pixel_formats")),
         sample_formats=_strings(value.get("sample_formats")),
+        textures=value.get("textures") is True,
     )
 
 
@@ -915,6 +920,7 @@ def _decoder_info(value: object) -> DecoderInfo | None:
         params_schema=schema if isinstance(schema, dict) else {},
         pixel_formats=_strings(value.get("pixel_formats")),
         sample_formats=_strings(value.get("sample_formats")),
+        textures=value.get("textures") is True,
     )
 
 

@@ -2501,6 +2501,56 @@ def test_a_cut_coded_by_a_codec_package_puts_its_halves_either_side(
     assert _between(plan) == [(first.id, second.id, "copy")]
 
 
+def _with_codec_builds(path: str) -> Described:
+    """`_with_codec`, with codec_gpu.wasm the same codec built on ffrwd:gpu:
+    its halves take and hand back their pictures as textures."""
+    if path != "codec_gpu.wasm":
+        return _with_codec(path)
+    host = _with_codec("codec.wasm")
+    assert host.encoder is not None and host.decoder is not None
+    return replace(
+        host,
+        encoder=replace(host.encoder, textures=True),
+        decoder=replace(host.decoder, textures=True),
+    )
+
+
+def test_a_gpu_regions_coded_input_is_decoded_there_by_the_build_the_input_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A coded input read by a module holding its pictures on the GPU is
+    decoded in that module's region, told the format the pictures are made in
+    there: by the codec's host build unasked, though its build on ffrwd:gpu
+    reads the same tag, and by the GPU build where the input names it."""
+    coded = ProbeResult(
+        streams=[
+            StreamMeta(
+                type="video", index=0, metadata={}, width=64, height=48,
+                fps="10/1", sample_rate=None, codec="FTST",
+            )
+        ]
+    )  # fmt: skip
+    monkeypatch.setattr("ffrwd.compiler.probe_path", lambda path, args=(), **kw: coded)
+    declared = _DEC + (
+        "CREATE FUNCTION dec_gpu() RETURNS decoder AS 'codec_gpu.wasm', 'decode' LANGUAGE wasm;\n"
+    )
+    for option, module in (("", "codec"), (", decoder => dec_gpu()", "codec_gpu")):
+        compiled = compile_all(
+            _declared(
+                declared + f"COPY (SELECT box(c.video[1]) FROM input('c.nut'{option}) c) "
+                "TO 'out.mkv' WITH (video_codec 'ffv1')"
+            ),
+            describe=_with_codec_builds,
+            shape=_Asked(),
+            av_filters=lambda: None,
+        )
+        assert compiled.plan is not None
+        (region,) = compiled.plan.sidecars
+        assert _filters_of(region)[:2] == [module, "box"]
+        argv = _shown(compiled.plan)[region.id]
+        assert argv[argv.index("-pads") + 1] == f'{module}=[{{"pix_fmt": "rgba"}}]'
+
+
 def test_a_cut_parts_a_region_holding_a_source_and_a_sink(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
