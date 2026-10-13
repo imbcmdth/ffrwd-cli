@@ -1172,9 +1172,9 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
   pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
-  -m spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm -m \
-  ring=../sidecar/modules/target/wasm32-wasip2/release/ring.wasm -filter_complex \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -m spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm \
+  -m ring=../sidecar/modules/target/wasm32-wasip2/release/ring.wasm -filter_complex \
   '[v=0:v]spot=every=30[spots=n1];[v=0:v][spots=n1]ring[v=out0]' -bound \
   'spot=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
   'ring=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"spots",'\
@@ -1212,9 +1212,9 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
   pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
-  -m spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm -m \
-  dim=../sidecar/modules/target/wasm32-wasip2/release/dim.wasm -filter_complex \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -m spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm \
+  -m dim=../sidecar/modules/target/wasm32-wasip2/release/dim.wasm -filter_complex \
   '[v=0:v]spot=every=30[spots=n1];'\
 '[n1]rowfilter=pred={"ge"\\:\[{"field"\\:"w"}\,{"lit"\\:20}\]}[n2];'\
 '[v=0:v][boxes=n2]dim=amount=0.5[v=out0]' -bound \
@@ -1258,9 +1258,9 @@ $ ffrwd compile -f query.sql
 2. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -map 0:a:0 -map 0:v:0 -ar:0 48000 -c:0 \
   pcm_f32le -c:1 rawvideo -pix_fmt:1 rgba -f nut pipe:1
 3. sidecar: ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
-  -m hear=../sidecar/modules/target/wasm32-wasip2/release/hear.wasm -m \
-  burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -filter_complex \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -m hear=../sidecar/modules/target/wasm32-wasip2/release/hear.wasm \
+  -m burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -filter_complex \
   '[a=0:a]hear[cues=out1];[v=0:v][words=out1]burn[v=out0]' -bound \
   'hear=[{"input":"a","streams":[{"rate":{"num":48000,"den":1}}]}]' -bound \
   'burn=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"words",'\
@@ -1298,9 +1298,9 @@ $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/av.mp4 -filter_complex '[0:a:0]asplit=2[out0][out2]' -map \
   '[out0]' -map 0:v:0 -map '[out2]' -ar:0 48000 -c:0 pcm_f32le -c:2 pcm_f32le -c:1 \
   rawvideo -pix_fmt:1 rgba -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
-  -m hear=../sidecar/modules/target/wasm32-wasip2/release/hear.wasm -m \
-  burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -filter_complex \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -m hear=../sidecar/modules/target/wasm32-wasip2/release/hear.wasm \
+  -m burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -filter_complex \
   '[a=0:a]hear[cues=n1];[v=0:v][a=0:a:1][words=n1]burn[v=out0]' -bound \
   'hear=[{"input":"a","streams":[{"rate":{"num":48000,"den":1}}]}]' -bound \
   'burn=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"a",'\
@@ -1339,9 +1339,9 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -map 0:a:0 -c:0 rawvideo -pix_fmt:0 rgba -c:1 \
   pcm_f32le -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
-  -m burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm -m \
-  inset=../sidecar/modules/target/wasm32-wasip2/release/inset.wasm -filter_complex \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -m burn=../sidecar/modules/target/wasm32-wasip2/release/burn.wasm \
+  -m inset=../sidecar/modules/target/wasm32-wasip2/release/inset.wasm -filter_complex \
   '[v=0:v][a=0:a]burn[v=n1];[v=n1]inset=port=9100:lead=0.5[v=out0]' -bound \
   'burn=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"a",'\
 '"streams":[{"rate":{"num":44100,"den":1}}]}]' -bound \
@@ -1383,13 +1383,13 @@ $ ffrwd compile -f query.sql
 4. ffmpeg: ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba \
   -f nut '<named pipe ffmpeg3-sidecar0 src:c:v:0 write>'
 5. sidecar: ffrwd-wasm -f nut -i '<named pipe ffmpeg1-sidecar0 src:a:v:0 read>' -pad \
-  '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
-  -f nut -i '<named pipe ffmpeg2-sidecar0 src:b:v:0 read>' -pad \
-  '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
-  -f nut -i '<named pipe ffmpeg3-sidecar0 src:c:v:0 read>' -pad \
-  '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
-  -m tile=../sidecar/modules/target/wasm32-wasip2/release/tile.wasm -filter_complex \
-  '[v=0:v][v=1:v][v=2:v]tile=columns=3[v=out0]' -bound \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -f nut -i '<named pipe ffmpeg2-sidecar0 src:b:v:0 read>' -pad \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -f nut -i '<named pipe ffmpeg3-sidecar0 src:c:v:0 read>' -pad \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -m tile=../sidecar/modules/target/wasm32-wasip2/release/tile.wasm \
+  -filter_complex '[v=0:v][v=1:v][v=2:v]tile=columns=3[v=out0]' -bound \
   'tile=[{"input":"v","streams":[{"rate":{"num":15,"den":1}},{"rate":{"num":15,'\
 '"den":1}},{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut pipe:1
 # this listing is not a shell command -- run the plan with `ffrwd run`
@@ -1427,9 +1427,9 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
   pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
-  -m matte=../sidecar/modules/target/wasm32-wasip2/release/matte.wasm -m \
-  dim=../sidecar/modules/target/wasm32-wasip2/release/dim.wasm -filter_complex \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -m matte=../sidecar/modules/target/wasm32-wasip2/release/matte.wasm \
+  -m dim=../sidecar/modules/target/wasm32-wasip2/release/dim.wasm -filter_complex \
   '[v=0:v]matte=every=30[mask=out1][spots=n11];[v=0:v][boxes=n11]dim=amount=0.5[v=out0]' \
   -bound 'matte=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
   'dim=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"boxes",'\
@@ -1460,9 +1460,9 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
   pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"color": {"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}}' \
-  -m spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm -filter_complex \
-  '[v=0:v]spot=every=30[spots=n1];[n1]rowmerge=max_span=10[out0]' -bound \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -m spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm \
+  -filter_complex '[v=0:v]spot=every=30[spots=n1];[n1]rowmerge=max_span=10[out0]' -bound \
   'spot=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f ndjson \
   spots.ndjson
 ```
@@ -1648,8 +1648,8 @@ COPY (
 $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 yuv420p -f nut \
   pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
-  '{"color": {"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
-' "space": "unknown"}}' -nn \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}]}' -nn \
   segment=../sidecar/modules/target/wasm32-wasip2/release/segment.onnx -gpu \
   ../sidecar/modules/target/wasm32-wasip2/release/segment_gpu.wasm -m \
   segment_gpu=../sidecar/modules/target/wasm32-wasip2/release/segment_gpu.wasm -m \

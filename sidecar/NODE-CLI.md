@@ -30,11 +30,15 @@ stream specifiers do:
 `[N:v]` is `[N:v:0]`. A raw stream binds a video or audio port, a coded
 one a packets port, a data stream a data port.
 
-    -pad '{"color": {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}, "tags": {"smart_timed": "1"}}'
+    -pad '{"color": [{"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}], "tags": {"smart_timed": "1"}}'
 
-after an `-i` says what its NUT does not carry: a raw picture's colour, in
-ffmpeg's names, and tags for its streams beside their own, which reach a
-node in `stream-info.tags` (a hold input anchored `tagged` reads them).
+after an `-i` says what its NUT does not carry: the colour of each raw
+picture, in ffmpeg's names, by position among its video streams as
+`geometry` is (null says nothing of that picture, and one object is the
+first picture's), and tags for its streams beside their own, which reach a
+node in `stream-info.tags` (a hold input anchored `tagged` reads them). One
+input carrying a picture twice, as rgba and as yuv420p, gives each its own
+colour.
 
     -pad '{"geometry": [null, {"width": 1280, "height": 720}]}'
 
@@ -186,8 +190,8 @@ as when it rides alone:
 
 after `-filter_complex`, one per call of a packet sink or codec in the
 network, taken in turn as `-bound` is: a list with one object per pad of
-the call, each what `-pad` says of an `-i` (`row`, `rendition`, `color`),
-and `pix_fmt` for a codec's pad. A sink's pad reads a label rather than an
+the call, each what `-pad` says of an `-i` (`row`, `rendition`, `color`,
+the one object of its pad's one stream), and `pix_fmt` for a codec's pad. A sink's pad reads a label rather than an
 `-i`, so this is where its row and rendition come from:
 
     -pads 'publish=[{"row": 0, "rendition": {"name": "1080p"}}]'

@@ -1120,9 +1120,9 @@ def test_a_yuv_picture_into_a_node_network_carries_the_probed_colour(
 ) -> None:
     _taking_pictures(monkeypatch, "yuv420p")
     argv = _plan_argv(_RING, monkeypatch, colour=_BT709_PC)
-    assert _pad_after_input(argv["sidecar0"])["color"] == {
-        "range": "pc", "primaries": "bt709", "trc": "bt709", "space": "bt709"
-    }
+    assert _pad_after_input(argv["sidecar0"])["color"] == [
+        {"range": "pc", "primaries": "bt709", "trc": "bt709", "space": "bt709"}
+    ]
 
 
 def test_a_picture_the_probe_says_nothing_of_carries_unknown_colour(
@@ -1130,9 +1130,9 @@ def test_a_picture_the_probe_says_nothing_of_carries_unknown_colour(
 ) -> None:
     _taking_pictures(monkeypatch, "yuv420p")
     argv = _plan_argv(_RING, monkeypatch)
-    assert _pad_after_input(argv["sidecar0"])["color"] == {
-        "range": "unknown", "primaries": "unknown", "trc": "unknown", "space": "unknown"
-    }
+    assert _pad_after_input(argv["sidecar0"])["color"] == [
+        {"range": "unknown", "primaries": "unknown", "trc": "unknown", "space": "unknown"}
+    ]
 
 
 def test_a_picture_converted_to_rgb_on_its_way_carries_what_the_conversion_wrote(
@@ -1140,9 +1140,23 @@ def test_a_picture_converted_to_rgb_on_its_way_carries_what_the_conversion_wrote
 ) -> None:
     _taking_pictures(monkeypatch, "rgba")
     argv = _plan_argv(_RING, monkeypatch, colour=_BT709_PC)
-    assert _pad_after_input(argv["sidecar0"])["color"] == {
-        "range": "pc", "primaries": "bt709", "trc": "bt709", "space": "gbr"
-    }
+    assert _pad_after_input(argv["sidecar0"])["color"] == [
+        {"range": "pc", "primaries": "bt709", "trc": "bt709", "space": "gbr"}
+    ]
+
+
+def test_each_picture_of_one_input_is_told_the_colour_it_is_read_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "spot.wasm", _taking(_spot, "video", _YUV))
+    monkeypatch.setitem(SHAPES, "ring.wasm", _taking(_reader("spots", _ROWS), "video", _RGBA))
+    plan = _plan(_RING, monkeypatch, colour={**_BT709_PC, "color_range": "tv"})
+    assert _pad_after_input(_shown(plan)["sidecar0"])["color"] == [
+        {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"},
+        {"range": "pc", "primaries": "bt709", "trc": "bt709", "space": "gbr"},
+    ]
+    (sidecar,) = plan.sidecars
+    assert SidecarProcess.from_dict(sidecar.to_dict()).colors == sidecar.colors
 
 
 def test_the_tags_a_query_writes_on_a_stream_reach_the_node_reading_it(
@@ -1985,6 +1999,7 @@ _BOXES_MASK = (
 )
 _TIMING = {"wants": "timing", "pixel_formats": ["yuv420p"]}
 _RGBA = {"pixel_formats": ["rgba"]}
+_YUV = {"pixel_formats": ["yuv420p"]}
 
 
 def _with_boxes_mask(monkeypatch: pytest.MonkeyPatch) -> None:

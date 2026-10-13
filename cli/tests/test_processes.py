@@ -3034,8 +3034,9 @@ def test_a_filtered_picture_beside_a_coded_one_stays_raw_with_its_colour() -> No
     assert isinstance(raw, VideoFormat)
     assert (raw.codec, raw.pix_fmt) == (RAWVIDEO, "yuv420p")
     sidecar = plan_argv(plan, sidecar_argv=wasm.shown_argv)[region.id]
+    # The coded picture's colour is the decoder's to read; the raw one's is the pad's.
     assert _pad_of(sidecar) == {
-        "color": {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}
+        "color": [None, {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}]
     }
     network = sidecar[sidecar.index("-filter_complex") + 1]
     assert network.startswith("[0:v]decode=format=rgba[decode0];[v=decode0][over=0:v:1]compose")

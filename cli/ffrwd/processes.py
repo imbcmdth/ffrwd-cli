@@ -1323,10 +1323,11 @@ class SidecarProcess:
     # The ports this region listens on for an input a node holds and the
     # query left unbound: (port, the node's name in the network, its input).
     listens: tuple[tuple[int, str, str], ...] = ()
-    # What each ``-i`` of a node network carries of its picture's colour, by
-    # the ``-pad`` key, in ``-i`` order: empty for an input with no raw
-    # picture an ffmpeg wrote.
-    colors: tuple[tuple[tuple[str, str], ...], ...] = ()
+    # The colour of each picture each ``-i`` of a node network carries, by
+    # the ``-pad`` key and its position among the input's pictures, in ``-i``
+    # order: None for a picture no ffmpeg wrote raw, and empty for an input
+    # with none.
+    colors: tuple[tuple[tuple[tuple[str, str], ...] | None, ...], ...] = ()
     # The tags the query wrote on what each ``-i`` of a node network carries,
     # in ``-i`` order: empty for an input it wrote none on.
     tags: tuple[tuple[tuple[str, str], ...], ...] = ()
@@ -1429,7 +1430,10 @@ class SidecarProcess:
         if self.listens:
             written["listens"] = [list(one) for one in self.listens]
         if self.colors:
-            written["colors"] = [dict(one) for one in self.colors]
+            written["colors"] = [
+                [None if colour is None else dict(colour) for colour in one]
+                for one in self.colors
+            ]
         if self.tags:
             written["tags"] = [dict(one) for one in self.tags]
         if self.geometries:
@@ -1498,9 +1502,14 @@ class SidecarProcess:
                 if isinstance(one, list) and len(one) == 3
             ),
             colors=tuple(
-                tuple((str(key), str(value)) for key, value in one.items())
+                tuple(
+                    tuple((str(key), str(value)) for key, value in colour.items())
+                    if isinstance(colour, dict)
+                    else None
+                    for colour in one
+                )
                 for one in _read_list(d, "colors")
-                if isinstance(one, dict)
+                if isinstance(one, list)
             ),
             tags=tuple(
                 tuple((str(key), str(value)) for key, value in one.items())
@@ -6485,7 +6494,7 @@ class _Partitioner:
         return replace(
             sidecar,
             listens=self._region_listens(members, names),
-            colors=self._region_colors(incoming, alias_of, read_order)
+            colors=self._region_colors(incoming, read_as, read_order)
             if sidecar.node_network
             else (),
             tags=self._region_tags(incoming, alias_of, read_order)
@@ -6570,25 +6579,24 @@ class _Partitioner:
     def _region_colors(
         self,
         incoming: Sequence[StreamEdge],
-        alias_of: Mapping[FrameRef, str],
+        read_as: Mapping[FrameRef, FrameRef],
         order: Sequence[str],
-    ) -> tuple[tuple[tuple[str, str], ...], ...]:
-        """The colour each ``-i`` of a node network is told, in ``-i`` order.
+    ) -> tuple[tuple[tuple[tuple[str, str], ...] | None, ...], ...]:
+        """The colour of each picture each ``-i`` of a node network carries,
+        by its position among the input's pictures, in ``-i`` order.
 
-        NUT writes none, so each input an ffmpeg writes a raw picture on is
-        told the first one's: what the probe and the filters on the way say
+        NUT writes none, so each raw picture an ffmpeg writes is told its own:
+        what the probe and the filters on the way say
         (:func:`stream_colorimetry`), and full-range RGB where the edge
         converts it to an RGB format. A field nothing settles is "unknown".
         """
         sidecars = {sidecar.id for sidecar in self.sidecars}
         modules = {name for name, external in self.external.items() if external}
-        found: dict[str, tuple[tuple[str, str], ...]] = {}
+        found: dict[str, list[tuple[tuple[str, str], ...] | None]] = {}
         for edge in incoming:
             wire = edge.format
-            alias = alias_of.get(edge.ref)
             if (
-                alias is None
-                or alias in found
+                edge.ref not in read_as
                 or edge.source in sidecars
                 or not isinstance(wire, VideoFormat)
                 or wire.codec != RAWVIDEO
@@ -6599,12 +6607,15 @@ class _Partitioner:
             )
             if wire.pix_fmt.startswith(RGB_PREFIXES):
                 said.update(_RGB_WIRE_COLOR)
-            found[alias] = tuple(
+            alias, _, index = src_parts(read_as[edge.ref])
+            colours = found.setdefault(alias, [])
+            colours.extend([None] * (index + 1 - len(colours)))
+            colours[index] = tuple(
                 (key, said.get(option, _UNKNOWN_COLOR)) for option, key in _PAD_COLOR.items()
             )
         if not found:
             return ()
-        return tuple(found.get(alias, ()) for alias in order)
+        return tuple(tuple(found.get(alias, ())) for alias in order)
 
     def _region_geometries(
         self,

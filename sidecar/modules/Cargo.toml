@@ -71,6 +71,7 @@ members = [
     "adapted-0160",
     "adapted-0170",
     "shape-probe",
+    "colour-probe",
     # The node world's stand-ins, written with ffrwd-node: the modules
     # cookbook recipes 145 to 154 name. `stand-ins` is what they share.
     "stand-ins",

@@ -420,10 +420,13 @@ pub(crate) struct PadSpec {
     pub(crate) row: Option<u32>,
     #[serde(default)]
     pub(crate) rendition: PadRendition,
-    /// A raw picture's colorimetry, which the NUT wire does not carry: the
-    /// compiler writes what it probed, in ffmpeg's names.
-    #[serde(default)]
-    pub(crate) color: Option<PadColor>,
+    /// The colorimetry of each of the input's raw pictures, by its position
+    /// among them, which the NUT wire does not carry: the compiler writes
+    /// what it probed, in ffmpeg's names, null for a picture it says nothing
+    /// of. One object is the first picture's, and is how `-pads` names the
+    /// one stream of its pad.
+    #[serde(default, deserialize_with = "one_or_each")]
+    pub(crate) color: Vec<Option<PadColor>>,
     /// Tags for the input's streams beside the ones its header carries, as
     /// the query's `tags` column says them: `smart_timed` makes a feed timed.
     #[serde(default)]
@@ -459,6 +462,24 @@ pub(crate) struct PadColor {
 
 fn unknown_name() -> String {
     "unknown".to_string()
+}
+
+/// A `color` written as one object or as a list of them.
+fn one_or_each<'de, D>(deserializer: D) -> std::result::Result<Vec<Option<PadColor>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Said {
+        One(PadColor),
+        Each(Vec<Option<PadColor>>),
+    }
+    Ok(match Option::<Said>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(Said::One(color)) => vec![Some(color)],
+        Some(Said::Each(colors)) => colors,
+    })
 }
 
 /// `-pad`'s `rendition` object: a row's name, bitrate and codec string,
@@ -4757,7 +4778,7 @@ mod pad_spec_tests {
                     codecs: Some("avc1.640028".to_string()),
                     language: Some("en".to_string()),
                 },
-                color: None,
+                color: Vec::new(),
                 tags: Default::default(),
                 geometry: Vec::new(),
                 pix_fmt: None,
@@ -4769,7 +4790,19 @@ mod pad_spec_tests {
     fn tags_beside_the_colour_are_read_as_strings() {
         let spec: PadSpec = serde_json::from_str(r#"{"tags":{"smart_timed":"1"}}"#).expect("valid");
         assert_eq!(spec.tags.get("smart_timed").map(String::as_str), Some("1"));
-        assert_eq!(spec.color, None);
+        assert!(spec.color.is_empty());
+    }
+
+    #[test]
+    fn a_colour_is_said_per_picture_and_one_object_is_the_first() {
+        let tv = r#"{"range":"tv","primaries":"bt709","trc":"bt709","space":"bt709"}"#;
+        let each: PadSpec =
+            serde_json::from_str(&format!(r#"{{"color":[null,{tv}]}}"#)).expect("valid");
+        assert_eq!(each.color.len(), 2);
+        assert_eq!(each.color[0], None);
+        assert_eq!(each.color[1].as_ref().map(|c| c.range.as_str()), Some("tv"));
+        let one: PadSpec = serde_json::from_str(&format!(r#"{{"color":{tv}}}"#)).expect("valid");
+        assert_eq!(one.color, each.color[1..].to_vec());
     }
 
     #[test]

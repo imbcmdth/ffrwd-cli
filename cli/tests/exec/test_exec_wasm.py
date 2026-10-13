@@ -1366,3 +1366,73 @@ def test_rows_on_the_first_pad_reach_a_module_reading_two_streams(
         (1, 0, f"first-{index}") if index % 2 == 0 else (0, 0, "")
         for index in range(frames)
     ]
+
+
+# -- one input read in two pixel formats ---------------------------------------
+
+_COLOUR_PROBE = _built(_SIDECAR_MODULES, "colour_probe")
+
+
+def _colour(path: Path) -> dict[str, str]:
+    """What ffprobe says of the first video stream's range and matrix."""
+    done = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=color_range,color_space", "-of", "json", str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+        check=True,
+    )
+    stream: dict[str, str] = json.loads(done.stdout)["streams"][0]
+    return stream
+
+
+def test_each_reading_of_one_input_is_told_the_colour_it_is_read_in(tmp_path: Path) -> None:
+    """A limited-range source read as rgba by one node and as yuv420p by
+    another of the same network: the yuv420p reading is told the source's
+    range and matrix, and the rgba one full-range RGB."""
+    if not _COLOUR_PROBE.exists():
+        pytest.skip(f"module missing: {_COLOUR_PROBE}")
+    source = tmp_path / "tv.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10",
+            "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-color_range", "tv",
+            "-colorspace", "bt709", str(source),
+        ],
+        check=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    probed = _colour(source)
+    assert probed == {"color_range": "tv", "color_space": "bt709"}
+    out_path = tmp_path / "colour.ndjson"
+    colour = "STRUCT(pix_fmt text, range text, primaries text, trc text, space text)[]"
+    compiled = compile_all(
+        f"CREATE FUNCTION colour_probe(v video_stream, pix_fmt text DEFAULT 'yuv420p',\n"
+        f"                             seen {colour} DEFAULT NULL)\n"
+        f"RETURNS {colour}\n"
+        f"  AS '{_COLOUR_PROBE.as_posix()}', 'colour_probe' LANGUAGE wasm;\n"
+        "COPY (SELECT colour_probe(f.video[1], 'yuv420p', colour_probe(f.video[1], 'rgba'))\n"
+        f"      FROM input('{source.as_posix()}') f) TO '{out_path.as_posix()}'"
+    )
+    assert compiled.plan is not None
+    assert len(compiled.plan.sidecars) == 1, "both readings ride one input of one network"
+    result = execute_plan(
+        compiled.plan, sidecar_argv=wasm.sidecar_argv, overwrite=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.exit_code == 0, "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    told = {
+        row["pix_fmt"]: (row["range"], row["space"])
+        for row in map(json.loads, out_path.read_text().splitlines())
+    }
+    assert told == {
+        "yuv420p": (probed["color_range"], probed["color_space"]),
+        "rgba": ("pc", "gbr"),
+    }

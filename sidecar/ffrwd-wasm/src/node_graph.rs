@@ -138,12 +138,7 @@ fn input_stream(
         StreamFormat::Data(runtime::DATA_CODEC.to_string())
     } else if stream.pix_fmt().is_some() || stream.sample_fmt().is_some() {
         match crate::format_from_stream(stream)?.media {
-            Media::Video(mut v) => {
-                if let Some(c) = pad.and_then(|p| p.color.as_ref()) {
-                    v.color = Some(pad_color(c)?);
-                }
-                StreamFormat::Video(v)
-            }
+            Media::Video(v) => StreamFormat::Video(v),
             Media::Audio(a) => StreamFormat::Audio(a),
         }
     } else if stream.codec_name().is_some() {
@@ -206,6 +201,15 @@ fn pad_color(c: &crate::PadColor) -> Result<runtime::ColorInfo> {
         trc: crate::codec::parse_color_name("-pad color.trc", &c.trc)?,
         space: crate::codec::parse_color_name("-pad color.space", &c.space)?,
     })
+}
+
+/// `def` with the colour `-pad` gives its picture, which the wire does not
+/// carry.
+fn coloured(mut def: StreamDef, color: Option<&crate::PadColor>) -> Result<StreamDef> {
+    if let (Some(c), StreamFormat::Video(video)) = (color, &mut def.format) {
+        video.color = Some(pad_color(c)?);
+    }
+    Ok(def)
 }
 
 /// `def` with the size `-pad` gives its pictures, where the wire carries them
@@ -497,14 +501,20 @@ fn open(
             match input_stream(args, input, index, stream) {
                 Ok(def) => {
                     let class = classes.entry(class_of(&def.format)).or_default();
-                    let geometry = args
+                    // What `-pad` says of this picture, by its position among
+                    // the input's pictures.
+                    let pad = args
                         .pads
                         .get(input)
                         .and_then(Option::as_ref)
-                        .filter(|_| matches!(def.format, StreamFormat::Video(_)))
-                        .and_then(|pad| pad.geometry.get(class.len()).copied().flatten());
+                        .filter(|_| matches!(def.format, StreamFormat::Video(_)));
+                    let geometry =
+                        pad.and_then(|pad| pad.geometry.get(class.len()).copied().flatten());
+                    let color = pad
+                        .and_then(|pad| pad.color.get(class.len()))
+                        .and_then(Option::as_ref);
                     class.push(id);
-                    streams.push(sized(def, geometry)?);
+                    streams.push(sized(coloured(def, color)?, geometry)?);
                 }
                 Err(_) if stream.class() == nut::ANNOTATION_CLASS => {
                     streams.push(StreamDef {
@@ -662,9 +672,7 @@ fn open(
                 let mut def = streams[id as usize].clone();
                 def.row = Some(spec.row.unwrap_or(position as u32));
                 def.rendition = spec.rendition.clone().into();
-                if let (Some(c), StreamFormat::Video(video)) = (&spec.color, &mut def.format) {
-                    video.color = Some(pad_color(c)?);
-                }
+                let def = coloured(def, spec.color.first().and_then(Option::as_ref))?;
                 streams.push(def);
                 mirrors.entry(id).or_default().push(mirror);
                 if held_on_gpu.contains(&id) {
@@ -2396,7 +2404,8 @@ fn open_codec(
 ) -> Result<Opening> {
     let pix_fmt = told.and_then(|spec| spec.pix_fmt.clone());
     let told_color = told
-        .and_then(|spec| spec.color.as_ref())
+        .and_then(|spec| spec.color.first())
+        .and_then(Option::as_ref)
         .map(pad_color)
         .transpose()?;
     let [(port, id)] = pads else {

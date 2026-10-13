@@ -456,6 +456,73 @@ fn a_pad_hands_a_node_the_colour_the_wire_does_not_carry() {
 }
 
 #[test]
+fn each_picture_of_one_input_is_handed_the_colour_its_pad_says() {
+    let dir = scratch("pad-colours");
+    let items: Vec<(usize, Write)> = (0..3)
+        .flat_map(|k| {
+            [
+                (0, Write::Frame(k, vec![7u8; 8 * 8 * 4])),
+                (1, Write::Frame(k, vec![9u8; 8 * 8 * 4])),
+            ]
+        })
+        .collect();
+    let picture = video(8, 8, TENTHS, (10, 1));
+    write_nut(&dir.join("in.nut"), &[picture.clone(), picture], &items);
+    let input = dir.join("in.nut").display().to_string();
+    let out = at_every_jobs(
+        "pad-colours",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-pad",
+            concat!(
+                r#"{"color": [{"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}, "#,
+                r#"{"range": "pc", "primaries": "unknown", "trc": "unknown", "space": "gbr"}]}"#
+            ),
+            "-m",
+            &module("shape_canvas"),
+            "-filter_complex",
+            concat!(
+                "[v=0:v:0]shape_canvas=width=2:height=2[out=a][@rows=ra];",
+                "[v=0:v:1]shape_canvas=width=2:height=2[out=b][@rows=rb]"
+            ),
+            "-map",
+            "[a]",
+            "-f",
+            "nut",
+            "{dir}/a.nut",
+            "-map",
+            "[b]",
+            "-f",
+            "nut",
+            "{dir}/b.nut",
+            "-map",
+            "[ra]",
+            "-f",
+            "ndjson",
+            "{dir}/ra.ndjson",
+            "-map",
+            "[rb]",
+            "-f",
+            "ndjson",
+            "{dir}/rb.ndjson",
+        ]),
+        &["a.nut", "b.nut", "ra.ndjson", "rb.ndjson"],
+    );
+    let (first, second) = (lines(&out[2]), lines(&out[3]));
+    assert_eq!(
+        (first[0]["range"].clone(), first[0]["space"].clone()),
+        ("tv".into(), "bt709".into())
+    );
+    assert_eq!(
+        (second[0]["range"].clone(), second[0]["space"].clone()),
+        ("pc".into(), "gbr".into())
+    );
+}
+
+#[test]
 fn a_rate_with_no_inputs_ticks_until_the_node_finishes() {
     let out = at_every_jobs(
         "rate",

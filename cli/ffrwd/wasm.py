@@ -2030,8 +2030,9 @@ def _argv(
     SINK pad carrying rendition metadata (:attr:`SidecarProcess.pads`) gets a
     ``-pad '<json>'`` right after its own ``-i``, ``{"row": ..., "rendition":
     {...}}`` with absent attributes omitted -- a pad with none gets no flag.
-    A node network's input carrying a raw picture gets its ``"color"`` there
-    too (:attr:`SidecarProcess.colors`), since NUT writes none, and the
+    A node network's input carrying a raw picture gets the ``"color"`` of
+    each of its pictures there too, by position, null for one it says nothing
+    of (:attr:`SidecarProcess.colors`), since NUT writes none, and the
     ``"geometry"`` of each picture crossing smaller than it is
     (:attr:`SidecarProcess.geometries`).
 
@@ -2076,9 +2077,9 @@ def _argv(
             argv += ["-f", EDGE_FORMAT, "-i", path]
             meta: PadMeta | None = process.pads[index] if index < len(process.pads) else None
             pad = meta.to_dict() if meta is not None else {}
-            colour = process.colors[index] if index < len(process.colors) else ()
-            if colour:
-                pad["color"] = dict(colour)
+            colours = process.colors[index] if index < len(process.colors) else ()
+            if colours:
+                pad["color"] = [None if one is None else dict(one) for one in colours]
             tags = process.tags[index] if index < len(process.tags) else ()
             if tags:
                 pad["tags"] = dict(tags)
