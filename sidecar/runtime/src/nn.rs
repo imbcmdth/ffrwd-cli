@@ -1240,7 +1240,13 @@ mod tests {
         let first = GPU_PRIORITY[0];
         let dir = empty_dir("exclude-one-model");
         let only_a = config(&["a", "b"], vec![one("a", first)]);
-        let (_, notes) = resolve(Target::Gpu, &dir, &only_a.pins());
+        let (provider, notes) = resolve(Target::Gpu, &dir, &only_a.pins());
+        if preflight(first, &dir).is_empty() {
+            // A provider needing nothing on disk (CoreML) passes its
+            // preflight even here, and is taken.
+            assert_eq!(provider, first, "{notes:?}");
+            return;
+        }
         let named = format!("not {}", first.name());
         let note = notes
             .iter()

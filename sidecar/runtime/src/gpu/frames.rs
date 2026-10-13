@@ -1061,13 +1061,14 @@ mod tests {
                 "rgba to NV12 ({yuv:?}) against ffmpeg: luma at most {y_max} apart \
                  (mean {y_mean:.3}), chroma at most {c_max} apart (mean {c_mean:.3})"
             );
-            // Measured on an RTX 4090: at most 1 apart; the means at most
-            // 0.035 for luma and 0.488 for full-range chroma, which ffmpeg
-            // rounds half a level apart from this.
+            // Measured at most 1 apart; the means at most 0.035 for luma,
+            // and for full-range chroma, which ffmpeg rounds half a level
+            // apart from this so that about half the samples differ, 0.488
+            // on an RTX 4090 and 0.501 on an M1 Max.
             assert!(y_max <= 1, "{yuv:?}: luma differs by up to {y_max}");
             assert!(c_max <= 1, "{yuv:?}: chroma differs by up to {c_max}");
             assert!(y_mean < 0.04, "{yuv:?}: luma mean {y_mean}");
-            assert!(c_mean < 0.5, "{yuv:?}: chroma mean {c_mean}");
+            assert!(c_mean < 0.55, "{yuv:?}: chroma mean {c_mean}");
             // The transparent corner is black.
             let black = if yuv.full_range { 0 } else { 16 };
             assert_eq!(ours[0], black, "{yuv:?}");
