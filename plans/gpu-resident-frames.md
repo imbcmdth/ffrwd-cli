@@ -1976,6 +1976,11 @@ run; each item names what it takes, and the notes above have the detail.
 6. **The acceptance lines that name the L4**: the benchmark recipe (160)
    at real time there, and section 3's harness run there for its GPU and
    readback columns.
+7. **The card pass's Vulkan upload**: `hwupload` makes no device of its
+   own. The VideoToolbox family's commands make one for it
+   (`init_hw_device`, `filter_hw_device`); the Vulkan family's do not and
+   have never run, and are left as they are until a card shows whether
+   they need the same.
 
 ## Packets inside the region, and sidecar to sidecar
 
@@ -2380,3 +2385,195 @@ release:
 
 These four numbers are what every acceptance line above is measured
 against.
+
+## macOS
+
+What follows was run on the owner's MacBook (2026-10-13): an M1 Max with 32
+GB, macOS 27.0, Homebrew's ffmpeg 9.0.1, ffrwd-av v1.2.0's macos-aarch64
+libav, and ONNX Runtime 1.22.0 with CoreML. Nothing of this work had run on
+a Mac before.
+
+### The first run
+
+The branch did not build off Windows: the output texture's read had one
+match arm there, and its result type could not be inferred; clippy also
+read the frame tensor's one-armed route match as needless. With that fixed,
+wgpu opens on Metal and `gpu_frames` passes with an adapter required, and
+gpu_box, invert, depth_gpu, segment_gpu and blitz's `compose` run. Three
+things did not:
+
+- **Every run that loaded ONNX Runtime ended in SIGABRT.** ONNX Runtime's
+  C++ static destructors abort ("mutex lock failed") while a session's
+  worker threads still run, after the outputs are written. Every exit from
+  `main` now goes through one function, which on macOS with ONNX Runtime
+  loaded flushes stdout and stderr and calls `_exit`. Nothing is lost by
+  it: `std::process::exit` runs no Rust destructors either, a run that
+  succeeded has joined its writers and finished every output before it
+  reaches that function, and what `_exit` skips beyond that, C's `atexit`
+  handlers and stdio buffers, carries no output. A run binding a model and
+  writing NUT to a file is checked to write every frame and end the file.
+- **The provider line named no library.** It reads the loaded images, which
+  only Windows and Linux listed; macOS lists them from dyld now.
+- **The relay crawled.** A FIFO on macOS holds 8 KB and cannot be made
+  bigger. While the process on the other end is in a blocking write larger
+  than that, which is every ffmpeg writing raw video, `poll` and kqueue on
+  the FIFO miss the wakeup, so each of the relay's reads waited out its
+  whole tenth of a second: 1.3 MB took 9.4 s to cross. `select` wakes on
+  time, and the relay now waits with it on macOS. The relay's suite went
+  from 4 of 13 failing (52 s) to all passing (3.3 s), and the exec tier
+  from 57 minutes, with every relay plan timing out, to 8.5.
+
+Two tests held for Windows' and Linux's providers and the 4090's rounding
+only: CoreML needs nothing on disk, so the walk takes it even with an empty
+runtime directory; and full-range chroma made on Metal is 0.501 levels from
+ffmpeg's on average, where the 4090 measured 0.488. The stdio test that
+asks for a 1 MiB pipe is skipped where pipes cannot be sized, as
+`ffrwd/pipes.py` already said of every platform but Windows and Linux.
+
+What still fails in the exec tier on this machine is Homebrew's ffmpeg and
+code this work did not touch: no SRT (5 tests), the HLS and DASH ladders
+refused at compile time (11), no `subtitles`, `drawtext` or `frei0r`
+(recipes 11, 58 and 62), channelsplit and the centred overlay, and one plan
+whose consumer never opens its input. 495 pass.
+
+### Decoding into the pool
+
+`decode` with `hw=auto` or `hw=videotoolbox`, read by an input held on the
+GPU, opens VideoToolbox on the process's device
+(`av::Shared::VideoToolbox`; VideoToolbox takes no device of the caller's).
+Its pictures are IOSurface-backed `CVPixelBuffer`s, `420v` or `420f`;
+`gpu/metal.rs` makes each plane a Metal texture over the surface through
+CoreVideo's texture cache, R8 for luma and RG8 for chroma, and hands both
+to wgpu as textures of the shared device. Nothing is copied. A picture is
+kept after its frame drops until the queue has run everything queued by
+then (`queue_on_submitted_work_done`), so the decoder's pool does not
+rewrite a surface a pass still reads. A coded port feed into an input held
+on the GPU decodes the same way. Recipe 165.
+
+Measured: gpu_box over testsrc into libx264 uploads nothing where it
+uploaded every frame before (18.4 MB for 60 frames of 320x240 rgba); the
+one readback left is the picture leaving for libx264. The picture matches
+ffmpeg's interpolating conversion as the software path matches ffmpeg's
+plain one (41 dB each, the box in both). A yuv420p reader gets the software
+decode byte for byte. VideoToolbox refuses the 64x48 fixture (libavcodec
+falls back to software and says so), so the macOS tests read a 96x64 one.
+
+The two feed tests paced their programme from the spawn. On this machine
+the sidecar's feed port comes up 2.4 s after the spawn, once the device is
+open and the module compiled, so 60 of the programme's 75 frames were
+already queued when the feeder connected, and the run ended before
+VideoToolbox's first picture. Both tests now write the programme's first
+frame at once and pace the rest from when the port is up, with the same
+bounds, and the coded one runs on macOS with VideoToolbox. Timed from the
+spawn: the port is up at 2.39 s, the feeder connects at 2.50 s,
+VideoToolbox hands back its first picture at 3.04 s (0.53 s after it was
+opened, its session's start and the fixture's B-frames), and that picture
+lands on the programme's 16th frame.
+
+### Encoding from the pool
+
+`h264_videotoolbox` and `hevc_videotoolbox` whose frames are on the Metal
+device are opened on a frames context of IOSurface-backed NV12 pictures
+(`attach_device_frames`). Each frame is made NV12 on the device where it is
+not, its planes are copied into a pool picture's two Metal textures, and
+the copy is waited for before the picture is sent, since VideoToolbox reads
+it with nothing to wait on. A `decode` read only by such an encoder decodes
+onto the device too. Frames in host memory reach the encoder as NV12 made
+by libswscale: before this, the host path chose the encoder's first pixel
+format, `videotoolbox_vld`, and every `_videotoolbox` encode in the sidecar
+failed in `av_frame_get_buffer`. The compiler counts `_videotoolbox` as a
+hardware encode session and keeps its rgba colour to the matrices the
+device converts in, as for `_d3d12va`. Recipe 166.
+
+Measured: gpu_box over testsrc into h264_videotoolbox moves 0 bytes up or
+down; the file is within 41 dB of ffmpeg's interpolating reference, the
+same as the libx264 path, and is tagged BT.709 limited.
+
+### The card pass
+
+`hwaccel => 'videotoolbox'` to a `_videotoolbox` encoder keeps the picture
+as `videotoolbox_vld` and spells `scale` and `transpose` as `scale_vt` and
+`transpose_vt`. A CPU segment goes back up through `hwupload`, which makes
+no device of its own, so the command makes one and names it for the
+filtergraph (`init_hw_device videotoolbox=up -filter_hw_device up`, written
+as input options of the first kept input, since ffmpeg reads global options
+anywhere). `yadif_videotoolbox` is left out: its name is not the family's
+suffix. Those three are FFmpeg 9.0's VideoToolbox filters. The sidecar's
+own libavfilter in ffrwd-av v1.2.0 carries none of them on macOS, so the
+`filter` node has no route there until that build adds them. Recipe 167,
+run here: av.mp4 decoded by VideoToolbox, flipped on the CPU, scaled by
+`scale_vt` and encoded by `h264_videotoolbox`.
+
+A pinned recipe whose command names a device filter the compiling machine
+lacks is skipped, naming the filter, rather than failing. Before, 156 and
+158 were checked wherever they were compiled; 167 is new. On CI's Linux
+runner, whose static ffmpeg has `scale_cuda` and `scale_vulkan` and no
+`_vt` filters, and whose sidecar loads no libav, 156 and 158 are still
+checked and 167 skips. On the owner's Windows machine 167 is the one skip.
+Here 156 (`scale_cuda`) and 158 (`scale_d3d12`) skip.
+
+### Inference on CoreML
+
+The GPU walk takes CoreML, and nothing binds on it: ONNX Runtime's CoreML
+provider reads and writes host memory, with no I/O binding to a Metal
+buffer or an IOSurface. A tensor made on the device from a frame in the
+pool is read back once (`input downloaded, COREML takes host memory`) and
+an output bound to a texture is uploaded once. That stays as it was: each
+is a copy of a tensor, 3.2 MB for depth's 518x518 input, never of a frame.
+
+What did change is that CoreML was barely running the models. Registered as
+`ort` registers it, in the NeuralNetwork format and with the models' free
+dimensions left free, it ran Depth Anything V2 small slower than the CPU:
+
+| depth, 518x518, a frame | |
+|---|---|
+| CoreML as registered before | 600 ms |
+| CPU | 330 ms |
+| CoreML, MLProgram, built for the input's shape | 52 ms |
+
+The host now registers CoreML in the MLProgram format, on the CPU and GPU,
+with a model cache under the runtime's directory, and the backend builds a
+CoreML session at the first run with the model's named free dimensions
+fixed to that run's input shapes, one per shape. The depth maps are within
+86 dB of the CPU's. A model whose batch changes from run to run compiles
+once per batch size.
+
+The cache keeps both ONNX Runtime's conversion and CoreML's compiled model,
+and was read back on every run; what took 45 s on every load of X-CLIP's
+video tower was CoreML compiling the model for the Neural Engine, which
+nothing caches. On the CPU and GPU the same model loads in 1.3 s after its
+first compile (two minutes, once), and the shots and clips chain runs
+faster than it did with the Neural Engine, 211 frames a second against 133
+at 1080p and 129 against 95 at 4K. Depth is the same 52 ms either way, and
+recipe 160 the same to within a frame a second at both sizes, so the Neural
+Engine is left out.
+
+A per-shape session that cannot be built or fails its first run gives way,
+once and named on stderr, to the session CoreML builds for the model by
+default. faceage's age model runs that way: CoreML cannot parse it as an ML
+program ("Required param 'pad' is missing").
+
+### Measured
+
+Sustained frames a second: the frames between a short and a long run over
+the difference of their wall times, so the start-up is left out, with the
+profile's bytes to and from the host a frame. "Before" is the branch as it
+first ran here, with only the first run's fixes.
+
+| run | before | now | 4090 |
+|---|---|---|---|
+| `compose` alone, 4K programme and two 1080p, `h264_videotoolbox` | | 84, nothing crosses | 159 |
+| the same at 1080p | | 190, nothing crosses | 266 |
+| the same with all three 4K | | 65, nothing crosses | |
+| recipe 160 at 4K | 1.5 (libx264), 50.8 MB up, 36.4 MB down | 9.2, 1.07 MB up, 3.22 MB down | 90.6 |
+| recipe 160 at 1080p | 1.6 (libx264), 16.7 MB up, 11.5 MB down | 17.8, the same tensors | |
+| shots and clips, rows only, 1080p | 84, 6.2 MB up | 211, 0.6 MB down | 959 |
+| shots and clips, rows only, 4K | 42, 24.9 MB up | 129, 0.6 MB down | 265 |
+
+On this machine the compositor is held by the media engine rather than the
+GPU: one 4K stream decoded, boxed and encoded through VideoToolbox runs at
+97 frames a second. Recipe 160 is held by depth, 52 ms a frame. The
+classroom clip faceage was measured on is not here; on Big Buck Bunny, with
+few faces, the GPU chain runs at 7.1 frames a second at 720p against 2.9
+before, and 6.1 at 4K, its time in the detector and the picture read back
+for libx264.

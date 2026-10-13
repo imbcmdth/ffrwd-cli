@@ -163,8 +163,8 @@ macOS: videotoolbox), skipping a device type the build does not have, and
 falls back to software. The frames come back to host memory, with one
 exception: when the node reading them holds its frames on the GPU
 (`NODE-SHAPE.md`) and the device is the sidecar's own, `d3d12va` on
-Windows, the decoder writes straight into the sidecar's frame pool and
-nothing comes back. A coded port feed into an input held on the GPU is
+Windows or `videotoolbox` on macOS, the decoder writes straight into the
+sidecar's frame pool and nothing comes back. A coded port feed into an input held on the GPU is
 decoded the same way, where the device allows. One line on stderr says
 what engaged, and a second says whether the decoder's own images were
 taken as they are or copied once on the device:
@@ -173,6 +173,15 @@ taken as they are or copied once on the device:
     [av] decode h264: software (d3d11va: no device)
     [av] decode h264: d3d12va, on the host's device
     [gpu] decode h264: d3d12va, frames wrapped
+    [av] decode h264: videotoolbox, on the host's device
+    [gpu] decode h264: videotoolbox, frames wrapped
+
+On macOS VideoToolbox writes each picture into an IOSurface, and CoreVideo's
+texture cache makes its two planes Metal textures over that surface, so a
+picture is always wrapped. A picture is kept until the device has run
+everything queued while it was read, then handed back. VideoToolbox in the
+bundled libav decodes h264, hevc and prores, and refuses a picture as small
+as 64x48, which then decodes in software.
 
 That holds for `format=yuv420p` and `format=rgba`. The decoder writes
 NV12 either way; a reader of yuv420p is handed its planes split on the
@@ -199,10 +208,19 @@ NVIDIA's driver and write no extradata, so `bf=0` is set unless asked
 otherwise, and the parameter sets for the header are taken from a first
 packet coded ahead of the stream. They keep 16 pictures in flight unless
 `async_depth` is given, since each picture reaches them through a copy on
-another queue. Every other encoder reads a GPU frame back once.
+another queue. On macOS, `h264_videotoolbox` and `hevc_videotoolbox`
+whose frames are on the sidecar's Metal device are opened on a pool of
+IOSurface-backed NV12 pictures: each frame is made NV12 on the device (an
+rgba frame first, as above), its two planes are copied into one of the
+pool's pictures through CoreVideo's texture cache, and the copy is waited
+for before the picture is sent, since VideoToolbox reads it with nothing to
+wait on. Frames in host memory reach them as NV12 made by libswscale. Every
+other encoder reads a GPU frame back once.
 
     [av] encode h264_d3d12va: 1920x1080 nv12, from the device
     [gpu] encode h264_d3d12va: from the device, each frame one copy
+    [av] encode h264_videotoolbox: 1920x1080 nv12, from the device
+    [gpu] encode h264_videotoolbox: from the device, each frame a copy per plane, waited for
 
 `filter` runs its graph on a `d3d12va` device: the D3D12 filters read and
 write D3D12 textures, so the graph's source is a frames context of NV12

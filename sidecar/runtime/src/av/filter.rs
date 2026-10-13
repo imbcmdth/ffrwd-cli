@@ -153,6 +153,13 @@ impl Filter {
         let shared = device.is_some();
         let raw = match device {
             Some(Shared::D3d12(device)) => device.into_raw(),
+            Some(Shared::VideoToolbox) => {
+                return Err(refuse(
+                    "av_hwframe_ctx_init",
+                    "the graph runs on a d3d12va device, and the device is a VideoToolbox one"
+                        .to_string(),
+                ))
+            }
             None => std::ptr::null_mut(),
         };
         let frames = lib

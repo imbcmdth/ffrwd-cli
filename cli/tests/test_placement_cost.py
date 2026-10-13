@@ -265,9 +265,11 @@ def test_a_regions_own_decode_and_hardware_encode_are_sessions() -> None:
     from ffrwd.placement_cost import process_load
 
     hardware, software = _av_region("fx0", "h264_amf"), _av_region("fx1", "ffv1")
-    plan = ProcessPlan(processes=(hardware, software), edges=())
+    apple = _av_region("fx2", "hevc_videotoolbox")
+    plan = ProcessPlan(processes=(hardware, software, apple), edges=())
     load = process_load(hardware, plan)
     assert (load.gpu_jobs, load.encodes, load.decodes) == (0, 1, 1)
+    assert process_load(apple, plan).encodes == 1
     assert (process_load(software, plan).encodes, process_load(software, plan).decodes) == (0, 1)
     assert needs_gpu(hardware)
     assert not needs_gpu(software)

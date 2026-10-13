@@ -127,6 +127,24 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
         # that stays on the card to an `_nvenc` encoder.
         probes=False,
     ),
+    "init_hw_device": InputOptionSpec(
+        name="init_hw_device",
+        type="str",
+        doc="Make a hardware device and name it, e.g. 'videotoolbox=up'.",
+        flag="-init_hw_device",
+        # A global option ffmpeg reads anywhere on its command line; written
+        # by the compiler where a picture is uploaded to a device that
+        # `hwupload` cannot make itself.
+        probes=False,
+    ),
+    "filter_hw_device": InputOptionSpec(
+        name="filter_hw_device",
+        type="str",
+        doc="Name the device the filtergraph's uploads go to, one init_hw_device made.",
+        flag="-filter_hw_device",
+        # Global too, and written beside init_hw_device.
+        probes=False,
+    ),
     "seek_end": InputOptionSpec(
         name="seek_end",
         type="num",

@@ -57,6 +57,9 @@ class _Family:
     # Whether the encoder reads only frames on the device, so a picture that
     # came down for a CPU segment goes up again before it.
     encoder_needs_device: bool
+    # The device an upload is made to, by ``-init_hw_device``'s spelling,
+    # where ``upload`` makes none of its own; empty where it does.
+    upload_device: str
     # The filters a variant stands in for, with the options the variant takes
     # under the name the CPU filter spells them. A call with an option
     # outside this list stays on the CPU: the variant does not take it.
@@ -68,6 +71,10 @@ class _Family:
     # The same for pix_fmts only some codecs' decoders keep on the device,
     # by ffprobe codec name.
     codec_sw_formats: Mapping[str, Mapping[str, str]]
+
+
+# The name the device an upload is made to is given on the command line.
+_UPLOAD_DEVICE = "up"
 
 
 def _same(*names: str) -> dict[str, str]:
@@ -92,6 +99,7 @@ _FAMILIES: tuple[_Family, ...] = (
         filter_suffix="_cuda",
         upload="hwupload_cuda",
         encoder_needs_device=False,
+        upload_device="",
         variants={
             "scale": {
                 "width": "w",
@@ -123,6 +131,7 @@ _FAMILIES: tuple[_Family, ...] = (
         filter_suffix="_vulkan",
         upload="hwupload",
         encoder_needs_device=True,
+        upload_device="",
         variants={
             "scale": {"width": "w", "height": "h", "w": "w", "h": "h"},
             "overlay": _same("x", "y"),
@@ -130,6 +139,23 @@ _FAMILIES: tuple[_Family, ...] = (
             "hflip": {},
             "vflip": {},
             "bwdif": _same("mode", "parity", "deint"),
+        },
+        sw_formats=_YUV420,
+        codec_sw_formats={},
+    ),
+    # VideoToolbox, on macOS. Its encoders read frames in host memory too.
+    # yadif_videotoolbox is left out: its name is not the family's suffix.
+    _Family(
+        hwaccels=frozenset({"videotoolbox"}),
+        output_format="videotoolbox_vld",
+        encoder_suffix="_videotoolbox",
+        filter_suffix="_vt",
+        upload="hwupload",
+        encoder_needs_device=False,
+        upload_device="videotoolbox",
+        variants={
+            "scale": {"width": "w", "height": "h", "w": "w", "h": "h"},
+            "transpose": _same("dir", "passthrough"),
         },
         sw_formats=_YUV420,
         codec_sw_formats={},
@@ -259,6 +285,16 @@ def _kept(g: Graph, family: _Family, sources: Mapping[FrameRef, str]) -> Graph:
         alias: _with_output_format(values, family) if alias in aliases else dict(values)
         for alias, values in g.input_options.items()
     }
+    uploads = any(node.filter == family.upload for node in nodes.values())
+    if uploads and family.upload_device:
+        # ffmpeg reads these anywhere on its command line; they ride on the
+        # first kept input, once.
+        first = next(alias for alias in options if alias in aliases)
+        options[first] = {
+            "init_hw_device": f"{family.upload_device}={_UPLOAD_DEVICE}",
+            "filter_hw_device": _UPLOAD_DEVICE,
+            **options[first],
+        }
     return replace(g, nodes=nodes, sinks=sinks, input_options=options)
 
 

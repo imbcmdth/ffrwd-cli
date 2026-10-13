@@ -125,6 +125,8 @@ pub struct OnnxBackend {
     /// Providers the embedder registers itself, in place of `ort`'s default
     /// registration of them.
     registrars: Vec<(Provider, Registrar)>,
+    /// What the next graph loaded is called on stderr.
+    next_name: String,
 }
 
 impl Default for OnnxBackend {
@@ -132,6 +134,7 @@ impl Default for OnnxBackend {
         Self {
             gpu_providers: platform_gpu_providers(),
             registrars: Vec::new(),
+            next_name: String::new(),
         }
     }
 }
@@ -147,6 +150,7 @@ impl OnnxBackend {
         Self {
             gpu_providers,
             registrars: Vec::new(),
+            next_name: String::new(),
         }
     }
 
@@ -186,6 +190,10 @@ impl BackendInner for OnnxBackend {
         let mut refused: Vec<(Provider, String)> = Vec::new();
         for provider in session_providers(target, &self.gpu_providers) {
             if let Some(registrar) = self.registrar(provider) {
+                if let Some(graph) = specialized(provider, registrar, builders[0], &self.next_name)?
+                {
+                    return Ok(graph);
+                }
                 let mut builder = Session::builder()?;
                 if let Err(e) = registrar(&mut builder) {
                     tracing::debug!(
@@ -201,6 +209,7 @@ impl BackendInner for OnnxBackend {
                 let box_: Box<dyn BackendGraph> = Box::new(OnnxGraph {
                     session: Arc::new(Mutex::new(session)),
                     provider,
+                    shapes: None,
                 });
                 return Ok(box_.into());
             }
@@ -232,6 +241,7 @@ impl BackendInner for OnnxBackend {
             let box_: Box<dyn BackendGraph> = Box::new(OnnxGraph {
                 session: Arc::new(Mutex::new(session)),
                 provider,
+                shapes: None,
             });
             return Ok(box_.into());
         }
@@ -250,6 +260,163 @@ impl BackendInner for OnnxBackend {
 
     fn as_dir_loadable<'a>(&'a mut self) -> Option<&'a mut dyn BackendFromDir> {
         Some(self)
+    }
+
+    fn name_next(&mut self, name: &str) {
+        self.next_name = name.to_string();
+    }
+}
+
+/// Whether a session on `provider` is built again for each shape its inputs
+/// arrive in. CoreML takes a graph with free dimensions only in part, and
+/// runs the rest on the CPU, so the session is built with them fixed.
+fn by_shape(provider: Provider) -> bool {
+    provider == Provider::CoreMl
+}
+
+/// A graph whose session is built for each shape its inputs arrive in, where
+/// `provider` is one ([`by_shape`]) and every free dimension of the model's
+/// inputs is named; None otherwise. The session read for the inputs' names
+/// and types runs on the CPU and is never run.
+fn specialized(
+    provider: Provider,
+    registrar: &Registrar,
+    model: &[u8],
+    name: &str,
+) -> Result<Option<Graph>, BackendError> {
+    if !by_shape(provider) {
+        return Ok(None);
+    }
+    let described = Session::builder()?.commit_from_memory(model)?;
+    let mut free = Vec::new();
+    for (input, slot) in described.inputs.iter().enumerate() {
+        let ValueType::Tensor {
+            shape,
+            dimension_symbols,
+            ..
+        } = &slot.input_type
+        else {
+            return Ok(None);
+        };
+        for (dimension, (&size, symbol)) in shape.iter().zip(dimension_symbols.iter()).enumerate() {
+            if size >= 0 {
+                continue;
+            }
+            if symbol.is_empty() {
+                return Ok(None);
+            }
+            free.push((input, dimension, symbol.clone()));
+        }
+    }
+    if free.is_empty() {
+        return Ok(None);
+    }
+    let box_: Box<dyn BackendGraph> = Box::new(OnnxGraph {
+        session: Arc::new(Mutex::new(described)),
+        provider,
+        shapes: Some(Arc::new(ByShape {
+            name: name.to_string(),
+            model: model.to_vec(),
+            provider,
+            registrar: registrar.clone(),
+            free,
+            sessions: Mutex::new(Vec::new()),
+            fallen: Mutex::new(None),
+        })),
+    });
+    Ok(Some(box_.into()))
+}
+
+/// A model's sessions, one for each shape its inputs arrived in, or, once
+/// one of them could not be built or failed its first run, the one session
+/// the provider builds for the model by default.
+struct ByShape {
+    /// What the model is called on stderr.
+    name: String,
+    model: Vec<u8>,
+    provider: Provider,
+    registrar: Registrar,
+    /// Each free dimension of the inputs: the input, the dimension, and its
+    /// name.
+    free: Vec<(usize, usize, String)>,
+    /// The sizes the free dimensions took, and the session built for them.
+    sessions: Mutex<Vec<(Vec<i64>, Arc<Mutex<Session>>)>>,
+    /// The session every shape runs on once a session for a shape could not
+    /// be built or failed its first run.
+    fallen: Mutex<Option<Arc<Mutex<Session>>>>,
+}
+
+impl ByShape {
+    /// The session for the shapes `inputs` hold, built the first time they
+    /// arrive in them, and whether it was built just now.
+    fn session(&self, inputs: &[TensorSlot]) -> Result<(Arc<Mutex<Session>>, bool), BackendError> {
+        if let Some(fallen) = self.fallen.lock().unwrap().as_ref() {
+            return Ok((fallen.clone(), false));
+        }
+        let mut sizes = Vec::with_capacity(self.free.len());
+        for (input, dimension, name) in &self.free {
+            let size = inputs
+                .get(*input)
+                .and_then(|slot| slot.tensor.as_ref())
+                .and_then(|tensor| tensor.dimensions.get(*dimension))
+                .ok_or_else(|| {
+                    BackendError::BackendAccess(wasmtime::format_err!(
+                        "no input gives the model's dimension {name}"
+                    ))
+                })?;
+            sizes.push(i64::from(*size));
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some((_, session)) = sessions.iter().find(|(made, _)| *made == sizes) {
+            return Ok((session.clone(), false));
+        }
+        let mut builder = Session::builder()?;
+        (self.registrar)(&mut builder).map_err(|e| {
+            BackendError::BackendAccess(wasmtime::format_err!("the provider did not register: {e}"))
+        })?;
+        for ((_, _, name), size) in self.free.iter().zip(&sizes) {
+            builder = builder.with_dimension_override(name, *size)?;
+        }
+        let session = Arc::new(Mutex::new(
+            builder
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .commit_from_memory(&self.model)?,
+        ));
+        sessions.push((sizes, session.clone()));
+        Ok((session, true))
+    }
+
+    /// The session the provider builds for the model by default, which
+    /// every shape runs on from now on: what a session for a shape gives
+    /// way to when it could not be built or failed its first run (`why`).
+    /// Said once on stderr.
+    fn fall_back(&self, why: &BackendError) -> Result<Arc<Mutex<Session>>, BackendError> {
+        let mut fallen = self.fallen.lock().unwrap();
+        if let Some(session) = fallen.as_ref() {
+            return Ok(session.clone());
+        }
+        eprintln!(
+            "[nn] {}: a {} session built for its inputs' shapes failed ({why}); the model \
+             runs on the session {} builds by default",
+            self.name,
+            self.provider.name(),
+            self.provider.name()
+        );
+        let dispatch = self.provider.dispatch().ok_or_else(|| {
+            BackendError::BackendAccess(wasmtime::format_err!(
+                "{} is not enabled in this build",
+                self.provider.name()
+            ))
+        })?;
+        let session = Arc::new(Mutex::new(
+            Session::builder()?
+                .with_execution_providers([dispatch.error_on_failure()])?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .commit_from_memory(&self.model)?,
+        ));
+        self.sessions.lock().unwrap().clear();
+        *fallen = Some(session.clone());
+        Ok(session)
     }
 }
 
@@ -283,6 +450,10 @@ struct OnnxGraph {
     /// The provider the session was built on, which decides whether an
     /// input in device memory can be bound to it.
     provider: Provider,
+    /// The sessions built for each shape the inputs arrive in, where the
+    /// provider takes fixed shapes only; `session` then only describes the
+    /// model.
+    shapes: Option<Arc<ByShape>>,
 }
 unsafe impl Send for OnnxGraph {}
 unsafe impl Sync for OnnxGraph {}
@@ -317,6 +488,7 @@ impl BackendGraph for OnnxGraph {
         let box_: Box<dyn BackendExecutionContext> = Box::new(OnnxExecutionContext {
             session: self.session.clone(),
             provider: self.provider,
+            shapes: self.shapes.clone(),
             inputs,
             outputs,
         });
@@ -331,6 +503,7 @@ impl BackendGraph for OnnxGraph {
 struct OnnxExecutionContext {
     session: Arc<Mutex<Session>>,
     provider: Provider,
+    shapes: Option<Arc<ByShape>>,
     inputs: Vec<TensorSlot>,
     outputs: Vec<TensorSlot>,
 }
@@ -364,7 +537,29 @@ impl OnnxExecutionContext {
                 bound.output.0.ready()?;
             }
         }
-        let mut session = self.session.lock().unwrap();
+        let Some(shapes) = self.shapes.clone() else {
+            return self.run_on(&self.session, on_device);
+        };
+        let (session, built) = match shapes.session(&self.inputs) {
+            Ok(made) => made,
+            Err(why) => (shapes.fall_back(&why)?, false),
+        };
+        match self.run_on(&session, on_device) {
+            Err(why) if built => {
+                let session = shapes.fall_back(&why)?;
+                self.run_on(&session, on_device)
+            }
+            ran => ran,
+        }
+    }
+
+    /// Runs `session` over the inputs set, as [`run`](Self::run) says.
+    fn run_on(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        on_device: bool,
+    ) -> Result<Vec<Tensor>, BackendError> {
+        let mut session = session.lock().unwrap();
         if !on_device {
             let mut session_inputs: Vec<SessionInputValue<'_>> = vec![];
             for i in &self.inputs {

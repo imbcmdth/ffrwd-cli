@@ -2456,3 +2456,108 @@ fn segment_on_the_device_paints_what_the_host_path_paints() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `invert.wasm`, built once.
+fn invert_module() -> PathBuf {
+    static BUILT: OnceLock<()> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let output = Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--target",
+                "wasm32-wasip2",
+                "-p",
+                "invert",
+            ])
+            .current_dir(sidecar_root().join("modules"))
+            .output()
+            .expect("spawn cargo build for invert");
+        assert!(
+            output.status.success(),
+            "building invert failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+    sidecar_root().join("modules/target/wasm32-wasip2/release/invert.wasm")
+}
+
+#[test]
+fn a_run_that_loads_a_model_writes_its_output_file_whole() {
+    // A run binding a model loads ONNX Runtime, and on macOS such a process
+    // leaves without running exit-time destructors: every frame the module
+    // wrote must still be in the file, and the file must end as NUT ends.
+    use ffrwd_wasm::nut::{Demuxer, Muxer, Stream, TimeBase};
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("a run binding a model needs a runtime");
+        return;
+    };
+    let (width, height, frames) = (64u32, 48u32, 30i64);
+    let dir = std::env::temp_dir().join(format!("ffrwd_nn_whole_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("make the scratch directory");
+    let (input, out) = (dir.join("in.nut"), dir.join("out.nut"));
+    let picture = |k: i64| -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|i| {
+                [
+                    (i as i64 * 3 + k) as u8,
+                    (i as i64 + k * 7) as u8,
+                    k as u8,
+                    255,
+                ]
+            })
+            .collect()
+    };
+    let stream = Stream::video("rgba", width, height, TimeBase { num: 1, den: 25 }).expect("rgba");
+    let mut wire = Vec::new();
+    {
+        let mut muxer = Muxer::new(&mut wire, &stream).expect("write NUT headers");
+        for k in 0..frames {
+            muxer.write_frame(k, &picture(k)).expect("write a frame");
+        }
+        muxer.finish().expect("finish the input");
+    }
+    std::fs::write(&input, wire).expect("write the input");
+    let module = invert_module();
+    let output = run_with_runtime(
+        &runtime,
+        &[
+            "-nn",
+            &format!("means={}", means_model(false).display()),
+            "-f",
+            "nut",
+            "-i",
+            &input.to_string_lossy(),
+            "-m",
+            &module.to_string_lossy(),
+            "-f",
+            "nut",
+            &out.to_string_lossy(),
+        ],
+    );
+    let message = stderr(&output);
+    assert!(output.status.success(), "the run failed:\n{message}");
+    assert!(
+        message.contains("[nn] means: execution provider "),
+        "the run loaded ONNX Runtime:\n{message}"
+    );
+    let written = std::fs::read(&out).expect("read the output");
+    let mut demuxer = Demuxer::open(written.as_slice()).expect("read the output's NUT headers");
+    let mut buf = Vec::new();
+    let mut got = 0;
+    while let Some(pts) = demuxer
+        .read_frame(&mut buf)
+        .expect("read a frame to the end")
+    {
+        assert_eq!(pts, got, "the frames in order");
+        assert_eq!(
+            buf.len(),
+            (width * height * 4) as usize,
+            "frame {pts} whole"
+        );
+        assert_ne!(buf, picture(pts), "frame {pts} inverted");
+        got += 1;
+    }
+    assert_eq!(got, frames, "every frame in the file");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -54,6 +54,9 @@ pub struct Encoder {
 /// The device type the encoders that read D3D12 pictures run on.
 const D3D12VA: &str = "d3d12va";
 
+/// The device type the VideoToolbox encoders read pictures of.
+const VIDEOTOOLBOX: &str = "videotoolbox";
+
 /// The pictures an encoder that reads D3D12 pictures has in flight before
 /// it waits for one. Each picture reaches it through a copy on another
 /// queue; at libavcodec's default of 2 the wait for that copy held a
@@ -200,7 +203,10 @@ impl Encoder {
     /// An encoder that reads D3D12 pictures (`h264_d3d12va`,
     /// `hevc_d3d12va`, `av1_d3d12va`), opened as [`open`](Encoder::open)
     /// opens one, with a pool of NV12 textures of the stream's size on
-    /// `device`, or on a `d3d12va` device of its own when None.
+    /// `device`, or on a `d3d12va` device of its own when None. A
+    /// VideoToolbox encoder given [`Shared::VideoToolbox`] is opened the
+    /// same way on a pool of IOSurface-backed NV12 pictures, which any
+    /// Metal device reads and writes.
     ///
     /// A picture is written into one of the pool's textures on the device
     /// ([`device_picture`](Encoder::device_picture), then
@@ -281,6 +287,13 @@ impl Encoder {
         codec.ends_with("_d3d12va")
     }
 
+    /// Whether `codec` names a VideoToolbox encoder, which reads pictures
+    /// in host memory or a pool of IOSurface-backed pictures that
+    /// [`open_on_device`](Encoder::open_on_device) gives it.
+    pub fn reads_videotoolbox(codec: &str) -> bool {
+        codec.ends_with("_videotoolbox")
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn open_with(
         codec: &str,
@@ -335,23 +348,29 @@ impl Encoder {
         let mut ctx = CodecCtx::new(found).map_err(call("avcodec_alloc_context3", &name))?;
 
         let supported = ctx.supported_pix_fmts();
-        // An encoder on the device lists only `d3d12`; what it codes is its
-        // pool's format, NV12.
+        // An encoder on the device lists its device's format (`d3d12`,
+        // `videotoolbox_vld`); what it codes is its pool's format, NV12.
         let on_device = match &device {
             None => None,
-            Some(_) => {
+            Some(shared) => {
                 let refuse = |why: String| Error::Call {
                     call: "av_hwframe_ctx_init",
                     codec: name.clone(),
                     why,
                 };
-                let reads = lib.pix_fmt("d3d12").is_some_and(|f| supported.contains(&f));
+                let (format, device_name, api) = match shared {
+                    Some(Shared::VideoToolbox) => {
+                        ("videotoolbox_vld", VIDEOTOOLBOX, "VideoToolbox")
+                    }
+                    _ => ("d3d12", D3D12VA, "D3D12"),
+                };
+                let reads = lib.pix_fmt(format).is_some_and(|f| supported.contains(&f));
                 if !reads {
-                    return Err(refuse("it does not read D3D12 pictures".to_string()));
+                    return Err(refuse(format!("it does not read {api} pictures")));
                 }
-                let Some(device_type) = lib.hw_type(D3D12VA) else {
+                let Some(device_type) = lib.hw_type(device_name) else {
                     return Err(refuse(format!(
-                        "this libav cannot create a {D3D12VA} device"
+                        "this libav cannot create a {device_name} device"
                     )));
                 };
                 if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
@@ -392,7 +411,13 @@ impl Encoder {
                 }
                 fmt
             }
-            None => supported.first().copied().unwrap_or(input_fmt),
+            // The first the encoder lists that pictures in host memory are
+            // made in: a VideoToolbox encoder lists its device's first.
+            None => supported
+                .iter()
+                .copied()
+                .find(|&f| !lib.pix_fmt_is_hw(f))
+                .unwrap_or(input_fmt),
         };
 
         let color = match color {
@@ -434,9 +459,17 @@ impl Encoder {
         // unless told otherwise; an explicit `threads` below replaces this.
         ctx.set_option("threads", "auto")
             .map_err(call("av_opt_set threads", &name))?;
-        if let (Some((device_type, nv12)), Some(device)) = (on_device, device) {
+        if let (Some((device_type, nv12)), Some(Some(Shared::VideoToolbox))) = (on_device, &device)
+        {
+            let format = lib
+                .pix_fmt("videotoolbox_vld")
+                .expect("checked above that the encoder reads it");
+            ctx.attach_device_frames(device_type, format, nv12, w, h)
+                .map_err(call("av_hwframe_ctx_init", &name))?;
+        } else if let (Some((device_type, nv12)), Some(device)) = (on_device, device) {
             let raw = match device {
                 Some(Shared::D3d12(raw)) => raw.into_raw(),
+                Some(Shared::VideoToolbox) => unreachable!("taken by the branch above"),
                 None => std::ptr::null_mut(),
             };
             ctx.attach_d3d12_frames(device_type, raw, nv12, w, h)
@@ -506,16 +539,19 @@ impl Encoder {
         })
     }
 
-    /// Whether the encoder reads D3D12 pictures from its pool.
+    /// Whether the encoder reads pictures from a pool on a device: D3D12
+    /// textures, or IOSurface-backed VideoToolbox pictures.
     pub fn on_device(&self) -> bool {
         self.pool.is_some()
     }
 
     /// A picture from the encoder's pool, for the caller to write on the
-    /// device: an NV12 texture of the stream's size, whose D3D12 objects
-    /// [`DeviceFrame::d3d12`] names. The caller records the write, has the
-    /// sync object signalled once it has run, says the value with
-    /// [`DeviceFrame::written_at`], and hands the picture to
+    /// device: NV12 of the stream's size. A D3D12 one is a texture whose
+    /// objects [`DeviceFrame::d3d12`] names; the caller records the write,
+    /// has the sync object signalled once it has run, and says the value
+    /// with [`DeviceFrame::written_at`]. A VideoToolbox one is a
+    /// `CVPixelBuffer` [`DeviceFrame::cv_pixel_buffer`] names, which the
+    /// caller writes and waits for. Either is then handed to
     /// [`send_picture`](Encoder::send_picture).
     pub fn device_picture(&mut self) -> Result<DeviceFrame> {
         let mut frame = Frame::new(self.lib).map_err(call("av_frame_alloc", &self.name))?;
@@ -540,11 +576,11 @@ impl Encoder {
         pts: i64,
         duration: Option<i64>,
     ) -> Result<()> {
-        if picture.frame.d3d12().is_none() {
+        if picture.frame.d3d12().is_none() && picture.frame.videotoolbox().is_none() {
             return Err(Error::Call {
                 call: "avcodec_send_frame",
                 codec: self.name.clone(),
-                why: "the picture is not one of a D3D12 pool".to_string(),
+                why: "the picture is not one of the encoder's pool".to_string(),
             });
         }
         picture.frame.set_color(self.color);

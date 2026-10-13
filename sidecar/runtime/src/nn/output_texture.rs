@@ -195,7 +195,7 @@ impl DeviceOutput for BoundTexture {
     }
 
     fn read(&self) -> wasmtime::Result<Vec<u8>> {
-        let read = match &self.route {
+        let read: Result<Vec<u8>> = match &self.route {
             #[cfg(windows)]
             Route::Cuda(output) => output.read(),
             #[cfg(windows)]

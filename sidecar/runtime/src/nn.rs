@@ -399,6 +399,7 @@ impl ModelRegistry {
     ) -> Result<()> {
         // The backend's own message names only the kind of failure; what
         // ONNX Runtime said is its cause, kept so a refusal carries it.
+        backend.name_next(name);
         let graph = backend.load(&[bytes], target).map_err(anyhow::Error::new)?;
         Arc::get_mut(&mut self.0)
             .context("the model registry is already shared")?
@@ -436,6 +437,15 @@ struct Models {
 /// Loaded once per process: building a session is expensive and `Graph` is
 /// reference-counted, so every store shares the one session. `Backend` is not
 /// shared, and is rebuilt for each store.
+/// Whether this process has loaded ONNX Runtime.
+static LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process has loaded ONNX Runtime: a run binding no model never
+/// does.
+pub fn runtime_loaded() -> bool {
+    LOADED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn graph_registry() -> &'static OnceLock<Models> {
     static MODELS: OnceLock<Models> = OnceLock::new();
     &MODELS
@@ -597,6 +607,42 @@ fn registered(
     _directml_lib: Option<&Path>,
 ) -> OnnxBackend {
     onnx
+}
+
+/// `onnx` with CoreML registered as the host wants it: in the MLProgram
+/// format, which runs more of a model than the default and does so on the
+/// GPU, on the CPU and GPU only, with each compiled model cached under the
+/// runtime's directory, so a run after the first skips the compile. The
+/// Neural Engine is left out: CoreML compiles a model for it again on every
+/// load, which no cache keeps (45 s for X-CLIP's video tower, every run). The backend builds a CoreML
+/// session for each shape a model's inputs arrive in, with the model's free
+/// dimensions fixed to it, since CoreML runs a graph with free dimensions
+/// mostly on the CPU.
+#[cfg(target_os = "macos")]
+fn coreml_registered(onnx: OnnxBackend, provider: Provider, dir: &Path) -> OnnxBackend {
+    use ort::execution_providers::coreml::{
+        CoreMLComputeUnits, CoreMLExecutionProvider, CoreMLModelFormat,
+    };
+    use ort::execution_providers::ExecutionProvider;
+    if provider != Provider::CoreMl {
+        return onnx;
+    }
+    let cache = dir.join("coreml-cache");
+    let cache = std::fs::create_dir_all(&cache)
+        .ok()
+        .map(|()| cache.to_string_lossy().into_owned());
+    onnx.with_registrar(
+        Provider::CoreMl,
+        Arc::new(move |builder| {
+            let mut coreml = CoreMLExecutionProvider::default()
+                .with_model_format(CoreMLModelFormat::MLProgram)
+                .with_compute_units(CoreMLComputeUnits::CPUAndGPU);
+            if let Some(cache) = &cache {
+                coreml = coreml.with_model_cache_dir(cache);
+            }
+            coreml.register(builder).map_err(|e| e.to_string())
+        }),
+    )
 }
 
 /// The wasi-nn context the store of the module at `module_path` gets, and
@@ -994,6 +1040,7 @@ pub fn configure(config: &Config) -> Result<()> {
     ort::init_from(lib.to_string_lossy().to_string())
         .commit()
         .map_err(|e| anyhow::anyhow!("initialising ONNX Runtime from {}: {e}", lib.display()))?;
+    LOADED.store(true, std::sync::atomic::Ordering::Release);
 
     let cuda_runtime = match provider {
         Provider::Cuda => dlls::locate(&dlls::search_dirs(&dir), dlls::CUDA_RUNTIME)
@@ -1008,12 +1055,15 @@ pub fn configure(config: &Config) -> Result<()> {
         }
         _ => None,
     };
-    let mut onnx = Backend::from(registered(
+    let onnx = registered(
         onnx_backend(provider),
         provider,
         cuda_runtime.as_deref(),
         directml_lib.as_deref(),
-    ));
+    );
+    #[cfg(target_os = "macos")]
+    let onnx = coreml_registered(onnx, provider, &dir);
+    let mut onnx = Backend::from(onnx);
 
     let mut registry = ModelRegistry::default();
     let mut names = Vec::new();
@@ -1230,7 +1280,13 @@ mod tests {
         let first = GPU_PRIORITY[0];
         let dir = empty_dir("exclude-one-model");
         let only_a = config(&["a", "b"], vec![one("a", first)]);
-        let (_, notes) = resolve(Target::Gpu, &dir, &only_a.pins());
+        let (provider, notes) = resolve(Target::Gpu, &dir, &only_a.pins());
+        if preflight(first, &dir).is_empty() {
+            // A provider needing nothing on disk (CoreML) passes its
+            // preflight even here, and is taken.
+            assert_eq!(provider, first, "{notes:?}");
+            return;
+        }
         let named = format!("not {}", first.name());
         let note = notes
             .iter()

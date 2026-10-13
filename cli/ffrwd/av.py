@@ -88,8 +88,11 @@ ENCODE_OPTIONS: Mapping[str, str] = {
 ENCODE_COLOUR: tuple[str, ...] = ("color_range", "color_primaries", "color_trc", "colorspace")
 # What an encoder makes YUV of rgba in where nothing says: BT.709, limited.
 _RGB_TO_YUV: Mapping[str, str] = {"color_range": "tv", "colorspace": "bt709"}
-# The matrices an encoder reading D3D12 pictures makes of rgba on the device.
-_D3D12_MATRICES = frozenset({"bt709", "bt470bg", "smpte170m"})
+# The matrices an encoder reading its pictures on the device (D3D12, or
+# VideoToolbox's on Metal) has rgba made into there.
+_DEVICE_MATRICES = frozenset({"bt709", "bt470bg", "smpte170m"})
+# The encoders that may read their pictures on the device.
+_DEVICE_ENCODER_SUFFIXES = ("_d3d12va", "_videotoolbox")
 # BT.601's matrix, by both of its names.
 _BT601 = frozenset({"bt470bg", "smpte170m"})
 # Encoders that code full range, whatever range they are handed.
@@ -113,7 +116,7 @@ def encoded_colour(
         made.update(color_range="pc", colorspace="gbr")
     elif from_rgb:
         made = {**_RGB_TO_YUV, **made}
-        if codec.endswith("_d3d12va") and made["colorspace"] not in _D3D12_MATRICES:
+        if codec.endswith(_DEVICE_ENCODER_SUFFIXES) and made["colorspace"] not in _DEVICE_MATRICES:
             made["colorspace"] = _RGB_TO_YUV["colorspace"]
         if codec in _BT601_ENCODERS and made["colorspace"] not in _BT601:
             made["colorspace"] = "bt470bg"
@@ -123,7 +126,7 @@ def encoded_colour(
 
 
 # The encoder names that run on a hardware encode session.
-HARDWARE_ENCODER_SUFFIXES = ("_nvenc", "_qsv", "_vaapi", "_amf", "_d3d12va")
+HARDWARE_ENCODER_SUFFIXES = ("_nvenc", "_qsv", "_vaapi", "_amf", "_d3d12va", "_videotoolbox")
 
 # The ``encode`` node's argument naming its encoder.
 CODEC = "codec"

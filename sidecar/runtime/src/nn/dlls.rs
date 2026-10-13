@@ -302,9 +302,33 @@ pub fn loaded() -> Option<Vec<PathBuf>> {
     Some(out)
 }
 
+#[cfg(target_os = "macos")]
+pub fn loaded() -> Option<Vec<PathBuf>> {
+    // dyld's list of the images the process loaded, in libSystem.
+    extern "C" {
+        fn _dyld_image_count() -> u32;
+        fn _dyld_get_image_name(index: u32) -> *const std::os::raw::c_char;
+    }
+    let mut out = Vec::new();
+    // SAFETY: dyld's own image list; a name is valid while its image stays
+    // loaded, and is copied before the next call.
+    unsafe {
+        for index in 0.._dyld_image_count() {
+            let name = _dyld_get_image_name(index);
+            if !name.is_null() {
+                let name = std::ffi::CStr::from_ptr(name).to_string_lossy();
+                out.push(PathBuf::from(name.into_owned()));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Some(out)
+}
+
 /// Nothing here enumerates the loaded images, so the provider cannot be
 /// established and callers are told so rather than guessing.
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn loaded() -> Option<Vec<PathBuf>> {
     None
 }

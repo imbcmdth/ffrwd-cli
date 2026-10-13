@@ -245,26 +245,55 @@ fn frames_held_on_the_gpu_come_back_with_the_same_box() {
     assert_eq!(got, again, "-jobs 1 and -jobs 4 write the same bytes");
 }
 
-// A decoder on the process's own device: `decode` with `hw=d3d12va`, read
-// by an input held on the GPU, leaves its pictures there, and gpu_box reads
-// them as textures with nothing uploaded at its lane.
+// A decoder on the process's own device: `decode` with `hw=d3d12va` on
+// Windows or `hw=videotoolbox` on macOS, read by an input held on the GPU,
+// leaves its pictures there, and gpu_box reads them as textures with
+// nothing uploaded at its lane.
 
-/// The h264 fixture: 64x48, B-frames.
+/// The h264 fixture: 64x48, B-frames. On macOS 96x64, since VideoToolbox
+/// decodes nothing as small as 64x48 and libavcodec falls back to software.
 fn h264_fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/h264.nut")
+    let name = if cfg!(target_os = "macos") {
+        "h264-96x64.nut"
+    } else {
+        "h264.nut"
+    };
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name)
+}
+
+/// The h264 fixture's size.
+fn h264_fixture_size() -> (u32, u32) {
+    if cfg!(target_os = "macos") {
+        (96, 64)
+    } else {
+        (64, 48)
+    }
 }
 
 /// The libav directory `FFRWD_AV_RUNTIME` names, where it holds libav;
 /// None, having said why the test is skipped, otherwise or off Windows.
 fn d3d12va_libav(test: &str) -> Option<PathBuf> {
     if !cfg!(windows) {
-        eprintln!(
-            "SKIPPED: {test}. A decoder shares the process's device on Windows (D3D12) only."
-        );
+        eprintln!("SKIPPED: {test}. The D3D12 encoders run on Windows only.");
         return None;
     }
+    libav(test)
+}
+
+/// The libav directory `FFRWD_AV_RUNTIME` names, where it holds libav;
+/// None, having said why the test is skipped, otherwise.
+fn libav(test: &str) -> Option<PathBuf> {
+    let library = if cfg!(windows) {
+        "avcodec-63.dll"
+    } else if cfg!(target_os = "macos") {
+        "libavcodec.63.dylib"
+    } else {
+        "libavcodec.so.63"
+    };
     let dir = std::env::var_os("FFRWD_AV_RUNTIME").map(PathBuf::from);
-    match dir.filter(|d| d.join("avcodec-63.dll").is_file()) {
+    match dir.filter(|d| d.join(library).is_file()) {
         Some(dir) => Some(dir),
         None => {
             eprintln!(
@@ -309,21 +338,56 @@ fn frames_in(path: &Path) -> Vec<(i64, Vec<u8>)> {
     read_nut(&wire)
 }
 
-const DECODED_LINE: &str = "[gpu] decode h264: d3d12va, frames ";
 const UPLOAD_LINE: &str = "putting the frames of stream";
+
+/// The device a decoder shares the process's device through, and the
+/// libav directory: `d3d12va` on Windows, `videotoolbox` on macOS. None,
+/// having said why the test is skipped, elsewhere.
+fn shared_decoder(test: &str) -> Option<(&'static str, PathBuf)> {
+    let device = if cfg!(windows) {
+        "d3d12va"
+    } else if cfg!(target_os = "macos") {
+        "videotoolbox"
+    } else {
+        eprintln!(
+            "SKIPPED: {test}. A decoder shares the process's device on Windows (D3D12) and \
+             macOS (Metal) only."
+        );
+        return None;
+    };
+    Some((device, libav(test)?))
+}
+
+/// What the decoder says of how its pictures are taken on `device`.
+fn decoded_line(device: &str) -> String {
+    format!("[gpu] decode h264: {device}, frames ")
+}
+
+/// The device a decoder shares the process's device through, the h264
+/// encoder that reads its pool there, and the libav directory:
+/// `h264_d3d12va` on Windows, `h264_videotoolbox` on macOS.
+fn shared_encoder(test: &str) -> Option<(&'static str, &'static str, PathBuf)> {
+    let (device, dir) = shared_decoder(test)?;
+    let encoder = if cfg!(windows) {
+        "h264_d3d12va"
+    } else {
+        "h264_videotoolbox"
+    };
+    Some((device, encoder, dir))
+}
 
 #[test]
 fn pictures_decoded_on_the_device_reach_gpu_box_unuploaded_and_as_software_decodes_them() {
     let test =
         "pictures_decoded_on_the_device_reach_gpu_box_unuploaded_and_as_software_decodes_them";
-    let Some(dir) = d3d12va_libav(test) else {
+    let Some((device, dir)) = shared_decoder(test) else {
         return;
     };
     let chain = |hw: &str, memory: &str| {
         format!("[0:v]decode=format=yuv420p:hw={hw}[d];[v=d]gpu_box=memory={memory}:out=host:size=5[out=o]")
     };
     let on_device = scratch("on_device.nut");
-    let output = run_decoded(&dir, &chain("d3d12va", "gpu"), &[("o", &on_device)]);
+    let output = run_decoded(&dir, &chain(device, "gpu"), &[("o", &on_device)]);
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
         return;
@@ -334,9 +398,10 @@ fn pictures_decoded_on_the_device_reach_gpu_box_unuploaded_and_as_software_decod
         "decode on the device exited {:?}:\n{stderr}",
         output.status.code()
     );
+    let decoded = decoded_line(device);
     assert!(
-        stderr.contains(&format!("{DECODED_LINE}wrapped"))
-            || stderr.contains(&format!("{DECODED_LINE}copied")),
+        stderr.contains(&format!("{decoded}wrapped"))
+            || stderr.contains(&format!("{decoded}copied")),
         "the decoder says how its pictures are taken:\n{stderr}"
     );
     assert!(
@@ -385,7 +450,7 @@ fn pictures_decoded_on_the_device_reach_gpu_box_unuploaded_and_as_software_decod
 #[test]
 fn encode_reads_a_picture_decoded_on_the_device_back_once_as_ffmpeg_decodes_it() {
     let test = "encode_reads_a_picture_decoded_on_the_device_back_once_as_ffmpeg_decodes_it";
-    let Some(dir) = d3d12va_libav(test) else {
+    let Some((device, dir)) = shared_decoder(test) else {
         return;
     };
     if Command::new("ffmpeg")
@@ -399,10 +464,12 @@ fn encode_reads_a_picture_decoded_on_the_device_back_once_as_ffmpeg_decodes_it()
     }
     // gpu_box holds [d] on the GPU, so the decoder leaves its pictures
     // there; encode reads the same frames and reads each back.
-    let chain = "[0:v]decode=format=yuv420p:hw=d3d12va[d];\
-                 [v=d]gpu_box=memory=gpu:out=host:size=5[out=o];[d]encode=codec=ffv1[e]";
+    let chain = format!(
+        "[0:v]decode=format=yuv420p:hw={device}[d];\
+         [v=d]gpu_box=memory=gpu:out=host:size=5[out=o];[d]encode=codec=ffv1[e]"
+    );
     let (boxed, encoded) = (scratch("boxed.nut"), scratch("encoded.nut"));
-    let output = run_decoded(&dir, chain, &[("o", &boxed), ("e", &encoded)]);
+    let output = run_decoded(&dir, &chain, &[("o", &boxed), ("e", &encoded)]);
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
         return;
@@ -414,7 +481,7 @@ fn encode_reads_a_picture_decoded_on_the_device_back_once_as_ffmpeg_decodes_it()
         output.status.code()
     );
     assert!(
-        stderr.contains(DECODED_LINE),
+        stderr.contains(&decoded_line(device)),
         "the decoder ran on the device:\n{stderr}"
     );
     let _ = std::fs::remove_file(&boxed);
@@ -552,12 +619,15 @@ fn plane_means(picture: &[u8], width: usize, height: usize) -> [f64; 3] {
 }
 
 const SIZE: (usize, usize) = (320, 240);
-const FROM_THE_DEVICE: &str = "[av] encode h264_d3d12va: 320x240 nv12, from the device";
+/// What `encoder` says when it is opened on the device for 320x240.
+fn from_the_device(encoder: &str) -> String {
+    format!("[av] encode {encoder}: 320x240 nv12, from the device")
+}
 
 #[test]
-fn h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back() {
-    let test = "h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back";
-    let Some(dir) = d3d12va_libav(test) else {
+fn an_encoder_on_the_device_takes_the_decoders_pictures_with_nothing_read_back() {
+    let test = "an_encoder_on_the_device_takes_the_decoders_pictures_with_nothing_read_back";
+    let Some((device, encoder, dir)) = shared_encoder(test) else {
         return;
     };
     let Some(()) = ffmpeg(test) else {
@@ -596,8 +666,9 @@ fn h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back
         return;
     }
     let out = scratch("d3d12va_out.nut");
-    let chain = "[0:v]decode=format=yuv420p:hw=d3d12va[d];[d]encode=codec=h264_d3d12va:b=2M[out0]";
-    let output = run_chain(&dir, &source, chain, &out, None);
+    let chain =
+        format!("[0:v]decode=format=yuv420p:hw={device}[d];[d]encode=codec={encoder}:b=2M[out0]");
+    let output = run_chain(&dir, &source, &chain, &out, None);
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
         return;
@@ -608,12 +679,14 @@ fn h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back
         "exited {:?}:\n{stderr}",
         output.status.code()
     );
-    assert!(stderr.contains(FROM_THE_DEVICE), "{stderr}");
+    assert!(stderr.contains(&from_the_device(encoder)), "{stderr}");
     assert!(
-        stderr.contains("[gpu] encode h264_d3d12va: from the device, each frame "),
+        stderr.contains(&format!(
+            "[gpu] encode {encoder}: from the device, each frame "
+        )),
         "the copy is said:\n{stderr}"
     );
-    assert!(stderr.contains(DECODED_LINE), "{stderr}");
+    assert!(stderr.contains(&decoded_line(device)), "{stderr}");
     let row = profile_row(&stderr);
     for stage in ["upload", "download"] {
         assert_eq!(row[stage]["bytes"], 0, "nothing crosses to the host: {row}");
@@ -689,9 +762,9 @@ fn h264_d3d12va_takes_the_decoders_pictures_on_the_device_with_nothing_read_back
 }
 
 #[test]
-fn h264_d3d12va_takes_a_modules_rgba_as_nv12_made_on_the_device() {
-    let test = "h264_d3d12va_takes_a_modules_rgba_as_nv12_made_on_the_device";
-    let Some(dir) = d3d12va_libav(test) else {
+fn an_encoder_on_the_device_takes_a_modules_rgba_as_nv12_made_there() {
+    let test = "an_encoder_on_the_device_takes_a_modules_rgba_as_nv12_made_there";
+    let Some((_, encoder, dir)) = shared_encoder(test) else {
         return;
     };
     let Some(()) = ffmpeg(test) else {
@@ -718,9 +791,10 @@ fn h264_d3d12va_takes_a_modules_rgba_as_nv12_made_on_the_device() {
         "making an rgba stream",
     );
     let encoded = scratch("d3d12va_boxed.nut");
-    let chain = "[v=0:v]gpu_box=memory=gpu:out=gpu:size=40[out=b];\
-                 [b]encode=codec=h264_d3d12va:b=8M[out0]";
-    let output = run_chain(&dir, &source, chain, &encoded, Some(&module));
+    let chain = format!(
+        "[v=0:v]gpu_box=memory=gpu:out=gpu:size=40[out=b];[b]encode=codec={encoder}:b=8M[out0]"
+    );
+    let output = run_chain(&dir, &source, &chain, &encoded, Some(&module));
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
         return;
@@ -731,7 +805,7 @@ fn h264_d3d12va_takes_a_modules_rgba_as_nv12_made_on_the_device() {
         "exited {:?}:\n{stderr}",
         output.status.code()
     );
-    assert!(stderr.contains(FROM_THE_DEVICE), "{stderr}");
+    assert!(stderr.contains(&from_the_device(encoder)), "{stderr}");
     assert!(
         stderr.contains("made NV12 from rgba first"),
         "the conversion is said:\n{stderr}"
@@ -983,7 +1057,7 @@ fn pictures_decoded_on_the_device_reach_an_rgba_reader_converted_there() {
         "exited {:?}:\n{stderr}",
         output.status.code()
     );
-    assert!(stderr.contains(DECODED_LINE), "{stderr}");
+    assert!(stderr.contains(&decoded_line("d3d12va")), "{stderr}");
     assert!(
         stderr.contains("[gpu] convert nv12 64x48 to rgba 64x48"),
         "the decoder's NV12 is made rgba on the device:\n{stderr}"
@@ -1324,6 +1398,41 @@ fn an_input_that_follows_another_is_resized_on_the_device() {
     }
 }
 
+/// How long a run may take to put its feed's port up while the programme's
+/// first frame is the only one written: spawning the sidecar, opening the
+/// device and compiling the module come first, and take what the machine
+/// makes them (2.4 s on an M1 Max, 8 s for a debug build on one core). It
+/// only has to be past any start.
+const LISTENING_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Reads `child`'s stderr to its end on a thread of its own: the moment
+/// its feed's port is up, sent once, and the whole of it when the run ends.
+fn watch_for_listening(
+    child: &mut std::process::Child,
+) -> (
+    std::sync::mpsc::Receiver<std::time::Instant>,
+    std::thread::JoinHandle<String>,
+) {
+    use std::io::BufRead;
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (up, listening) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line.contains("\"kind\":\"listen\"") {
+                let _ = up.send(std::time::Instant::now());
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+    (listening, reader)
+}
+
 #[test]
 fn a_feed_held_on_the_gpu_is_conformed_on_the_device() {
     use std::net::{TcpListener, TcpStream};
@@ -1349,14 +1458,23 @@ fn a_feed_held_on_the_gpu_is_conformed_on_the_device() {
         .spawn()
         .expect("spawn ffrwd-wasm");
 
-    // The programme, flat green, paced at 25 a second for three seconds.
+    // The programme, flat green, at 25 a second for three seconds: its first
+    // frame at once, the rest paced from when the feed's port is up, so the
+    // sidecar's own start is not in the three seconds.
+    let (listening, stderr_reader) = watch_for_listening(&mut child);
     let mut stdin = child.stdin.take().expect("stdin is piped");
     let programme = std::thread::spawn(move || {
         let mut stream = Stream::video("rgba", small.0, small.1, TIME_BASE).expect("rgba");
         stream.frame_rate = Some((25, 1));
         let mut muxer = Muxer::new(&mut stdin, &stream).expect("headers");
-        let started = Instant::now();
-        for k in 0..75i64 {
+        if muxer.write_frame(0, &green(small.0, small.1)).is_err() {
+            return;
+        }
+        let _ = muxer.flush();
+        let started = listening
+            .recv_timeout(LISTENING_BOUND)
+            .unwrap_or_else(|_| Instant::now());
+        for k in 1..75i64 {
             let due = started + Duration::from_millis(40 * k as u64);
             if let Some(wait) = due.checked_duration_since(Instant::now()) {
                 std::thread::sleep(wait);
@@ -1397,11 +1515,11 @@ fn a_feed_held_on_the_gpu_is_conformed_on_the_device() {
     });
     let output = child.wait_with_output().expect("wait for ffrwd-wasm");
     let _ = (programme.join(), feeder.join());
+    let stderr = stderr_reader.join().expect("read stderr");
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
         return;
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
         "exited {:?}:\n{stderr}",
@@ -1448,7 +1566,7 @@ fn a_coded_feed_held_on_the_gpu_is_decoded_on_the_device() {
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
     let test = "a_coded_feed_held_on_the_gpu_is_decoded_on_the_device";
-    let Some(dir) = d3d12va_libav(test) else {
+    let Some((device, dir)) = shared_decoder(test) else {
         return;
     };
     let module = module();
@@ -1469,14 +1587,23 @@ fn a_coded_feed_held_on_the_gpu_is_decoded_on_the_device() {
         .spawn()
         .expect("spawn ffrwd-wasm");
 
-    // The programme, flat green, paced at 25 a second for three seconds.
+    // The programme, flat green, at 25 a second for three seconds: its first
+    // frame at once, the rest paced from when the feed's port is up, so the
+    // sidecar's own start is not in the three seconds.
+    let (listening, stderr_reader) = watch_for_listening(&mut child);
     let mut stdin = child.stdin.take().expect("stdin is piped");
     let programme = std::thread::spawn(move || {
         let mut stream = Stream::video("rgba", small.0, small.1, TIME_BASE).expect("rgba");
         stream.frame_rate = Some((25, 1));
         let mut muxer = Muxer::new(&mut stdin, &stream).expect("headers");
-        let started = Instant::now();
-        for k in 0..75i64 {
+        if muxer.write_frame(0, &green(small.0, small.1)).is_err() {
+            return;
+        }
+        let _ = muxer.flush();
+        let started = listening
+            .recv_timeout(LISTENING_BOUND)
+            .unwrap_or_else(|_| Instant::now());
+        for k in 1..75i64 {
             let due = started + Duration::from_millis(40 * k as u64);
             if let Some(wait) = due.checked_duration_since(Instant::now()) {
                 std::thread::sleep(wait);
@@ -1488,7 +1615,7 @@ fn a_coded_feed_held_on_the_gpu_is_decoded_on_the_device() {
         }
         let _ = muxer.finish();
     });
-    // The feeder: the h264 fixture's packets as they are, 64x48.
+    // The feeder: the h264 fixture's packets as they are.
     let feeder = std::thread::spawn(move || {
         let until = Instant::now() + Duration::from_secs(10);
         let socket = loop {
@@ -1517,22 +1644,23 @@ fn a_coded_feed_held_on_the_gpu_is_decoded_on_the_device() {
     });
     let output = child.wait_with_output().expect("wait for ffrwd-wasm");
     let _ = (programme.join(), feeder.join());
+    let stderr = stderr_reader.join().expect("read stderr");
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
         return;
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
         "exited {:?}:\n{stderr}",
         output.status.code()
     );
-    assert!(stderr.contains(DECODED_LINE), "{stderr}");
+    assert!(stderr.contains(&decoded_line(device)), "{stderr}");
+    let (fw, fh) = h264_fixture_size();
     assert!(
-        stderr.contains(
-            "feed: gpu_box 'w': the feeder's picture is 64x48 h264, conformed to 32x24 rgba \
-             on the GPU"
-        ),
+        stderr.contains(&format!(
+            "feed: gpu_box 'w': the feeder's picture is {fw}x{fh} h264, conformed to 32x24 \
+             rgba on the GPU"
+        )),
         "{stderr}"
     );
     // The programme alone is uploaded; the feed's pictures never were in
@@ -1660,7 +1788,7 @@ fn scale_d3d12_runs_between_a_decoder_and_an_encoder_on_the_device() {
         "exited {:?}:\n{stderr}",
         output.status.code()
     );
-    assert!(stderr.contains(DECODED_LINE), "{stderr}");
+    assert!(stderr.contains(&decoded_line("d3d12va")), "{stderr}");
     assert!(stderr.contains(FILTER_LINE), "{stderr}");
     assert!(
         stderr.contains("[av] filter scale_d3d12: frames copied on the device"),

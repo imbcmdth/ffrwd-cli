@@ -12,7 +12,7 @@ crate-type = ["rlib"]
 [features]
 # wasi:webgpu for modules granted `-gpu`, over wgpu-core (Vulkan, D3D12,
 # Metal). Off, a module importing wasi:webgpu is refused at instantiation.
-gpu = ["dep:wasi-webgpu-wasmtime", "dep:wasmtime-wasi-io", "dep:wgpu-hal", "dep:windows"]
+gpu = ["dep:wasi-webgpu-wasmtime", "dep:wasmtime-wasi-io", "dep:wgpu-hal", "dep:windows", "dep:objc2", "dep:objc2-metal", "dep:objc2-core-video", "dep:objc2-core-foundation"]
 
 [dependencies]
 # The wasi:webgpu@0.0.1 host, vendored and adapted from wasi-gfx-runtime;
@@ -83,6 +83,16 @@ ort = { version = "=2.0.0-rc.10", default-features = false, features = ["cuda"] 
 # CoreML is Apple's, and the only GPU provider there.
 wasmtime-wasi-nn = { version = "48.0.1", default-features = false, features = ["onnx-coreml"] }
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["coreml"] }
+
+# The Metal objects under the process's wgpu device, for the VideoToolbox
+# pictures a decoder writes and an encoder reads: wgpu-hal's metal types, the
+# objc2 versions they are declared in (wgpu-hal 29's), and CoreVideo's cache
+# that makes a picture's planes Metal textures.
+wgpu-hal = { version = "29", features = ["metal"], optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+objc2-core-foundation = { version = "0.3", optional = true }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "objc2", "objc2-metal", "CVBuffer", "CVImageBuffer", "CVMetalTexture", "CVMetalTextureCache", "CVPixelBuffer", "CVReturn"], optional = true }
 
 # The integration tests read the rows a module emits, which are JSON.
 [dev-dependencies]

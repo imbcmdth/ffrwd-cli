@@ -59,9 +59,11 @@ from.
 
 ## Sharp edges
 
-- **The card path is CUDA's and Vulkan's.** `hwaccel => 'cuda'` to an
-  `_nvenc` encoder, or `hwaccel => 'vulkan'` to a `_vulkan` one, keeps
-  the picture on the card; `vaapi`, `qsv` and `amf` are decoded and
+- **The card path is CUDA's, Vulkan's and VideoToolbox's.** `hwaccel =>
+  'cuda'` to an `_nvenc` encoder, `hwaccel => 'vulkan'` to a `_vulkan`
+  one, or `hwaccel => 'videotoolbox'` to a `_videotoolbox` one keeps the
+  picture on the card; VideoToolbox has `scale_vt` and `transpose_vt`
+  only. `vaapi`, `qsv` and `amf` are decoded and
   encoded as asked, but every filter between runs on the CPU, and the
   `_cuda` or `_vulkan` filters the compiler writes need an ffmpeg built
   with them, which a packaged build may lack. A `scale` with `flags` or a
@@ -71,6 +73,13 @@ from.
   of one ends with an upload. Only 8-bit and 10-bit 4:2:0 pictures, and
   8-bit 4:4:4 HEVC on CUDA, stay on the card; 4:2:2, 10-bit 4:4:4 and an
   input whose pixel format the probe does not report run on the CPU.
+- **The sidecar has no device filters on macOS.** Its bundled
+  libavfilter carries none for VideoToolbox, so a filter between two
+  modules holding their pictures on the GPU runs in ffmpeg there, and the
+  picture leaves the device for it.
+- **CoreML compiles a model on the first run that loads it.** That takes
+  from a few seconds to two minutes; later runs read the compiled model
+  from the cache in about a second.
 - **A packet filter's rows cost a second pass over the input.** The rows
   it reads are a file, and a file is finished before whatever reads it
   starts -- so a producer reading the same input the encoder reads runs

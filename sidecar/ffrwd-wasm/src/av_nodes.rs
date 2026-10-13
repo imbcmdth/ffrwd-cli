@@ -13,18 +13,23 @@
 //!
 //! A `decode` whose pictures are read by an input held on the GPU, or by an
 //! encoder that reads D3D12 pictures, decodes on the process's own device
-//! where it can (`d3d12va` on Windows), and hands its pictures on as frames
-//! on that device, so nothing is copied to host memory and back. Asked for
-//! rgba, it still leaves the decoder's NV12 there, and a reader of the
-//! frames is handed rgba converted on the device once per picture.
+//! where it can (`d3d12va` on Windows, `videotoolbox` on macOS), and hands
+//! its pictures on as frames on that device, so nothing is copied to host
+//! memory and back. Asked for rgba, it still leaves the decoder's NV12
+//! there, and a reader of the frames is handed rgba converted on the device
+//! once per picture.
 //!
 //! An `encode` whose encoder reads D3D12 pictures (`h264_d3d12va`,
 //! `hevc_d3d12va`, `av1_d3d12va`) and whose frames arrive on the process's
 //! device takes them there: each is copied on the device into a picture of
 //! the encoder's pool, a module's rgba made NV12 first, and no byte crosses
 //! to the host. Such an encoder reads nothing else, so a frame in host
-//! memory is uploaded into its pool. Every other encoder reads a frame on
-//! the GPU back once.
+//! memory is uploaded into its pool. On macOS a VideoToolbox encoder
+//! (`h264_videotoolbox`, `hevc_videotoolbox`) whose frames arrive on the
+//! process's Metal device takes them there the same way, each copy waited
+//! for before the picture is sent; frames in host memory reach it as they
+//! reach any encoder. Every other encoder reads a frame on the GPU back
+//! once.
 //!
 //! `filter` runs a libavfilter graph on a D3D12 device -
 //! `[d]filter=graph=scale_d3d12=w=1280\\:h=720[f]` - fed the way such an
@@ -226,11 +231,12 @@ pub(crate) fn yuv_of(color: Option<&ColorInfo>) -> Yuv {
 pub(crate) fn yuv_of(_color: Option<&ColorInfo>) -> Yuv {}
 
 /// A decoder on the process's own device, where `hw` allows the device
-/// it is (`auto`, or that device by name), the wire's format is one its
-/// pictures are made on the device (yuv420p, or rgba in a matrix the
-/// conversion has: `yuv`), and the device opens. None, having said why on
-/// stderr where it is not obvious, otherwise.
-#[cfg(all(feature = "gpu", windows))]
+/// it is (`auto`, or that device by name: `d3d12va` on Windows,
+/// `videotoolbox` on macOS), the wire's format is one its pictures are made
+/// on the device (yuv420p, or rgba in a matrix the conversion has: `yuv`),
+/// and the device opens. None, having said why on stderr where it is not
+/// obvious, otherwise.
+#[cfg(all(feature = "gpu", any(windows, target_os = "macos")))]
 pub(crate) fn open_on_shared_device(
     codec: &str,
     extradata: &[u8],
@@ -240,7 +246,14 @@ pub(crate) fn open_on_shared_device(
     yuv: Option<Yuv>,
 ) -> Option<(Decoder, Option<OnDevice>)> {
     use ffrwd_wasm_runtime::gpu;
+    #[cfg(windows)]
     const DEVICE: &str = "d3d12va";
+    #[cfg(windows)]
+    const API: &str = "D3D12";
+    #[cfg(target_os = "macos")]
+    const DEVICE: &str = "videotoolbox";
+    #[cfg(target_os = "macos")]
+    const API: &str = "Metal";
     let allowed = match hw {
         Hw::Auto => true,
         Hw::Device(named) => named == DEVICE,
@@ -265,9 +278,13 @@ pub(crate) fn open_on_shared_device(
         );
         return None;
     }
-    let Some(device) = gpu::d3d12::av_device() else {
+    #[cfg(windows)]
+    let device = gpu::d3d12::av_device();
+    #[cfg(target_os = "macos")]
+    let device = gpu::metal::av_device();
+    let Some(device) = device else {
         eprintln!(
-            "[gpu] decode {codec}: the process's device is not a D3D12 one, so {DEVICE} \
+            "[gpu] decode {codec}: the process's device is not a {API} one, so {DEVICE} \
              cannot share it"
         );
         return None;
@@ -284,7 +301,7 @@ pub(crate) fn open_on_shared_device(
     }
 }
 
-#[cfg(not(all(feature = "gpu", windows)))]
+#[cfg(not(all(feature = "gpu", any(windows, target_os = "macos"))))]
 pub(crate) fn open_on_shared_device(
     _codec: &str,
     _extradata: &[u8],
@@ -582,31 +599,42 @@ pub struct Encode {
     /// Copies frames on the process's device into the encoder's pictures,
     /// for an encoder opened on that device. Dropped before the encoder,
     /// waiting for the copies still running into its pictures.
-    #[cfg_attr(not(all(feature = "gpu", windows)), allow(dead_code))]
+    #[cfg_attr(
+        not(all(feature = "gpu", any(windows, target_os = "macos"))),
+        allow(dead_code)
+    )]
     feed: Option<Feed>,
     encoder: Encoder,
     coded: CodedStream,
     duration: Option<i64>,
     /// The colour an rgba frame is made NV12 in on the device: the stream's
     /// matrix and range, as the header declares them.
-    #[cfg_attr(not(all(feature = "gpu", windows)), allow(dead_code))]
+    #[cfg_attr(
+        not(all(feature = "gpu", any(windows, target_os = "macos"))),
+        allow(dead_code)
+    )]
     yuv: ColorInfo,
     /// How frames last reached the encoder, said on stderr when it changes.
     said: Option<String>,
     /// How frames on the device were last copied into the encoder's
     /// pictures, said on stderr when it changes.
-    #[cfg_attr(not(all(feature = "gpu", windows)), allow(dead_code))]
+    #[cfg_attr(
+        not(all(feature = "gpu", any(windows, target_os = "macos"))),
+        allow(dead_code)
+    )]
     copies: Option<String>,
 }
 
 #[cfg(all(feature = "gpu", windows))]
 type Feed = ffrwd_wasm_runtime::gpu::d3d12::EncoderFeed;
-#[cfg(not(all(feature = "gpu", windows)))]
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+type Feed = ffrwd_wasm_runtime::gpu::metal::EncoderFeed;
+#[cfg(not(all(feature = "gpu", any(windows, target_os = "macos"))))]
 type Feed = std::convert::Infallible;
 
-/// The process's device for an encoder that reads D3D12 pictures, and the
-/// feed that copies frames on it into the encoder's; None for both where
-/// the process has no D3D12 device.
+/// The process's device for an encoder that reads its pool there, and the
+/// feed that copies frames on it into the encoder's: D3D12 on Windows,
+/// Metal on macOS. None for both where the process has no such device.
 #[cfg(all(feature = "gpu", windows))]
 fn encoder_device() -> Option<(av::Shared, Feed)> {
     Some((
@@ -615,7 +643,15 @@ fn encoder_device() -> Option<(av::Shared, Feed)> {
     ))
 }
 
-#[cfg(not(all(feature = "gpu", windows)))]
+#[cfg(all(feature = "gpu", target_os = "macos"))]
+fn encoder_device() -> Option<(av::Shared, Feed)> {
+    Some((
+        ffrwd_wasm_runtime::gpu::metal::av_device()?,
+        Feed::default(),
+    ))
+}
+
+#[cfg(not(all(feature = "gpu", any(windows, target_os = "macos"))))]
 fn encoder_device() -> Option<(av::Shared, Feed)> {
     None
 }
@@ -702,10 +738,11 @@ impl Encode {
     /// `aspect` is the input's pixel aspect, which the coded stream
     /// declares in turn. `on_gpu` says the frames arrive held on the GPU,
     /// which an encoder that reads D3D12 pictures then takes on the
-    /// process's device.
+    /// process's device, and a VideoToolbox encoder takes there on a Metal
+    /// one.
     ///
-    /// Says on stderr what it opened, and for an encoder that reads D3D12
-    /// pictures how frames reach it:
+    /// Says on stderr what it opened, and for an encoder that reads its
+    /// pool on a device how frames reach it:
     /// `[av] encode h264_d3d12va: 1920x1080 nv12, from the device`.
     pub fn open(
         options: &[(String, String)],
@@ -748,9 +785,17 @@ impl Encode {
             ..*video
         };
         // An encoder that reads NV12 has an rgba input converted to it, in
-        // the colour the stream's header then declares.
+        // the colour the stream's header then declares. A VideoToolbox
+        // encoder reads a pool on the device only where its frames are on
+        // a Metal one.
         let reads_d3d12 = Encoder::reads_d3d12(codec);
-        let (yuv, stream_color) = if reads_d3d12 && video.pix_fmt == "rgba" {
+        let device = if reads_d3d12 || (Encoder::reads_videotoolbox(codec) && on_gpu) {
+            on_gpu.then(encoder_device).flatten()
+        } else {
+            None
+        };
+        let reads_pool = reads_d3d12 || device.is_some();
+        let (yuv, stream_color) = if reads_pool && video.pix_fmt == "rgba" {
             let (yuv, why) = nv12_color(video.color);
             if let Some(why) = why {
                 eprintln!(
@@ -775,10 +820,11 @@ impl Encode {
             i64::try_from(base.num).unwrap_or(i64::MAX),
             i64::try_from(base.den).unwrap_or(i64::MAX),
         );
-        let (encoder, feed) = if reads_d3d12 {
+        let (encoder, feed) = if reads_pool {
             // On the process's device when the frames are there, so they
-            // are copied on it; on a device of the encoder's own otherwise.
-            let (device, feed) = match on_gpu.then(encoder_device).flatten() {
+            // are copied on it; a D3D12 encoder on a device of its own
+            // otherwise.
+            let (device, feed) = match device {
                 Some((device, feed)) => (Some(device), Some(feed)),
                 None => (None, None),
             };
@@ -937,7 +983,53 @@ impl Encode {
         Ok(true)
     }
 
-    #[cfg(not(all(feature = "gpu", windows)))]
+    #[cfg(all(feature = "gpu", target_os = "macos"))]
+    fn send_on_device(
+        &mut self,
+        data: &FrameData,
+        pts: i64,
+        duration: Option<i64>,
+    ) -> Result<bool> {
+        use ffrwd_wasm_runtime::gpu::frames::{Layout, Matrix};
+        let (FrameData::Gpu(frame), Some(feed)) = (data, self.feed.as_mut()) else {
+            return Ok(false);
+        };
+        if !frame.converts_to(Layout::Nv12) {
+            return Ok(false);
+        }
+        let yuv = Yuv {
+            matrix: if self.yuv.space == "bt709" {
+                Matrix::Bt709
+            } else {
+                Matrix::Bt601
+            },
+            full_range: self.yuv.range == "pc",
+        };
+        let name = &self.name;
+        let mut picture = self
+            .encoder
+            .device_picture()
+            .map_err(|e| anyhow!("{name}: {e}"))?;
+        feed.feed(frame, yuv, &mut picture)
+            .map_err(|e| anyhow!("{name}: copying a frame into the encoder's: {e:#}"))?;
+        self.encoder
+            .send_picture(picture, pts, duration)
+            .map_err(|e| anyhow!("{name}: {e}"))?;
+        let how = "from the device, each frame a copy per plane, waited for";
+        let how = if frame.pix_fmt() == "nv12" {
+            how.to_string()
+        } else {
+            format!("{how}, made NV12 from {} first", frame.pix_fmt())
+        };
+        self.say(FROM_THE_DEVICE);
+        if self.copies.as_deref() != Some(how.as_str()) {
+            eprintln!("[gpu] encode {}: {how}", self.encoder.name());
+            self.copies = Some(how);
+        }
+        Ok(true)
+    }
+
+    #[cfg(not(all(feature = "gpu", any(windows, target_os = "macos"))))]
     fn send_on_device(
         &mut self,
         _data: &FrameData,

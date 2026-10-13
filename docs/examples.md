@@ -1584,7 +1584,7 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
   copy -color_range:0 tv -colorspace:0 bt709 boxed.mp4
 ```
 
-With `memory => 'host'` the same module holds nothing on the GPU, and its region takes raw frames on both pipes unless the declaration says `SET ffrwd.edges = 'coded'`. The region's `decode` is told `hw=auto`: where the machine's decoder and the device share one (D3D12 on Windows) the decoder's frames land on the device directly; elsewhere the decoded picture reaches it through the sidecar's own upload at the module's input and comes back through one download at the output, which the `upload` and `download` rows of `--profile` count.
+With `memory => 'host'` the same module holds nothing on the GPU, and its region takes raw frames on both pipes unless the declaration says `SET ffrwd.edges = 'coded'`. The region's `decode` is told `hw=auto`: where the machine's decoder and the device share one (D3D12 on Windows, Metal on macOS) the decoder's frames land on the device directly; elsewhere the decoded picture reaches it through the sidecar's own upload at the module's input and comes back through one download at the output, which the `upload` and `download` rows of `--profile` count.
 
 ## 158. Scale on the device, inside the region
 
@@ -1909,3 +1909,124 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
 ```
 
 The first three frames write no row. With `memory => 'gpu'` each frame's tensor is made on the device. Where the model's session binds the device's memory in place, CUDA or DirectML on the sidecar's device, the slots are copied together on the device and the joined tensor is bound the same way, so nothing is read back. Elsewhere each frame's tensor is read back once, when it is made, and the slots are joined in host memory. `sidecar/NN-EDGE.md`, "Tensors of several ticks", has the rules.
+
+## 165. Decode onto the GPU on a Mac
+
+On macOS the sidecar's device is Metal, and a region's `decode` with `hw=auto` runs VideoToolbox. Where the pictures are read by an input held on the GPU, VideoToolbox's own pictures become the module's textures: the two planes of each IOSurface it wrote are handed to the device as they are, and nothing is copied or uploaded. `gpu_box` draws on them there. `libx264` is not an encoder the sidecar hosts, so the exit is raw and each picture is read back once on its way out:
+
+```pgsql
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT gpu_box(f.video[1])
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'boxed.mp4' WITH (video_codec 'libx264', crf 20)
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
+  -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];'\
+'[v=decode0]gpu_box=memory=gpu:size=8[out=out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
+  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
+  libx264 -crf:0 20 boxed.mp4
+```
+
+The command is the same on every machine; what `hw=auto` opens is decided where it runs. VideoToolbox in the bundled libav decodes h264, hevc and prores. Another codec, or a picture smaller than VideoToolbox decodes (64x48 is refused, 96x64 is not), is decoded in software, stderr says so, and the reader uploads the picture.
+
+## 166. Encode from the GPU on a Mac
+
+Recipe 165 with `h264_videotoolbox` as the encoder, which the sidecar hosts, so the exit is coded too and the picture never leaves the device. VideoToolbox is opened on a pool of IOSurface pictures; each frame is made NV12 on the device (`gpu_box` hands back rgba), copied into one of the pool's pictures, and the copy is waited for before the encoder is handed the picture:
+
+```pgsql
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT gpu_box(f.video[1])
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'boxed.mp4' WITH (video_codec 'h264_videotoolbox', video_bitrate '6M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
+  -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];'\
+'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
+'[n1]encode=codec=h264_videotoolbox:b=6M:color_range=tv:colorspace=bt709[out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
+  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
+  copy -color_range:0 tv -colorspace:0 bt709 boxed.mp4
+```
+
+With the frames in host memory, a module holding them there or no GPU at all, the same encoder reads NV12 converted by libswscale. `hevc_videotoolbox` is the HEVC one. A `decode` read only by such an encoder decodes onto the device too, so a region that only re-encodes copies nothing to host memory.
+
+## 167. Stay on the device on a Mac
+
+Recipe 156 with VideoToolbox. `hwaccel => 'videotoolbox'` decodes onto the device and a `_videotoolbox` encoder encodes there, so the input is told `hwaccel_output_format videotoolbox_vld` and `scale` becomes `scale_vt`. `hflip` has no VideoToolbox variant and runs on the CPU between one `hwdownload` and one `hwupload`. `hwupload` makes no device of its own, so the command makes one and names it for the filtergraph (`init_hw_device`, `filter_hw_device`):
+
+```pgsql
+COPY (
+  SELECT scale(hflip(f.video[1]), 1280, -2), f.audio[1]
+  FROM input('tests/fixtures/av.mp4', hwaccel => 'videotoolbox') f
+) TO 'small.mp4' WITH (video_codec 'h264_videotoolbox', video_bitrate '6M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -init_hw_device videotoolbox=up -filter_hw_device up -hwaccel videotoolbox \
+  -hwaccel_output_format videotoolbox_vld -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0]hwdownload,format=pix_fmts=nv12,hflip,hwupload,scale_vt=w=1280:h=-2[out0]' \
+  -map '[out0]' -map 0:a:0 -c:1 copy -c:0 h264_videotoolbox -b:0 6M small.mp4
+```
+
+The variants are `scale_vt` and `transpose_vt`, and the pass uses them only where the compiling machine's ffmpeg has them. `yadif_videotoolbox` is not used. A VideoToolbox encoder also reads frames in host memory, so a picture that comes down for a CPU filter last is not sent up again.
+
+## 168. A model on the GPU on a Mac
+
+Depth Anything V2 on frames held on the GPU, as in recipe 160, on macOS. The region decodes onto the device, `depth` asks for each frame as the model's input tensor, and the encoder reads the depth map from the pool. The model runs on CoreML, which reads host memory, so the tensor made on the device is read back once a frame and the depth map is uploaded once; the frame itself never leaves the device:
+
+```pgsql
+CREATE FUNCTION depth(v video_stream, memory text DEFAULT 'host') RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/depth_gpu.wasm', 'depth' LANGUAGE wasm;
+
+COPY (
+  SELECT depth(f.video[1], memory => 'gpu')
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'depth.mp4' WITH (video_codec 'h264_videotoolbox', video_bitrate '4M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
+  -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -nn \
+  depth=../sidecar/modules/target/wasm32-wasip2/release/depth.onnx -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/depth_gpu.wasm -m \
+  depth_gpu=../sidecar/modules/target/wasm32-wasip2/release/depth_gpu.wasm \
+  -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];[v=decode0]depth_gpu=memory=gpu[out=n1];'\
+'[n1]encode=codec=h264_videotoolbox:b=4M:color_range=tv:colorspace=bt709[out0]' -bound \
+  'depth_gpu=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f \
+  nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 copy -color_range:0 tv -colorspace:0 bt709 depth.mp4
+```
+
+`ffrwd run` asks for the GPU (`-nn-target gpu`), which on macOS is CoreML. Its session is built at the first frame with the model's free dimensions fixed to that frame's tensor, since CoreML runs a graph with free dimensions mostly on the CPU, and the compiled model is cached, so only the first run pays for the compile. `sidecar/NN-EDGE.md`, "CoreML", has the rules and what they cost.

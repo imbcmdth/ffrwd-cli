@@ -1907,6 +1907,10 @@ mod sys {
     /// Wait until `fd` is ready for `events`, or a tenth of a second has
     /// passed.
     fn wait_for(fd: &OwnedFd, events: libc::c_short) {
+        #[cfg(target_os = "macos")]
+        if select(fd.as_raw_fd(), events) {
+            return;
+        }
         let mut poll = libc::pollfd {
             fd: fd.as_raw_fd(),
             events,
@@ -1914,6 +1918,36 @@ mod sys {
         };
         // SAFETY: one pollfd, alive for the call.
         unsafe { libc::poll(&mut poll, 1, POLL_MS) };
+    }
+
+    /// `wait_for` through `select`, which macOS needs for a FIFO: there
+    /// `poll` and kqueue miss the wakeup while the process on the other end
+    /// is in a blocking write larger than the FIFO holds, so every read
+    /// waited out the whole tenth of a second. False, having waited for
+    /// nothing, for a descriptor past what `select` takes.
+    #[cfg(target_os = "macos")]
+    fn select(fd: libc::c_int, events: libc::c_short) -> bool {
+        if !(0..libc::FD_SETSIZE as libc::c_int).contains(&fd) {
+            return false;
+        }
+        // SAFETY: an fd_set is plain data, zeroed then set through the
+        // macros, and `fd` is below FD_SETSIZE.
+        unsafe {
+            let mut set: libc::fd_set = std::mem::zeroed();
+            libc::FD_ZERO(&mut set);
+            libc::FD_SET(fd, &mut set);
+            let mut timeout = libc::timeval {
+                tv_sec: 0,
+                tv_usec: POLL_MS * 1000,
+            };
+            let (read, write) = if events & libc::POLLOUT != 0 {
+                (std::ptr::null_mut(), &mut set as *mut libc::fd_set)
+            } else {
+                (&mut set as *mut libc::fd_set, std::ptr::null_mut())
+            };
+            libc::select(fd + 1, read, write, std::ptr::null_mut(), &mut timeout);
+        }
+        true
     }
 
     /// A FIFO the process on the other end has opened.
