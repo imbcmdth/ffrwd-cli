@@ -2511,3 +2511,69 @@ runner, whose static ffmpeg has `scale_cuda` and `scale_vulkan` and no
 `_vt` filters, and whose sidecar loads no libav, 156 and 158 are still
 checked and 167 skips. On the owner's Windows machine 167 is the one skip.
 Here 156 (`scale_cuda`) and 158 (`scale_d3d12`) skip.
+
+### Inference on CoreML
+
+The GPU walk takes CoreML, and nothing binds on it: ONNX Runtime's CoreML
+provider reads and writes host memory, with no I/O binding to a Metal
+buffer or an IOSurface. A tensor made on the device from a frame in the
+pool is read back once (`input downloaded, COREML takes host memory`) and
+an output bound to a texture is uploaded once. That stays as it was: each
+is a copy of a tensor, 3.2 MB for depth's 518x518 input, never of a frame.
+
+What did change is that CoreML was barely running the models. Registered as
+`ort` registers it, in the NeuralNetwork format and with the models' free
+dimensions left free, it ran Depth Anything V2 small slower than the CPU:
+
+| depth, 518x518, a frame | |
+|---|---|
+| CoreML as registered before | 600 ms |
+| CPU | 330 ms |
+| CoreML, MLProgram, built for the input's shape | 52 ms |
+
+The host now registers CoreML in the MLProgram format, on the CPU and GPU,
+with a model cache under the runtime's directory, and the backend builds a
+CoreML session at the first run with the model's named free dimensions
+fixed to that run's input shapes, one per shape. The depth maps are within
+86 dB of the CPU's. A model whose batch changes from run to run compiles
+once per batch size.
+
+The cache keeps both ONNX Runtime's conversion and CoreML's compiled model,
+and was read back on every run; what took 45 s on every load of X-CLIP's
+video tower was CoreML compiling the model for the Neural Engine, which
+nothing caches. On the CPU and GPU the same model loads in 1.3 s after its
+first compile (two minutes, once), and the shots and clips chain runs
+faster than it did with the Neural Engine, 211 frames a second against 133
+at 1080p and 129 against 95 at 4K. Depth is the same 52 ms either way, and
+recipe 160 the same to within a frame a second at both sizes, so the Neural
+Engine is left out.
+
+A per-shape session that cannot be built or fails its first run gives way,
+once and named on stderr, to the session CoreML builds for the model by
+default. faceage's age model runs that way: CoreML cannot parse it as an ML
+program ("Required param 'pad' is missing").
+
+### Measured
+
+Sustained frames a second: the frames between a short and a long run over
+the difference of their wall times, so the start-up is left out, with the
+profile's bytes to and from the host a frame. "Before" is the branch as it
+first ran here, with only the first run's fixes.
+
+| run | before | now | 4090 |
+|---|---|---|---|
+| `compose` alone, 4K programme and two 1080p, `h264_videotoolbox` | | 84, nothing crosses | 159 |
+| the same at 1080p | | 190, nothing crosses | 266 |
+| the same with all three 4K | | 65, nothing crosses | |
+| recipe 160 at 4K | 1.5 (libx264), 50.8 MB up, 36.4 MB down | 9.2, 1.07 MB up, 3.22 MB down | 90.6 |
+| recipe 160 at 1080p | 1.6 (libx264), 16.7 MB up, 11.5 MB down | 17.8, the same tensors | |
+| shots and clips, rows only, 1080p | 84, 6.2 MB up | 211, 0.6 MB down | 959 |
+| shots and clips, rows only, 4K | 42, 24.9 MB up | 129, 0.6 MB down | 265 |
+
+On this machine the compositor is held by the media engine rather than the
+GPU: one 4K stream decoded, boxed and encoded through VideoToolbox runs at
+97 frames a second. Recipe 160 is held by depth, 52 ms a frame. The
+classroom clip faceage was measured on is not here; on Big Buck Bunny, with
+few faces, the GPU chain runs at 7.1 frames a second at 720p against 2.9
+before, and 6.1 at 4K, its time in the detector and the picture read back
+for libx264.

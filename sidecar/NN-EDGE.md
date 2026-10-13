@@ -284,6 +284,48 @@ soname lookup may ask for - `libonnxruntime.so.1`, `libonnxruntime.so.1.22.0` -
 are links to it. The runtime is loaded by full path either way; the links are
 for anything that goes looking by soname.
 
+## CoreML
+
+On macOS the GPU walk takes CoreML, which ONNX Runtime carries inside its
+one library. The host registers it in the MLProgram format, which runs more
+of a model than the default NeuralNetwork format and runs it on the GPU, on
+the CPU and GPU only, and gives it a model cache, `coreml-cache` in the
+runtime's directory. The first run that loads a model compiles it, which
+takes from a few seconds to two minutes; later runs read the compiled
+model back in about a second. The Neural Engine is left out: CoreML
+compiles a model for it again on every load, which no cache keeps, 45 s
+for X-CLIP's video tower on every run, and it ran neither depth nor
+X-CLIP faster than the GPU.
+
+CoreML runs a graph with free dimensions mostly on the CPU. Where every
+free dimension of a model's inputs is named (`batch_size`, `height`,
+`width`), the session is built at the first run instead, with those
+dimensions fixed to the shapes of that run's inputs, and again for each
+other shape that arrives. A model with an unnamed free dimension is built
+as it is. A model whose batch changes from run to run compiles once per
+batch size.
+
+A session built for a shape that cannot be built, or fails its first run,
+gives way to the session CoreML builds for the model by default, for every
+shape from then on, and stderr says so once:
+
+    [nn] ages: a COREML session built for its inputs' shapes failed (...);
+    the model runs on the session COREML builds by default
+
+faceage's age model takes that route: CoreML cannot parse it as an ML
+program ("Required param 'pad' is missing").
+
+| Depth Anything V2 small, 518x518, M1 Max | a frame |
+|---|---|
+| CoreML, free dimensions left | 600 ms |
+| CPU | 330 ms |
+| CoreML, built for the input's shape | 52 ms |
+
+CoreML reads and writes host memory: a tensor made on the device from a
+frame in the pool is read back once (`input downloaded, COREML takes host
+memory`), and an output bound to a texture is uploaded from what the
+session wrote. Each is a copy of the tensor, never of the frame.
+
 ## Loading discipline
 
 The runtime is named by full path, never by bare name: Windows ships an

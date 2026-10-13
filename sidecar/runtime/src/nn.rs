@@ -399,6 +399,7 @@ impl ModelRegistry {
     ) -> Result<()> {
         // The backend's own message names only the kind of failure; what
         // ONNX Runtime said is its cause, kept so a refusal carries it.
+        backend.name_next(name);
         let graph = backend.load(&[bytes], target).map_err(anyhow::Error::new)?;
         Arc::get_mut(&mut self.0)
             .context("the model registry is already shared")?
@@ -606,6 +607,42 @@ fn registered(
     _directml_lib: Option<&Path>,
 ) -> OnnxBackend {
     onnx
+}
+
+/// `onnx` with CoreML registered as the host wants it: in the MLProgram
+/// format, which runs more of a model than the default and does so on the
+/// GPU, on the CPU and GPU only, with each compiled model cached under the
+/// runtime's directory, so a run after the first skips the compile. The
+/// Neural Engine is left out: CoreML compiles a model for it again on every
+/// load, which no cache keeps (45 s for X-CLIP's video tower, every run). The backend builds a CoreML
+/// session for each shape a model's inputs arrive in, with the model's free
+/// dimensions fixed to it, since CoreML runs a graph with free dimensions
+/// mostly on the CPU.
+#[cfg(target_os = "macos")]
+fn coreml_registered(onnx: OnnxBackend, provider: Provider, dir: &Path) -> OnnxBackend {
+    use ort::execution_providers::coreml::{
+        CoreMLComputeUnits, CoreMLExecutionProvider, CoreMLModelFormat,
+    };
+    use ort::execution_providers::ExecutionProvider;
+    if provider != Provider::CoreMl {
+        return onnx;
+    }
+    let cache = dir.join("coreml-cache");
+    let cache = std::fs::create_dir_all(&cache)
+        .ok()
+        .map(|()| cache.to_string_lossy().into_owned());
+    onnx.with_registrar(
+        Provider::CoreMl,
+        Arc::new(move |builder| {
+            let mut coreml = CoreMLExecutionProvider::default()
+                .with_model_format(CoreMLModelFormat::MLProgram)
+                .with_compute_units(CoreMLComputeUnits::CPUAndGPU);
+            if let Some(cache) = &cache {
+                coreml = coreml.with_model_cache_dir(cache);
+            }
+            coreml.register(builder).map_err(|e| e.to_string())
+        }),
+    )
 }
 
 /// The wasi-nn context the store of the module at `module_path` gets, and
@@ -1018,12 +1055,15 @@ pub fn configure(config: &Config) -> Result<()> {
         }
         _ => None,
     };
-    let mut onnx = Backend::from(registered(
+    let onnx = registered(
         onnx_backend(provider),
         provider,
         cuda_runtime.as_deref(),
         directml_lib.as_deref(),
-    ));
+    );
+    #[cfg(target_os = "macos")]
+    let onnx = coreml_registered(onnx, provider, &dir);
+    let mut onnx = Backend::from(onnx);
 
     let mut registry = ModelRegistry::default();
     let mut names = Vec::new();

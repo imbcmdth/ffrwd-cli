@@ -77,6 +77,9 @@ from.
   libavfilter carries none for VideoToolbox, so a filter between two
   modules holding their pictures on the GPU runs in ffmpeg there, and the
   picture leaves the device for it.
+- **CoreML compiles a model on the first run that loads it.** That takes
+  from a few seconds to two minutes; later runs read the compiled model
+  from the cache in about a second.
 - **A packet filter's rows cost a second pass over the input.** The rows
   it reads are a file, and a file is finished before whatever reads it
   starts -- so a producer reading the same input the encoder reads runs

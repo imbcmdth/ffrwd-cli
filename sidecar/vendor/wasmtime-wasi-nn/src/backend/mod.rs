@@ -56,6 +56,9 @@ pub trait BackendInner: Send + Sync {
     fn encoding(&self) -> GraphEncoding;
     fn load(&mut self, builders: &[&[u8]], target: ExecutionTarget) -> Result<Graph, BackendError>;
     fn as_dir_loadable<'a>(&'a mut self) -> Option<&'a mut dyn BackendFromDir>;
+    /// What the next graph `load` makes is called in what the backend says
+    /// of it on stderr.
+    fn name_next(&mut self, _name: &str) {}
 }
 
 /// Some [Backend]s support loading a [Graph] from a directory on the

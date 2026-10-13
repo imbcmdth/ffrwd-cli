@@ -1997,3 +1997,36 @@ ffmpeg -init_hw_device videotoolbox=up -filter_hw_device up -hwaccel videotoolbo
 ```
 
 The variants are `scale_vt` and `transpose_vt`, and the pass uses them only where the compiling machine's ffmpeg has them. `yadif_videotoolbox` is not used. A VideoToolbox encoder also reads frames in host memory, so a picture that comes down for a CPU filter last is not sent up again.
+
+## 168. A model on the GPU on a Mac
+
+Depth Anything V2 on frames held on the GPU, as in recipe 160, on macOS. The region decodes onto the device, `depth` asks for each frame as the model's input tensor, and the encoder reads the depth map from the pool. The model runs on CoreML, which reads host memory, so the tensor made on the device is read back once a frame and the depth map is uploaded once; the frame itself never leaves the device:
+
+```pgsql
+CREATE FUNCTION depth(v video_stream, memory text DEFAULT 'host') RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/depth_gpu.wasm', 'depth' LANGUAGE wasm;
+
+COPY (
+  SELECT depth(f.video[1], memory => 'gpu')
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'depth.mp4' WITH (video_codec 'h264_videotoolbox', video_bitrate '4M')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
+  -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -nn \
+  depth=../sidecar/modules/target/wasm32-wasip2/release/depth.onnx -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/depth_gpu.wasm -m \
+  depth_gpu=../sidecar/modules/target/wasm32-wasip2/release/depth_gpu.wasm \
+  -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];[v=decode0]depth_gpu=memory=gpu[out=n1];'\
+'[n1]encode=codec=h264_videotoolbox:b=4M:color_range=tv:colorspace=bt709[out0]' -bound \
+  'depth_gpu=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f \
+  nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 copy -color_range:0 tv -colorspace:0 bt709 depth.mp4
+```
+
+`ffrwd run` asks for the GPU (`-nn-target gpu`), which on macOS is CoreML. Its session is built at the first frame with the model's free dimensions fixed to that frame's tensor, since CoreML runs a graph with free dimensions mostly on the CPU, and the compiled model is cached, so only the first run pays for the compile. `sidecar/NN-EDGE.md`, "CoreML", has the rules and what they cost.
