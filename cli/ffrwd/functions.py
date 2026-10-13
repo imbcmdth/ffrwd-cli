@@ -4653,7 +4653,7 @@ class _Expander:
         if holder is not None and holder[0] == full:
             found = packages.versions.get(full, {}).get(holder[1])
         if found is None:
-            found = packages.resolve(holder[0] if holder is not None else None, full)
+            found = packages.resolve(holder, full)
         if found is not None:
             return found
         known = packages.namespaces()

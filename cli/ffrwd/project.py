@@ -44,7 +44,10 @@ one, beside the machine-wide lockfile, is where `ffrwd link` run in a
 package's directory records name -> directory; the one beside a project's
 lockfile records the names that project reads live, each resolved through
 the machine-wide file. A linked package resolves its own calls through its
-own lockfile, and the project around it never sees those pins. Older ffrwds
+own lockfile, and the project around it never sees those pins. The project's
+own links are the exception: they are this machine's overrides, so a name
+the project links resolves to that link from every package the compile
+reaches, whatever a lockfile pins for it. Older ffrwds
 wrote directory paths -- into the lockfile itself, or into a project's links
 file; those are still read, and the next write migrates them.
 
@@ -413,6 +416,9 @@ def name_refusal(name: str) -> tuple[str, str] | None:
 # knows the call site.
 Layer = Literal["project", "local", "global"]
 
+# A package at one version: (name, version).
+Identity = tuple[str, str]
+
 
 @dataclass(frozen=True)
 class ModelPin:
@@ -565,10 +571,16 @@ class PackageSet:
 
     `wants` answers the question `versions` alone cannot: which of those
     versions a given DEPENDENT package itself resolved to, when its own
-    dependencies were installed. Keyed by the dependent's own name --
-    `project` for the top-level script and the project's own `ffrwd.json`
-    -- to a map of dependency name to the exact version that dependent binds
-    it to. See :meth:`resolve`.
+    dependencies were installed. Keyed by the dependent's own (name, version)
+    -- the project's for the top-level script and the project's own
+    `ffrwd.json` -- to a map of dependency name to the exact version that
+    dependent binds it to. Two versions of one package bind apart, each
+    through what its own install recorded. See :meth:`resolve`.
+
+    `linked` is what the project's own links file links, name to package:
+    the developer's overrides on this machine. A name in it resolves to that
+    package from everywhere in the compile, a linked package's own calls
+    included, whatever any lockfile pins for it.
 
     `in_project` is True when the query sits inside a project -- a manifest or
     a lockfile was found above it. It is what makes landing on the global
@@ -585,26 +597,27 @@ class PackageSet:
     root: Path
     packages: dict[str, Package] = field(default_factory=dict)
     versions: dict[str, dict[str, Package]] = field(default_factory=dict)
-    wants: dict[str, dict[str, str]] = field(default_factory=dict)
+    wants: dict[Identity, dict[str, str]] = field(default_factory=dict)
+    linked: dict[str, Package] = field(default_factory=dict)
     project: str | None = None
     in_project: bool = True
     manifest: Path | None = None
     start: Path | None = None
-    # Linked package name -> its own lockfile, not resolved yet. Discovery
-    # reads a link's manifest and stops there; its pins are loaded by
-    # `settle` when a call resolves through that package, so a link the
+    # Linked package (name, version) -> its own lockfile, not resolved yet.
+    # Discovery reads a link's manifest and stops there; its pins are loaded
+    # by `settle` when a call resolves through that package, so a link the
     # query never reaches costs nothing and cannot fail the command.
-    pending: dict[str, _PendingLink] = field(default_factory=dict)
+    pending: dict[Identity, _PendingLink] = field(default_factory=dict)
 
-    def settle(self, name: str) -> None:
-        """Load linked package `name`'s own pins, if they are not loaded yet.
+    def settle(self, identity: Identity) -> None:
+        """Load linked package `identity`'s own pins, if they are not loaded yet.
 
         A no-op for every other name, and for one already settled. The
         rejection a broken link raises is kept and raised again, so the
         reader that needs the package is told what is wrong with it however
         many readers came before.
         """
-        held = self.pending.get(name)
+        held = self.pending.get(identity)
         if held is None or held.done:
             return
         if held.failed is not None:
@@ -624,9 +637,9 @@ class PackageSet:
         that package's problem, and a query reaching it still gets the typed
         rejection from :meth:`settle`.
         """
-        for name in list(self.pending):
+        for identity in list(self.pending):
             try:
-                self.settle(name)
+                self.settle(identity)
             except FfrwdError:
                 continue
 
@@ -638,20 +651,24 @@ class PackageSet:
         """The canonical package the two segments name, or None."""
         return self.packages.get(f"{namespace}/{package}")
 
-    def resolve(self, dependent: str | None, name: str) -> Package | None:
+    def resolve(self, dependent: Identity | None, name: str) -> Package | None:
         """The package `name` names, at the version `dependent` itself depends on it at.
 
-        `dependent` is a package's own name -- whose source a call is written
-        in -- or None/empty for the top-level script, which resolves as the
-        project itself. Falls back to the canonical entry when nothing
-        recorded a binding: a linked package (not walked by `install`), or a
-        lockfile with no project above it to hold one.
+        `dependent` is the (name, version) of the package whose source a call
+        is written in, or None for the top-level script, which resolves as
+        the project itself. A name the project links resolves to its link
+        from every dependent. Otherwise this falls back to the canonical
+        entry when nothing recorded a binding: a linked package (not walked
+        by `install`), or a lockfile with no project above it to hold one.
 
         This is where a LINKED dependent's own pins are loaded, the query
         having reached it: a call written in that package is what its
         lockfile answers, and until one is written the lockfile is not read.
         """
-        who = dependent or self.project
+        override = self.linked.get(name)
+        if override is not None:
+            return override
+        who = dependent if dependent is not None else self._project_identity()
         if who is not None:
             self.settle(who)
         version = self.wants.get(who, {}).get(name) if who is not None else None
@@ -660,6 +677,11 @@ class PackageSet:
             if found is not None:
                 return found
         return self.get(name)
+
+    def _project_identity(self) -> Identity | None:
+        """The project's own (name, version), or None outside a manifest."""
+        own = self.packages.get(self.project) if self.project is not None else None
+        return (own.name, own.version) if own is not None else None
 
     def in_namespace(self, namespace: str) -> tuple[Package, ...]:
         """Every canonical package under `namespace`, in name order."""
@@ -2408,7 +2430,7 @@ def _stored_package(entry: RegistryEntry, lock: Lockfile, layer: Layer) -> Packa
 def _add_layer(
     packages: dict[str, Package],
     versions: dict[str, dict[str, Package]],
-    wants: dict[str, dict[str, str]],
+    wants: dict[Identity, dict[str, str]],
     lock: Lockfile | None,
     layer: Layer,
 ) -> None:
@@ -2429,7 +2451,7 @@ def _add_layer(
             package = _linked_package(entry, lock, layer)
         else:
             package = _stored_package(entry, lock, layer)
-            wants.setdefault(package.name, dict(entry.dependencies))
+            wants.setdefault((package.name, package.version), dict(entry.dependencies))
         identity = (package.name, package.version)
         if identity in resolved:
             # The reader catches two same-kind claims; a registry entry and a
@@ -2467,33 +2489,33 @@ def _canonical_over(lock: Lockfile, package: Package, held: Package) -> bool:
 def _add_links(
     packages: dict[str, Package],
     versions: dict[str, dict[str, Package]],
-    wants: dict[str, dict[str, str]],
-    pending: dict[str, _PendingLink],
+    wants: dict[Identity, dict[str, str]],
+    pending: dict[Identity, _PendingLink],
     links: Sequence[tuple[LinkEntry, Path]],
     layer: Layer,
-) -> dict[str, str]:
+) -> dict[str, Package]:
     """Add the linked directories under the names no earlier claim took.
 
-    Returns what was claimed -- linked package name to its manifest's version
-    -- for the caller to bind the project's own calls to: a link answers its
-    name over anything installed under it.
+    Returns what was claimed, linked package name to the package, for the
+    caller to bind calls to: a link answers its name over anything installed
+    under it.
     """
-    claimed: dict[str, str] = {}
+    claimed: dict[str, Package] = {}
     chain: list[tuple[Path, str]] = []
     for entry, source in links:
         package = _add_link(
             packages, versions, wants, pending, entry, source, layer, chain, claims=True
         )
         if packages.get(package.name) is package:
-            claimed[package.name] = package.version
+            claimed[package.name] = package
     return claimed
 
 
 def _add_link(
     packages: dict[str, Package],
     versions: dict[str, dict[str, Package]],
-    wants: dict[str, dict[str, str]],
-    pending: dict[str, _PendingLink],
+    wants: dict[Identity, dict[str, str]],
+    pending: dict[Identity, _PendingLink],
     entry: LinkEntry,
     source: Path,
     layer: Layer,
@@ -2541,7 +2563,7 @@ def _add_link(
         packages.setdefault(package.name, package)
     inside = [*chain, (root, package.name)]
     pending.setdefault(
-        package.name,
+        (package.name, package.version),
         _PendingLink(
             lambda: _add_link_pins(
                 packages, versions, wants, pending, root, package, layer, inside
@@ -2554,8 +2576,8 @@ def _add_link(
 def _add_link_pins(
     packages: dict[str, Package],
     versions: dict[str, dict[str, Package]],
-    wants: dict[str, dict[str, str]],
-    pending: dict[str, _PendingLink],
+    wants: dict[Identity, dict[str, str]],
+    pending: dict[Identity, _PendingLink],
     root: Path,
     package: Package,
     layer: Layer,
@@ -2588,13 +2610,13 @@ def _add_link_pins(
             claims=False,
         )
         binding[nested.name] = nested.version
-    wants.setdefault(package.name, binding)
+    wants.setdefault((package.name, package.version), binding)
     if own is None:
         return
     for held in _reachable_entries(own):
         stored = _stored_package(held, own, layer)
         versions.setdefault(stored.name, {}).setdefault(stored.version, stored)
-        wants.setdefault(stored.name, dict(held.dependencies))
+        wants.setdefault((stored.name, stored.version), dict(held.dependencies))
 
 
 def _reachable_entries(lock: Lockfile) -> tuple[RegistryEntry, ...]:
@@ -2647,7 +2669,9 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
     Three layers, the first claim on a name winning: the project's own
     manifest, then its lockfile, then the machine-wide one -- each lockfile
     preceded by the links file beside it, so a linked directory answers its
-    name over anything installed under it. A lockfile carrying several
+    name over anything installed under it. A name the project's own links
+    file links answers for every package the compile reaches, not only for
+    the project's own calls. A lockfile carrying several
     versions of one name answers with the one its own `dependencies` pins,
     else the highest. The layering lives here and nowhere else -- what the
     compiler gets is one name to one canonical package per layer, plus every
@@ -2663,7 +2687,7 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
     local = find_lockfile(base)
     packages: dict[str, Package] = {}
     versions: dict[str, dict[str, Package]] = {}
-    wants: dict[str, dict[str, str]] = {}
+    wants: dict[Identity, dict[str, str]] = {}
     project: Package | None = None
     if manifest is not None:
         project = read_manifest(manifest)
@@ -2671,13 +2695,16 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
         versions.setdefault(project.name, {})[project.version] = project
 
     # Links before pins, layer by layer: a linked directory answers its name
-    # over anything installed under it.
-    claimed: dict[str, str] = {}
-    pending: dict[str, _PendingLink] = {}
+    # over anything installed under it. The project's own links answer it
+    # from every package in the compile too.
+    linked: dict[str, Package] = {}
+    claimed: dict[str, Package] = {}
+    pending: dict[Identity, _PendingLink] = {}
     local_lock = read_lockfile(local) if local is not None else None
     if local is not None:
         pairs = [(entry, links_path(local)) for entry in read_linksfile(links_path(local))]
-        claimed.update(_add_links(packages, versions, wants, pending, pairs, "local"))
+        linked = _add_links(packages, versions, wants, pending, pairs, "local")
+        claimed.update(linked)
     _add_layer(packages, versions, wants, local_lock, "local")
     global_lock = store.global_lock_path()
     if local is None or global_lock != local:
@@ -2688,8 +2715,9 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
     _add_layer(packages, versions, wants, _global_lockfile(local), "global")
 
     if project is not None:
-        wants[project.name] = dict(local_lock.dependencies) if local_lock is not None else {}
-        wants[project.name].update(claimed)
+        own = dict(local_lock.dependencies) if local_lock is not None else {}
+        own.update((name, package.version) for name, package in claimed.items())
+        wants[(project.name, project.version)] = own
 
     in_project = manifest is not None or local is not None
     if not in_project and not packages:
@@ -2700,6 +2728,7 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
         packages=packages,
         versions=versions,
         wants=wants,
+        linked=linked,
         project=project.name if project is not None else None,
         in_project=in_project,
         manifest=manifest,

@@ -1113,10 +1113,13 @@ moves them into `ffrwd.links` and out of the lockfile.
 A package resolves through three layers, the first claim on its name
 winning: the project's own manifest, then its links file and lockfile,
 then the machine-wide pair a global install and a bare `ffrwd link`
-write. A link claims its name over anything installed under it. A lockfile
+write. A link claims its name over anything installed under it, and a
+name the project's own links file links answers every call to it in the
+compile, those written inside other packages included. A lockfile
 holding several versions of one name answers with the one its own
-`dependencies` pins, else the highest; a package calling into itself by
-name gets its own version. Two of those layers are worth saying out
+`dependencies` pins, else the highest; each installed version binds its
+own calls through the dependencies its own entry records, and a package
+calling into itself by name gets its own version. Two of those layers are worth saying out
 loud, so a compile reports them without refusing: resolving inside a
 project but landing on the machine-wide layer, and compiling against a
 link. Each is reported once per package - as a `warning:` line on
@@ -1329,7 +1332,11 @@ the shared store; a tree whose manifest drifts past that lockfile
 after linking is refused at the next compile, hint naming the re-link.
 The consuming project's own queries never see the linked package's
 dependencies. Linking a package something else already pins leaves the
-pin in place; the link answers while it stands.
+pin in place; the link answers while it stands, for the project's own
+calls and for every package's call to that name. So a project linking
+both a package and one of its dependencies compiles the package against
+the linked dependency, whether a recipe is run by name or by file
+path.
 
 That lockfile is read only when a query REACHES the package - a call
 written in its own source is what its pins answer - so a machine-wide

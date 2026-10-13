@@ -32,6 +32,14 @@ from ffrwd.lower import lower_table
 from ffrwd.mcp import tools as mcp_tools
 from ffrwd.parser import parse, resolve
 from ffrwd.probe import probe
+from ffrwd.project import (
+    LOCKFILE_NAME,
+    MANIFEST_NAME,
+    LinkEntry,
+    links_path,
+    write_linksfile,
+    write_lockfile,
+)
 from ffrwd.types import DISPOSITION_KEYS
 
 pytestmark = pytest.mark.exec
@@ -2428,6 +2436,66 @@ def test_init_writes_a_project_whose_starter_recipe_runs(
     )
     assert code == 0
     assert out_path.exists() and out_path.stat().st_size > 0
+
+
+def _linked_package(root: Path, manifest: dict[str, object], files: dict[str, str]) -> Path:
+    """A package directory: its manifest, its files, and an empty lockfile."""
+    root.mkdir(parents=True, exist_ok=True)
+    for name, body in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(body, encoding="utf-8")
+    (root / MANIFEST_NAME).write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+    write_lockfile(root / LOCKFILE_NAME, [])
+    return root
+
+
+def _quieter_package(root: Path, version: str, factor: str) -> Path:
+    return _linked_package(
+        root,
+        {"name": "shared/d", "version": version, "lib": {"quieter": "src/lib.sql"}},
+        {
+            "src/lib.sql": "CREATE FUNCTION quieter(track audio_stream) RETURNS audio_stream "
+            f"AS $$ SELECT volume(track, {factor}) $$ LANGUAGE sql;\n"
+        },
+    )
+
+
+def test_a_recipe_by_name_reaches_the_projects_links_as_its_file_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A project links studio/pipe and shared/d. studio/pipe's own links file
+    links an older shared/d, and its recipe calls shared.d.quieter. Compiled
+    by name or by file path, the recipe reaches the project's shared/d."""
+    _require_fixture(_AV)
+    old = _quieter_package(tmp_path / "old", "1.0.0", "0.25")
+    new = _quieter_package(tmp_path / "new", "1.1.0", "0.75")
+    pipe = _linked_package(
+        tmp_path / "pipe",
+        {
+            "name": "studio/pipe",
+            "version": "1.0.0",
+            "bin": {"go": "recipes/go.sql"},
+            "dependencies": {"shared/d": "1.0.0"},
+        },
+        {
+            "recipes/go.sql": "-- variables: source (input path), dest (output path)\n"
+            "COPY (SELECT shared.d.quieter(f.audio[1]) FROM input(:'source') f) TO :'dest'\n"
+        },
+    )
+    write_linksfile(links_path(pipe / LOCKFILE_NAME), [LinkEntry(path=str(old))])
+    project = _linked_package(tmp_path / "work", {"name": "me/edits", "version": "0.1.0"}, {})
+    write_linksfile(
+        links_path(project / LOCKFILE_NAME), [LinkEntry(path=str(pipe)), LinkEntry(path=str(new))]
+    )
+    monkeypatch.chdir(project)
+    variables = ["-v", f"source={_sql_path(_AV)}", "-v", "dest=out.mka"]
+
+    assert cli.main(["compile", "-f", str(pipe / "recipes" / "go.sql"), *variables]) == 0
+    by_path = capsys.readouterr().out
+    assert cli.main(["compile", "studio/pipe:go", *variables]) == 0
+    by_name = capsys.readouterr().out
+    assert "volume=volume=0.75" in by_path
+    assert by_name == by_path
 
 
 # ---------------------------------------------------------------------------

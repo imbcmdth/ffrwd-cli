@@ -1988,6 +1988,76 @@ def test_a_link_inside_a_linked_package_resolves_for_its_holder(
     assert (helper / MANIFEST_NAME).is_file()
 
 
+def test_a_name_the_project_links_answers_inside_another_linked_package(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """The project links both the package and its dependency. The call written
+    inside the package reaches the project's link, not the version the
+    package's own lockfile pins; the lockfiles are left as they were."""
+    dep = _installed(_library(tmp_path / "d", "shared", "0.25", package="d"))
+    linked = _library(
+        tmp_path / "dev",
+        "studio",
+        "",
+        package="pipe",
+        member="use",
+        src=_REACH,
+        dependencies={"shared/d": "1.0.0"},
+    )
+    own = _lock(linked, [dep], dependencies={"shared/d": "1.0.0"})
+    # At a version nothing pins, so only the link can answer.
+    helper = _library(tmp_path / "helper", "shared", "0.75", package="d", version="1.1.0")
+    project = tmp_path / "work"
+    lock = _linked_consumer(project, linked)
+    write_linksfile(links_path(lock), [LinkEntry(path=str(linked)), LinkEntry(path=str(helper))])
+    pinned = own.read_text(encoding="utf-8")
+
+    argv, _said = _heard(QUERY.format(call="studio.pipe.use"), _packages(project))
+    assert "volume=volume=0.75" in " ".join(argv)
+    assert own.read_text(encoding="utf-8") == pinned
+
+
+def test_another_installed_version_of_a_linked_package_lends_it_no_pins(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """The project installs studio/pipe 0.9.0, which pins shared/d 2.0.0, and
+    links a working tree of studio/pipe 1.0.0, whose own lockfile pins
+    shared/d 1.0.0. The project links nothing else, so the linked tree's call
+    binds through its own lockfile, not through the installed version's."""
+    dep = _installed(_library(tmp_path / "d", "shared", "0.25", package="d"))
+    newer = _installed(_library(tmp_path / "d2", "shared", "0.5", package="d", version="2.0.0"))
+    installed = _installed(
+        _library(
+            tmp_path / "old",
+            "studio",
+            "",
+            package="pipe",
+            member="use",
+            src=_REACH,
+            version="0.9.0",
+            dependencies={"shared/d": "2.0.0"},
+        ),
+        dependencies={"shared/d": "2.0.0"},
+    )
+    linked = _library(
+        tmp_path / "dev",
+        "studio",
+        "",
+        package="pipe",
+        member="use",
+        src=_REACH,
+        dependencies={"shared/d": "1.0.0"},
+    )
+    _lock(linked, [dep], dependencies={"shared/d": "1.0.0"})
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    lock = _lock(project, [installed, newer], dependencies={"studio/pipe": "0.9.0"})
+    write_linksfile(links_path(lock), [LinkEntry(path=str(linked))])
+
+    argv, _said = _heard(QUERY.format(call="studio.pipe.use"), _packages(project))
+    assert "volume=volume=0.25" in " ".join(argv)
+
+
 def test_a_linked_packages_own_lock_is_read_only_when_a_call_reaches_it(
     store_home: Path, tmp_path: Path
 ) -> None:
@@ -2220,7 +2290,7 @@ def test_the_set_carries_the_projects_own_wants(store_home: Path, tmp_path: Path
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [entry], dependencies={"broadcast/tracks": "1.0.0"})
     packages = _packages(project)
-    assert packages.wants[packages.project or ""] == {"broadcast/tracks": "1.0.0"}
+    assert packages.wants[("me/edits", "0.1.0")] == {"broadcast/tracks": "1.0.0"}
     found = packages.resolve(None, "broadcast/tracks")
     assert found is not None and found.name == "broadcast/tracks"
     assert packages.resolve(None, "nothing/here") is None
