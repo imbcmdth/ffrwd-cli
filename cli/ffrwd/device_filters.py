@@ -17,17 +17,18 @@ stay in ffmpeg.
 
 A filter qualifies when its picture comes from the device (a module output
 held on the GPU, another filter that qualifies, or an input's own picture,
-which the region then decodes onto the device) and every reader of what it
-makes is on the device too (a module input held on the GPU, another filter
-that qualifies, or a file whose encoder reads the device's pictures), and
-the run of such filters touches a module holding its pictures on the GPU,
-since without one there is no region to join. Which variants exist is what
-the sidecar the compile finds says its libavfilter has (``ffrwd-wasm
---av-info``), the way the card pass reads the local ffmpeg's filters; where
-that sidecar loads no libav at all, the command is written for a reader's
-sidecar that carries the bundled libavfilter, as the card pass writes for a
-reader's ffmpeg it cannot see. A filter with no variant, or a call naming
-an option the variant lacks, stays in ffmpeg.
+itself or a split's copy of it, which the region then decodes onto the
+device) and every reader of what it makes is on the device too (a module
+input held on the GPU, another filter that qualifies, or a file whose
+encoder reads the device's pictures), and the run of such filters touches
+a module holding its pictures on the GPU, since without one there is no
+region to join. Which variants exist is what the sidecar the compile finds
+says its libavfilter has (``ffrwd-wasm --av-info``), the way the card pass
+reads the local ffmpeg's filters; where that sidecar loads no libav at all,
+the command is written for a reader's sidecar that carries the bundled
+libavfilter, as the card pass writes for a reader's ffmpeg it cannot see.
+A filter with no variant, or a call naming an option the variant lacks,
+stays in ffmpeg.
 """
 
 from __future__ import annotations
@@ -131,6 +132,17 @@ def filters_on_the_device(g: Graph, available: Callable[[], Collection[str] | No
         port = shape.output(node.out_ports[pad])
         return port is not None and port.memory == "gpu"
 
+    def input_picture(ref: FrameRef) -> bool:
+        """Whether `ref` is an input's own picture, or a split's copy of it."""
+        seen: set[str] = set()
+        while (found := producers.get(ref)) is not None and found[0] not in seen:
+            node = g.nodes[found[0]]
+            if node.filter != "split":
+                return False
+            seen.add(node.id)
+            ref = node.inputs[0]
+        return is_src(ref) and src_parts(ref)[1] == "video"
+
     def held_in(name: str, position: int) -> bool:
         """Whether input `position` of node `name` is held on the GPU."""
         shape = shapes.get(name)
@@ -152,7 +164,7 @@ def filters_on_the_device(g: Graph, available: Callable[[], Collection[str] | No
             reads = (
                 held_out(source)
                 or _producer(source, producers) in chosen
-                or (is_src(source) and src_parts(source)[1] == "video")
+                or input_picture(source)
             )
             slot = f"{name}:0"
             read_by = readers.get(slot, [])

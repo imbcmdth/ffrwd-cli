@@ -2030,3 +2030,66 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
 ```
 
 `ffrwd run` asks for the GPU (`-nn-target gpu`), which on macOS is CoreML. Its session is built at the first frame with the model's free dimensions fixed to that frame's tensor, since CoreML runs a graph with free dimensions mostly on the CPU, and the compiled model is cached, so only the first run pays for the compile. `sidecar/NN-EDGE.md`, "CoreML", has the rules and what they cost.
+
+## 169. One input in a region on the GPU and in ffmpeg
+
+An input read by a region holding its frames on the GPU and by ffmpeg as well reaches them through a split. The region still takes the input's own packets and decodes them once, onto the device, ahead of every node of the region that reads it; ffmpeg opens the input again for the filter it runs and decodes it there. Here both `gpu_box` calls read the input in one region, `ring` draws what `spot` finds in one boxed picture on the other, and `hflip` runs in ffmpeg:
+
+```pgsql
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+CREATE FUNCTION spot(v video_stream, every number DEFAULT 30)
+RETURNS STRUCT(start_t number, id number, x number, y number, w number, h number)[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/spot.wasm', 'spot'
+  LANGUAGE wasm;
+
+CREATE FUNCTION ring(v video_stream,
+                     spots STRUCT(start_t number, id number,
+                                  x number, y number, w number, h number)[])
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/ring.wasm', 'ring'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT ring(gpu_box(f.video[1], size => 8), spot(gpu_box(f.video[1], size => 32))) AS ringed,
+         hflip(f.video[1]) AS flipped
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'both.mkv' WITH (video_codec 'libx264')
+```
+
+```
+$ ffrwd compile -f query.sql
+# named pipes: ffmpeg0 reads ffmpeg1, sidecar0
+1. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  '<named pipe ffmpeg1-ffmpeg0 n5 read>' -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+  '<named pipe sidecar0-ffmpeg0 n4 read>' -map 1:v:0 -map 0:v:0 -c:0 libx264 -c:1 \
+  libx264 both.mkv
+2. ffmpeg: ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex '[0:v:0]hflip[out0]' \
+  -map '[out0]' -c:0 rawvideo -pix_fmt:0 yuv420p -f nut \
+  '<named pipe ffmpeg1-ffmpeg0 n5 write>'
+3. ffmpeg: ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts \
+  disabled -output_ts_offset 1001 -f nut pipe:1
+4. sidecar: ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  spot=../sidecar/modules/target/wasm32-wasip2/release/spot.wasm -m \
+  ring=../sidecar/modules/target/wasm32-wasip2/release/ring.wasm -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];'\
+'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
+'[v=decode0]gpu_box=memory=gpu:size=32[out=n2];[v=n2]spot=every=30[spots=n3];'\
+'[v=n1][spots=n3]ring[v=out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
+  'spot=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
+  'ring=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"spots",'\
+'"streams":[{"rate":null}]}]' -map '[out0]' -f nut \
+  '<named pipe sidecar0-ffmpeg0 n4 write>'
+# this listing is not a shell command -- run the plan with `ffrwd run`
+```
+
+The ffmpeg in front of the region copies the packets, `-c:0 copy`, and the region's `decode` is told `hw=auto`, as in recipe 157. An input that one process opens for all its readers, as a live input is, is copied onto the region's pipe from the input itself, and the split in that process feeds only its other readers. A region holding nothing on the GPU, and not declared with `SET ffrwd.edges = 'coded'`, takes its leg raw.

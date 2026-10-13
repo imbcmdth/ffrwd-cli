@@ -2607,6 +2607,13 @@ def test_a_packet_filter_reading_a_picture_held_on_the_gpu_takes_the_regions_pac
     assert not any("-b:0" in words for words in encoders)
 
 
+def _spot_on_card(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    """`spot`, holding its picture on the GPU."""
+    shaped = _spot(params, bound)
+    shaped["inputs"][0]["accepts"] = {"pixel_formats": ["rgba"], "memory": "gpu"}  # type: ignore[index]
+    return shaped
+
+
 def test_a_source_read_by_several_nodes_of_a_region_on_the_gpu_is_decoded_there(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2614,13 +2621,7 @@ def test_a_source_read_by_several_nodes_of_a_region_on_the_gpu_is_decoded_there(
     picture: the region splits the picture itself, so the edge's reader is
     that split, not the entry node, and the input still crosses as its
     packets and is decoded once, ahead of both."""
-
-    def on_card(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
-        shaped = _spot(params, bound)
-        shaped["inputs"][0]["accepts"] = {"pixel_formats": ["rgba"], "memory": "gpu"}  # type: ignore[index]
-        return shaped
-
-    monkeypatch.setitem(SHAPES, "spot.wasm", on_card)
+    monkeypatch.setitem(SHAPES, "spot.wasm", _spot_on_card)
     plan = _plan(
         "COPY (SELECT ring(box(f.video[1]), spot(f.video[1])) FROM input('f.mp4') f) "
         "TO 'out.mp4' WITH (video_codec 'h264_nvenc')",
@@ -2630,6 +2631,82 @@ def test_a_source_read_by_several_nodes_of_a_region_on_the_gpu_is_decoded_there(
     assert region.av and region.graph is not None
     found = [n.filter for n in region.graph.nodes.values()]
     assert found[0] == "decode" and found.count("decode") == 1, found
+
+
+def _split_three_ways(
+    monkeypatch: pytest.MonkeyPatch, memory: str = "gpu", realtime: bool = False
+) -> tuple[list[str], list[str]]:
+    """One input read by `box` and `spot`, joined by `ring` in one region,
+    and by an `hflip` in ffmpeg: the region's graph, and the command writing
+    the pipe it reads."""
+    monkeypatch.setitem(SHAPES, "spot.wasm", _spot_on_card if memory == "gpu" else _spot)
+    live = ", realtime => true" if realtime else ""
+    plan = _plan(
+        f"COPY (SELECT ring(box(f.video[1], memory => '{memory}'), spot(f.video[1])) AS a, "
+        f"hflip(f.video[1]) AS b FROM input('f.mp4'{live}) f) TO 'out.mkv'",
+        monkeypatch,
+    )
+    argv = _shown(plan)
+    (region,) = plan.sidecars
+    (feeder,) = {edge.source for edge in plan.stream_edges if edge.target == region.id}
+    graph = argv[region.id][argv[region.id].index("-filter_complex") + 1]
+    return graph.split(";"), argv[feeder]
+
+
+def test_a_source_read_by_a_region_on_the_gpu_and_by_ffmpeg_is_decoded_in_the_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The input reaches the region through a split whose other leg is
+    ffmpeg's: the region still takes the input's packets and decodes them
+    once, ahead of both its readers, and the ffmpeg flipping the picture
+    decodes it for itself."""
+    graph, feeder = _split_three_ways(monkeypatch)
+    assert graph[0] == "[0:v]decode=format=rgba:hw=auto[decode0]"
+    assert sum("decode=" in step for step in graph) == 1
+    assert feeder[feeder.index("-map") + 1 : feeder.index("-map") + 4] == ["0:v:0", "-c:0", "copy"]
+    assert "-filter_complex" not in feeder
+
+
+def test_a_live_source_read_by_a_region_on_the_gpu_and_by_ffmpeg_is_copied_to_the_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live input has one reader, which splits it among its readers: the
+    region's leg leaves that reader as the input's packets, mapped from the
+    input, and only the flipped leg is decoded there."""
+    graph, feeder = _split_three_ways(monkeypatch, realtime=True)
+    assert graph[0] == "[0:v]decode=format=rgba:hw=auto[decode0]"
+    flipped = re.fullmatch(r"\[0:v:0\]hflip(\[\w+\])", feeder[feeder.index("-filter_complex") + 1])
+    assert flipped is not None
+    maps = [feeder[i + 1] for i, word in enumerate(feeder) if word == "-map"]
+    assert maps == ["0:v:0", flipped.group(1)]
+    assert feeder[feeder.index("-c:0") + 1] == "copy"
+
+
+def test_a_source_read_by_a_region_in_host_memory_and_by_ffmpeg_crosses_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With nothing held on the GPU and no clause asking for coded edges,
+    the region's leg crosses decoded."""
+    graph, feeder = _split_three_ways(monkeypatch, memory="host")
+    assert not any("decode=" in step for step in graph)
+    assert feeder[feeder.index("-c:0") + 1] == "rawvideo"
+
+
+def test_a_filter_on_a_split_copy_of_an_input_runs_on_the_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``scale`` reading the input through the split its other reader
+    put in front of it still reads the input's own picture: it runs on the
+    device, after the region's ``decode``."""
+    plan = _plan(
+        "COPY (SELECT box(scale(f.video[1], 160, 120)) AS a, hflip(f.video[1]) AS b "
+        "FROM input('f.mp4') f) TO 'out.mkv' WITH (video_codec 'h264_d3d12va')",
+        monkeypatch,
+        av_filters=lambda: {"scale_d3d12"},
+    )
+    (region,) = plan.sidecars
+    assert region.graph is not None
+    assert [n.filter for n in region.graph.nodes.values()] == ["decode", "filter", "box"]
 
 
 def test_a_filter_between_pictures_on_the_device_runs_there_where_it_has_a_variant(

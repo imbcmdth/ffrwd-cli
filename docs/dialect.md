@@ -458,8 +458,15 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   with no clause at all: the sidecar decodes onto the device it holds
   the frames on (its `decode` is told `hw=auto`). Any node of the region
   holding its input on the GPU is enough, and an input read by several
-  nodes of the region is decoded once, ahead of all of them. Recipe
-  [157](examples.md#157-a-module-holding-its-frames-on-the-gpu-takes-the-packets).
+  nodes of the region is decoded once, ahead of all of them. So is an
+  input read outside the region too: the region still takes its packets,
+  and each other reader gets what it would without the region, an ffmpeg
+  decoding the input for itself and another region taking the packets
+  as well. Where one process opens the input for every reader, as for a
+  live input, it copies the packets onto the region's pipe from the
+  input and splits the input only among the others. Recipes
+  [157](examples.md#157-a-module-holding-its-frames-on-the-gpu-takes-the-packets)
+  and [169](examples.md#169-one-input-in-a-region-on-the-gpu-and-in-ffmpeg).
   Recipe [155](examples.md#155-decode-and-encode-inside-the-sidecar);
   `sidecar/AV-EDGE.md` has the sidecar side.
 - A **filter between pictures on the sidecar's device** runs there
@@ -467,8 +474,9 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   it for the device: `scale`, with its width and height only, becomes the
   sidecar's `filter` node running `scale_d3d12`. It qualifies when its
   picture comes from the device (a node module's output held on the GPU,
-  another such filter, or an input's own picture, which the region then
-  decodes onto the device) and everything reading it is on the device too
+  another such filter, or an input's own picture, read directly or
+  through a split, which the region then decodes onto the device) and
+  everything reading it is on the device too
   (a node module's input held on the GPU, another such filter, or a
   destination whose encoder reads the device's pictures, the `_d3d12va`
   ones), and the run of such filters touches a module holding its

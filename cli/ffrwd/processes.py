@@ -4892,7 +4892,8 @@ class _Partitioner:
 
         An input's own picture a node of the region reads, in a codec the
         sidecar decodes, crosses as the input's packets and is decoded in the
-        region.
+        region, also where it reaches the region through a split whose other
+        legs go elsewhere.
         A picture the region writes straight to one file, whose encoder the
         sidecar has, is encoded in the region and copied into the file, with
         the file's encoder options moved onto the encoder. Every other edge
@@ -5016,17 +5017,19 @@ class _Partitioner:
 
     def _decodable(self, edge: StreamEdge) -> bool:
         """True when `edge` carries an input's own picture, untrimmed, in a
-        codec the sidecar decodes."""
+        codec the sidecar decodes: the input's stream, or a split's copy of
+        it."""
         wire = edge.format
         if not isinstance(wire, VideoFormat) or wire.codec != RAWVIDEO:
             return False
-        if wire.geometry is not None or not is_src(edge.ref):
+        source = self._past_splits(edge.ref)
+        if wire.geometry is not None or not is_src(source):
             return False
-        alias, kind, _ = src_parts(edge.ref)
+        alias, kind, _ = src_parts(source)
         if kind != "video" or alias in self.g.input_trims:
             return False
-        meta = self._origin_meta(edge.ref)
-        return meta is not None and meta.codec in DECODABLE and self._copyable(edge.ref)
+        meta = self._origin_meta(source)
+        return meta is not None and meta.codec in DECODABLE and self._copyable(source)
 
     def _encoded_write(self, edge: StreamEdge) -> tuple[dict[str, object], int] | None:
         """The `encode` arguments for a picture `edge` hands one file, and the
@@ -6268,7 +6271,7 @@ class _Partitioner:
             refs.extend(self.g.nodes[name].inputs)
         for unit in process.sinks:
             refs.extend(o.ref for o in unit.outputs)
-        refs.extend(process.pipes)
+        refs.extend(ref for ref in process.pipes if self._copied_leg(process, ref) is None)
 
         read: dict[str, dict[int, FrameRef]] = {}
         for ref in refs:
@@ -6279,6 +6282,20 @@ class _Partitioner:
                 continue
             read.setdefault(producer, {})[_ref_pad(ref)] = ref
         return read
+
+    def _copied_leg(self, process: _Pending, ref: FrameRef) -> FrameRef | None:
+        """The input stream `process` copies onto the pipe carrying `ref`,
+        where `ref` is a split's leg of it and the pipe carries its packets;
+        else None. The packets are mapped from the input, not the split."""
+        source = self._past_splits(ref)
+        if source == ref or not is_src(source):
+            return None
+        if not any(
+            edge.source == process.id and edge.ref == ref and _copies(edge.format)
+            for edge in self.edges
+        ):
+            return None
+        return source
 
     def _shrink_splits(
         self, process: _Pending
@@ -6410,7 +6427,7 @@ class _Partitioner:
             SinkUnit(
                 outputs=[
                     Output(
-                        ref=rewrite(ref),
+                        ref=self._copied_leg(process, ref) or rewrite(ref),
                         type=ref_type(self.g, ref),
                         name=None,
                         metadata={},
