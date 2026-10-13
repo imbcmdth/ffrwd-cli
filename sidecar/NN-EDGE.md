@@ -18,6 +18,8 @@ interface is linked only for the components whose type declares it.
 ## The argv
 
     -nn <name>=<path>       bind a model file to a name, repeatable
+    -nn-for <module>        bind the -nn before it for this module alone,
+                            repeatable
     -nn-runtime <dir>       where ONNX Runtime is, else FFRWD_NN_RUNTIME
     -nn-target <provider>   where sessions run, else FFRWD_NN_TARGET; cpu is
                             the default
@@ -26,7 +28,15 @@ interface is linked only for the components whose type declares it.
                             the bare <provider> keeps every model off it
 
 `-nn` is spelled like `-m` and validated the same way: a name is letters,
-digits and underscores, and each name may be bound once.
+digits and underscores, and each name may be bound once for every module.
+`-nn-for <module>` after a `-nn` narrows it to that module, named by the
+path its `-m` gives, so two modules asking for one name can each load a
+file of its own; a module's own binding wins over one for every module,
+and a name bound twice for one module is refused. `-nn-exclude` names
+every binding of its name.
+
+    ffrwd-wasm ... -nn ages=a/ages.onnx -nn-for a/ages.wasm \
+      -nn ages=b/ages.onnx -nn-for b/ages_gpu.wasm ...
 
     ffrwd-wasm -f nut -i - \
       -nn yolo=models/yolov8n.onnx \

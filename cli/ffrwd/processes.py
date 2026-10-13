@@ -1096,16 +1096,23 @@ class ModelBinding:
     read off its manifest at compile time, empty for a model pinned with no
     ``not_on`` or bound outside any package. Each provider in it becomes one
     ``-nn-exclude <name>=<provider>`` on the process that binds the model.
+
+    `modules` narrows the binding to those modules, each a ``-nn-for
+    <module>`` after it: set where two modules of one process load a model
+    by the same name from two files. Empty binds it for every module.
     """
 
     name: str
     path: str
     not_on: tuple[str, ...] = ()
+    modules: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         written: dict[str, object] = {"name": self.name, "path": self.path}
         if self.not_on:
             written["not_on"] = list(self.not_on)
+        if self.modules:
+            written["modules"] = list(self.modules)
         return written
 
     @classmethod
@@ -1114,6 +1121,7 @@ class ModelBinding:
             name=_read_text(d, "name"),
             path=_read_text(d, "path"),
             not_on=tuple(str(one) for one in _read_list(d, "not_on")),
+            modules=tuple(str(one) for one in _read_list(d, "modules")),
         )
 
 
@@ -5221,14 +5229,34 @@ class _Partitioner:
                 self.edges[slot] = edge
 
     def _region_models(self, members: Sequence[str]) -> tuple[ModelBinding, ...]:
-        """The ``-nn`` binding each module of this region needs, in graph order."""
-        found: dict[str, ModelBinding] = {}
+        """The ``-nn`` bindings this region's modules need, in graph order.
+
+        Modules loading a model by one name from one file share one binding,
+        denied every provider any of their pins denies. Where they load it
+        from several files, each file is bound for the modules loading it.
+        """
+        files: dict[str, dict[str, list[tuple[str, ModelBinding]]]] = {}
         for name in members:
-            path = self.g.nodes[name].filter
-            binding = self.models.get(path)
-            if binding is not None and path not in found:
-                found[path] = binding
-        return tuple(found.values())
+            module = self.g.nodes[name].filter
+            binding = self.models.get(module)
+            if binding is None:
+                continue
+            users = files.setdefault(binding.name, {}).setdefault(binding.path, [])
+            if all(seen != module for seen, _ in users):
+                users.append((module, binding))
+        found: list[ModelBinding] = []
+        for by_path in files.values():
+            for users in by_path.values():
+                found.append(
+                    replace(
+                        users[0][1],
+                        not_on=tuple(sorted({p for _, b in users for p in b.not_on})),
+                        modules=tuple(module for module, _ in users)
+                        if len(by_path) > 1
+                        else (),
+                    )
+                )
+        return tuple(found)
 
     def _region_grants(self, members: Sequence[str]) -> tuple[EffectGrant, ...]:
         """The effect grants each module of this region needs, in graph order."""

@@ -118,6 +118,7 @@ fn a_real_detector_runs_through_the_sidecar() {
         models: vec![nn::ModelSpec {
             name: "yolo".to_string(),
             path: model,
+            modules: Vec::new(),
         }],
         runtime_dir: Some(dir),
         target,

@@ -903,6 +903,12 @@ others on the same process take the provider the `gpu` walk settles
 (`sidecar/NN-EDGE.md`). A model of several files carries it on the
 first entry only, the graph itself.
 
+Two modules of one process that load a model by the same name, such as
+a module's host build and its GPU build, share one binding where they
+load one file, kept off every provider either pin names. Where the files
+differ, each file is bound for the modules loading it alone, with
+`-nn-for <module>` after its `-nn`.
+
 A query calls into an installed package one of two ways, always
 written in full:
 

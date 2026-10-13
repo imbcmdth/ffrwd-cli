@@ -673,6 +673,7 @@ fn resolve_model(raw: &str) -> Result<nn::ModelSpec> {
     Ok(nn::ModelSpec {
         name: name.to_string(),
         path: path.into(),
+        modules: Vec::new(),
     })
 }
 
@@ -682,6 +683,8 @@ fn resolve_model(raw: &str) -> Result<nn::ModelSpec> {
 /// `--invoke` reach a module that does inference, not only the frame loop.
 /// `-nn-exclude` is repeatable and deduplicated: `<name>=<provider>` keeps
 /// one model's session off a provider, and a bare `<provider>` every model's.
+/// `-nn-for <module>` follows the `-nn` it narrows to that module, and may be
+/// repeated for several.
 fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
     let mut config = nn::Config::default();
     let mut rest = Vec::with_capacity(argv.len());
@@ -698,6 +701,13 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
         };
         match arg.as_str() {
             "-nn" => config.models.push(resolve_model(&next("-nn")?)?),
+            "-nn-for" => {
+                let module = next("-nn-for")?;
+                match config.models.last_mut() {
+                    Some(spec) => spec.modules.push(module.into()),
+                    None => bail!("-nn-for {module} with no -nn before it: -nn-for follows the -nn it narrows"),
+                }
+            }
             "-nn-runtime" => config.runtime_dir = Some(next("-nn-runtime")?.into()),
             "-nn-target" => config.target = nn::Target::parse(&next("-nn-target")?)?,
             "-nn-exclude" => {
@@ -710,13 +720,7 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
         }
     }
 
-    let mut seen: Vec<&str> = Vec::new();
-    for spec in &config.models {
-        if seen.contains(&spec.name.as_str()) {
-            bail!("-nn {}: bound twice", spec.name);
-        }
-        seen.push(&spec.name);
-    }
+    config.check_bindings()?;
     config.check_exclude()?;
     Ok((config, rest))
 }

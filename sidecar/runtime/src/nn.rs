@@ -245,6 +245,49 @@ pub fn info() -> String {
 pub struct ModelSpec {
     pub name: String,
     pub path: PathBuf,
+    /// The modules it is bound for, each a `-nn-for` after it; empty for
+    /// every module.
+    pub modules: Vec<PathBuf>,
+}
+
+impl ModelSpec {
+    /// What the binding is called in the registry and in what the run says:
+    /// its name, and the modules it is for where it is bound for some.
+    pub fn key(&self) -> String {
+        if self.modules.is_empty() {
+            return self.name.clone();
+        }
+        let modules: Vec<String> = self
+            .modules
+            .iter()
+            .map(|m| m.display().to_string())
+            .collect();
+        format!("{} for {}", self.name, modules.join(", "))
+    }
+
+    /// Whether a module at `module` loads this binding under its name.
+    fn binds(&self, module: &Path) -> bool {
+        self.modules.is_empty() || self.modules.iter().any(|m| canonical(m) == module)
+    }
+}
+
+/// `path` as the file it names, where it names one.
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The registry key each name a module asks for resolves to, for one
+/// module's store: a binding for that module alone wins over one for every
+/// module.
+#[derive(Clone, Debug, Default)]
+pub struct Scope(HashMap<String, String>);
+
+impl Scope {
+    /// The registry key `name` resolves to here; `name` itself where nothing
+    /// binds it, which then names nothing.
+    pub fn key<'a>(&'a self, name: &'a str) -> &'a str {
+        self.0.get(name).map(String::as_str).unwrap_or(name)
+    }
 }
 
 /// What the command line said about inference.
@@ -261,6 +304,25 @@ pub struct Config {
 }
 
 impl Config {
+    /// Refuses a name bound twice for one module: twice for every module, or
+    /// twice for a module named by two `-nn-for`.
+    pub fn check_bindings(&self) -> Result<()> {
+        for (at, spec) in self.models.iter().enumerate() {
+            for earlier in &self.models[..at] {
+                if earlier.name != spec.name {
+                    continue;
+                }
+                if earlier.modules.is_empty() && spec.modules.is_empty() {
+                    bail!("-nn {}: bound twice", spec.name);
+                }
+                if let Some(module) = spec.modules.iter().find(|m| earlier.modules.contains(m)) {
+                    bail!("-nn {}: bound twice for {}", spec.name, module.display());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Refuses a `-nn-exclude <name>=<provider>` whose name no `-nn` binds,
     /// since a misspelt name would otherwise exclude nothing in silence.
     pub fn check_exclude(&self) -> Result<()> {
@@ -292,7 +354,7 @@ impl Config {
                     .models
                     .iter()
                     .filter(|m| self.excludes(&m.name, p))
-                    .map(|m| m.name.clone())
+                    .map(ModelSpec::key)
                     .collect();
                 if by.is_empty() {
                     None
@@ -358,10 +420,13 @@ impl GraphRegistry for ModelRegistry {
 
 /// The models this process loaded, and the provider the walk took for it.
 struct Models {
+    /// Every session, by its binding's key.
     registry: ModelRegistry,
+    /// The bindings, in `-nn` order.
+    bindings: Vec<ModelSpec>,
     names: Vec<String>,
     provider: Provider,
-    /// The provider each model's session engaged, by `-nn` name.
+    /// The provider each model's session engaged, by its binding's key.
     placed: HashMap<String, Provider>,
     /// The CUDA runtime the CUDA provider loads, where the walk took CUDA
     /// and its preflight found one.
@@ -391,13 +456,13 @@ pub fn model_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The provider the session of the model bound as `name` engaged; None for
-/// a name no `-nn` binds.
-pub fn provider_of(name: &str) -> Option<Provider> {
-    graph_registry().get()?.placed.get(name).copied()
+/// The provider the session of the binding keyed `key` engaged
+/// ([`Scope::key`]); None for a key no `-nn` makes.
+pub fn provider_of(key: &str) -> Option<Provider> {
+    graph_registry().get()?.placed.get(key).copied()
 }
 
-/// The `-nn` name of the model whose session `key` is
+/// The key of the `-nn` binding whose session `key` is
 /// ([`wasmtime_wasi_nn::backend::BackendGraph::session_key`]).
 pub fn model_of_session(key: usize) -> Option<String> {
     let models = graph_registry().get()?;
@@ -534,16 +599,31 @@ fn registered(
     onnx
 }
 
-/// The wasi-nn context one store gets. Backends are consumed by the context,
-/// so each store builds its own; the graphs behind them are shared.
-pub fn store_ctx() -> WasiNnCtx {
-    match graph_registry().get() {
-        Some(models) => WasiNnCtx::new(
-            vec![Backend::from(onnx_backend(models.provider))],
-            Registry::from(models.registry.clone()),
-        ),
-        None => empty_ctx(),
+/// The wasi-nn context the store of the module at `module_path` gets, and
+/// the key each name it asks for resolves to. Backends are consumed by the
+/// context, so each store builds its own; the graphs behind them are shared.
+pub fn store_ctx(module_path: &str) -> (WasiNnCtx, Scope) {
+    let Some(models) = graph_registry().get() else {
+        return (empty_ctx(), Scope::default());
+    };
+    let module = canonical(Path::new(module_path));
+    let mut scope = HashMap::new();
+    for for_every in [true, false] {
+        for spec in &models.bindings {
+            if spec.modules.is_empty() == for_every && spec.binds(&module) {
+                scope.insert(spec.name.clone(), spec.key());
+            }
+        }
     }
+    let graphs: HashMap<String, Graph> = scope
+        .iter()
+        .filter_map(|(name, key)| Some((name.clone(), models.registry.0.get(key)?.clone())))
+        .collect();
+    let ctx = WasiNnCtx::new(
+        vec![Backend::from(onnx_backend(models.provider))],
+        Registry::from(ModelRegistry(Arc::new(graphs))),
+    );
+    (ctx, Scope(scope))
 }
 
 /// A context with no backends and no graphs, for the stores of the modules
@@ -894,6 +974,7 @@ pub fn configure(config: &Config) -> Result<()> {
     if config.models.is_empty() {
         return Ok(());
     }
+    config.check_bindings()?;
     config.check_exclude()?;
 
     let dir = resolve_runtime_dir(config)?;
@@ -938,6 +1019,7 @@ pub fn configure(config: &Config) -> Result<()> {
     let mut names = Vec::new();
     let mut placements = Vec::new();
     for spec in &config.models {
+        let key = spec.key();
         let loading = || {
             format!(
                 "-nn {}={}: loading the model",
@@ -951,19 +1033,19 @@ pub fn configure(config: &Config) -> Result<()> {
 
         let (placed, why_cpu) = match ask(config, provider, &spec.name) {
             Ask::Gpu(asked) => {
-                match registry.register(&mut onnx, &spec.name, &bytes, ExecutionTarget::Gpu) {
+                match registry.register(&mut onnx, &key, &bytes, ExecutionTarget::Gpu) {
                     Ok(()) => (asked, None),
                     // The session refused rather than falling back in silence;
                     // the CPU answers the same, and slower.
                     Err(e) => {
                         eprintln!(
                             "[nn] {}: {} did not engage ({}); runs on the CPU",
-                            spec.name,
+                            key,
                             asked.name(),
                             one_line(&e.root_cause().to_string())
                         );
                         registry
-                            .register(&mut onnx, &spec.name, &bytes, ExecutionTarget::Cpu)
+                            .register(&mut onnx, &key, &bytes, ExecutionTarget::Cpu)
                             .with_context(loading)?;
                         (
                             Provider::Cpu,
@@ -974,17 +1056,17 @@ pub fn configure(config: &Config) -> Result<()> {
             }
             Ask::Cpu(why) => {
                 registry
-                    .register(&mut onnx, &spec.name, &bytes, ExecutionTarget::Cpu)
+                    .register(&mut onnx, &key, &bytes, ExecutionTarget::Cpu)
                     .with_context(loading)?;
                 (Provider::Cpu, why)
             }
         };
         placements.push(Placement {
-            name: spec.name.clone(),
+            name: key.clone(),
             provider: placed,
             why_cpu,
         });
-        names.push(spec.name.clone());
+        names.push(key);
     }
 
     report_verdict(&dir, config, &placements);
@@ -996,6 +1078,7 @@ pub fn configure(config: &Config) -> Result<()> {
     graph_registry()
         .set(Models {
             registry,
+            bindings: config.models.clone(),
             names,
             provider,
             placed,
@@ -1033,6 +1116,7 @@ mod tests {
                 .map(|name| ModelSpec {
                     name: name.to_string(),
                     path: PathBuf::from(format!("{name}.onnx")),
+                    modules: Vec::new(),
                 })
                 .collect(),
             runtime_dir: None,

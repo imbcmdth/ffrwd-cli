@@ -117,7 +117,8 @@ fn settle(provider: Provider) -> Route {
 }
 
 /// Frame `frame`, a `width` x `height` `pix_fmt` frame of a stream, made into
-/// the tensor `spec` says for the model bound as `model`: the whole frame,
+/// the tensor `spec` says for the model whose binding is keyed `model`
+/// ([`crate::nn::Scope::key`]): the whole frame,
 /// or each of `crops` cut to the frame, one picture after another.
 pub fn frame_tensor(
     frame: &FrameData,

@@ -28,7 +28,14 @@ import pytest
 from ffrwd import binaries, cli, nn, wasm
 from ffrwd.console import written_size
 from ffrwd.errors import ErrorCode, FfrwdError
-from ffrwd.processes import ModelBinding, SidecarProcess
+from ffrwd.ir import Graph, Node, Output, SinkUnit
+from ffrwd.processes import (
+    ModelBinding,
+    ModuleShape,
+    SidecarProcess,
+    external_ids,
+    partition,
+)
 
 WINDOWS = nn.Info(
     ort_version="9.9.9", providers=("directml", "cuda", "cpu"), platform="win-x64"
@@ -918,6 +925,53 @@ def test_a_printed_command_carries_each_models_denied_providers() -> None:
     argv = wasm.shown_argv(process)
     assert argv[argv.index("-nn-exclude") + 1] == "depth=directml"
     assert argv.index("-nn-exclude") < argv.index("-nn")
+
+
+def _two_builds(first: ModelBinding, second: ModelBinding) -> list[str]:
+    """The `-nn` flags of one region running m0.wasm into m1.wasm, each
+    loading the model its binding names."""
+    g = Graph(input_paths=["x.mp4"], sources={"a": 0})
+    g.nodes["m0"] = Node(
+        id="m0", filter="m0.wasm", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.nodes["m1"] = Node(id="m1", filter="m1.wasm", args={}, inputs=["m0"], outputs=["video"])
+    g.sinks = [
+        SinkUnit(outputs=[Output(ref="m1", type="video", name=None, metadata={})], path="o.mkv")
+    ]
+    plan = partition(
+        g,
+        external=external_ids("m0", "m1"),
+        shapes={"m0.wasm": ModuleShape(pure=True), "m1.wasm": ModuleShape(pure=True)},
+        models={"m0.wasm": first, "m1.wasm": second},
+    )
+    (sidecar,) = plan.sidecars
+    assert SidecarProcess.from_dict(sidecar.to_dict()).models == sidecar.models
+    argv = wasm.shown_argv(sidecar)
+    return [
+        word
+        for at, word in enumerate(argv)
+        if word.startswith("-nn") or argv[at - 1].startswith("-nn")
+    ]
+
+
+def test_two_builds_of_one_model_loading_one_file_bind_it_once() -> None:
+    assert _two_builds(
+        ModelBinding(name="depth", path="m/depth.onnx", not_on=("directml",)),
+        ModelBinding(name="depth", path="m/depth.onnx", not_on=("coreml",)),
+    ) == [
+        "-nn-exclude", "depth=coreml", "-nn-exclude", "depth=directml",
+        "-nn", "depth=m/depth.onnx",
+    ]
+
+
+def test_two_builds_of_one_model_loading_two_files_bind_one_each() -> None:
+    assert _two_builds(
+        ModelBinding(name="depth", path="a/depth.onnx"),
+        ModelBinding(name="depth", path="b/depth.onnx"),
+    ) == [
+        "-nn", "depth=a/depth.onnx", "-nn-for", "m0.wasm",
+        "-nn", "depth=b/depth.onnx", "-nn-for", "m1.wasm",
+    ]
 
 
 def test_the_target_variable_beats_the_default(

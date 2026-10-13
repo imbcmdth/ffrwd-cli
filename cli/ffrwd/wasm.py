@@ -384,6 +384,8 @@ _TRACK_FLAG = "-track"
 # file is called: the export's own name, beside the module.
 _NN_FLAG = "-nn"
 _NN_EXCLUDE_FLAG = "-nn-exclude"
+# A module the ``-nn`` before it binds its model for, and no other.
+_NN_FOR_FLAG = "-nn-for"
 
 # The sidecar's worker-thread cap. Unwritten, the sidecar sizes its own pool.
 _JOBS_FLAG = "-jobs"
@@ -1948,7 +1950,8 @@ def _packet_rows(module: str, text: str) -> tuple[dict[str, object], ...]:
 def _nn_args(models: Sequence[ModelBinding], runtime: Sequence[str]) -> list[str]:
     """The ``-nn-runtime``/``-nn-target`` pair, one ``-nn-exclude
     <name>=<provider>`` per provider a model denies, then one ``-nn
-    name=path`` per model.
+    name=path`` per model, each followed by a ``-nn-for <module>`` per module
+    it is bound for alone.
 
     Shared by a sidecar process's argv and a compile-time :func:`invoke` of a
     module that runs one -- both bind a model the same way. `runtime` is
@@ -1966,6 +1969,8 @@ def _nn_args(models: Sequence[ModelBinding], runtime: Sequence[str]) -> list[str
         argv += [_NN_EXCLUDE_FLAG, f"{name}={provider}"]
     for model in models:
         argv += [_NN_FLAG, f"{model.name}={model.path}"]
+        for module in model.modules:
+            argv += [_NN_FOR_FLAG, module]
     return argv
 
 

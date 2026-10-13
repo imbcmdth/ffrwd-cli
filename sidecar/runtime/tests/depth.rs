@@ -113,6 +113,7 @@ fn configured() -> &'static Result<PathBuf, String> {
             models: vec![nn::ModelSpec {
                 name: MODEL.to_string(),
                 path: model,
+                modules: Vec::new(),
             }],
             runtime_dir: Some(dir),
             target,

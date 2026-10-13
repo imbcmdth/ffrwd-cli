@@ -23,13 +23,14 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from ffrwd import binaries, wasm
+from ffrwd import binaries, nn, wasm
 from ffrwd.compiler import Compiled, compile_all, compile_sql
 from ffrwd.emit import build_ffmpeg_args, emit
 from ffrwd.errors import FfrwdError
@@ -1436,3 +1437,71 @@ def test_each_reading_of_one_input_is_told_the_colour_it_is_read_in(tmp_path: Pa
         "yuv420p": (probed["color_range"], probed["color_space"]),
         "rgba": ("pc", "gbr"),
     }
+
+
+# -- the host build and the GPU build of one model in one query ----------------
+
+_DEPTH = _built(_SIDECAR_MODULES, "depth")
+_DEPTH_GPU = _built(_SIDECAR_MODULES, "depth_gpu")
+_BLUR_MASK = _built(_SIDECAR_MODULES, "blur_mask")
+
+
+def _onnx_runtime() -> Path | None:
+    """The ONNX Runtime directory the environment names, else the one
+    `ffrwd setup nn` fetched into the user's own cache; None where neither
+    holds one."""
+    named = os.environ.get(nn.RUNTIME_DIR_VAR, "").strip()
+    known = nn.info()
+    fetched = Path.home() / ".cache" / "ffrwd" / "nn-runtime" / known.ort_version / known.platform
+    for candidate in (Path(named) if named else None, fetched):
+        if candidate is not None and any(
+            (candidate / lib).is_file()
+            for lib in ("onnxruntime.dll", "libonnxruntime.so", "libonnxruntime.dylib")
+        ):
+            return candidate
+    return None
+
+
+def test_two_builds_of_one_model_run_in_one_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`depth` and `depth_gpu` load the model `depth` from the one file beside
+    them: the process binds it once, and both run, on the CPU."""
+    model = _DEPTH.with_name("depth.onnx")
+    for needed in (_DEPTH, _DEPTH_GPU, _BLUR_MASK, model):
+        if not needed.exists():
+            pytest.skip(f"missing: {needed}")
+    runtime = _onnx_runtime()
+    if runtime is None:
+        pytest.skip("no ONNX Runtime here (ffrwd setup nn, or FFRWD_NN_RUNTIME)")
+    monkeypatch.setenv(nn.RUNTIME_DIR_VAR, str(runtime))
+    monkeypatch.setenv(nn.TARGET_VAR, "cpu")
+    out_path = tmp_path / "both.mkv"
+    compiled = compile_all(
+        f"CREATE FUNCTION depth(v video_stream) RETURNS video_stream\n"
+        f"  AS '{_DEPTH.as_posix()}', 'depth' LANGUAGE wasm;\n"
+        "CREATE FUNCTION depth_gpu(v video_stream, memory text DEFAULT 'host')\n"
+        f"RETURNS video_stream AS '{_DEPTH_GPU.as_posix()}', 'depth' LANGUAGE wasm;\n"
+        "CREATE FUNCTION blur_mask(v video_stream, mask video_stream,\n"
+        "                          max_radius number DEFAULT 16, invert boolean DEFAULT FALSE)\n"
+        f"RETURNS video_stream AS '{_BLUR_MASK.as_posix()}', 'blur_mask' LANGUAGE wasm;\n"
+        "COPY (SELECT blur_mask(depth_gpu(f.video[1]), depth(f.video[1]), 8, TRUE)\n"
+        f"      FROM input('{_SOURCE.as_posix()}') f WHERE f.t <= 1)\n"
+        f"TO '{out_path.as_posix()}' WITH (video_codec 'ffv1')"
+    )
+    assert compiled.plan is not None
+    (sidecar,) = compiled.plan.sidecars
+    assert [(m.name, Path(m.path), m.modules) for m in sidecar.models] == [
+        ("depth", model, ())
+    ]
+    result = execute_plan(
+        compiled.plan, sidecar_argv=wasm.sidecar_argv, overwrite=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.exit_code == 0, "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    # The fixture's first second, at 15 frames a second.
+    assert int(str(_video_stream(out_path)["nb_read_frames"])) == 15

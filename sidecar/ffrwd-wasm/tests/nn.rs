@@ -379,6 +379,115 @@ fn nn_exclude_refuses_cpu_and_a_misspelling() {
 }
 
 #[test]
+fn a_name_is_bound_once_for_every_module_or_once_for_each_module() {
+    let model = format!("tiny={}", tiny_model().display());
+    let refused = |args: &[&str], said: &str| {
+        let output = run_bare(args);
+        assert!(!output.status.success(), "{args:?} should be refused");
+        assert!(stderr(&output).contains(said), "got: {}", stderr(&output));
+    };
+    refused(
+        &["-nn", &model, "-nn", &model, "--describe", "x.wasm"],
+        "-nn tiny: bound twice",
+    );
+    refused(
+        &[
+            "-nn",
+            &model,
+            "-nn-for",
+            "a.wasm",
+            "-nn",
+            &model,
+            "-nn-for",
+            "a.wasm",
+            "--describe",
+            "x.wasm",
+        ],
+        "-nn tiny: bound twice for a.wasm",
+    );
+    refused(
+        &["-nn-for", "a.wasm", "-nn", &model, "--describe", "x.wasm"],
+        "-nn-for a.wasm with no -nn before it",
+    );
+    let output = run_bare(&[
+        "-nn",
+        &model,
+        "-nn-for",
+        "a.wasm",
+        "-nn",
+        &model,
+        "-nn-for",
+        "b.wasm",
+        "--describe",
+        "x.wasm",
+    ]);
+    assert!(
+        !stderr(&output).contains("bound twice"),
+        "one name bound for two modules apart is accepted: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_model_bound_for_one_module_is_the_one_that_module_loads() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("the probe module cannot run without a runtime");
+        return;
+    };
+    let module = probe_module();
+    let module = module.to_string_lossy().to_string();
+    let other = sidecar_root().join("modules/nn-frames/model/channel-means.onnx");
+    let tiny = format!("tiny={}", tiny_model().display());
+    let means = format!("tiny={}", other.display());
+    let run = r#"{"model":"tiny","input":[1,2,3,4]}"#;
+
+    let output = run_with_runtime(
+        &runtime,
+        &[
+            "-nn",
+            &means,
+            "-nn-for",
+            "elsewhere.wasm",
+            "-nn",
+            &tiny,
+            "-nn-for",
+            &module,
+            "--invoke",
+            &module,
+            "run",
+            run,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "the run failed: {}",
+        stderr(&output)
+    );
+    let result: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("the result is JSON");
+    assert_eq!(result["output"], serde_json::json!([12.5, 0.5]));
+
+    let output = run_with_runtime(
+        &runtime,
+        &[
+            "-nn",
+            &tiny,
+            "-nn-for",
+            "elsewhere.wasm",
+            "--invoke",
+            &module,
+            "run",
+            run,
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "a model bound for another module is not this one's: {}",
+        stdout(&output)
+    );
+}
+
+#[test]
 fn nn_exclude_takes_a_model_name_and_refuses_one_never_bound() {
     let model = format!("tiny={}", tiny_model().display());
 
