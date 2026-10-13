@@ -103,8 +103,9 @@ pub enum DeviceMemory {
 
 /// An input tensor's elements in device memory the embedder owns, which a
 /// backend binds to its session in place of bytes. The tensor carries a
-/// handle to it, so the wasi-nn tensor itself stays bytes or nothing.
-pub trait DeviceInput: Send + Sync {
+/// handle to it, so the wasi-nn tensor itself stays bytes or nothing. It is
+/// `Any`, so the embedder can reach its own type behind a handle.
+pub trait DeviceInput: std::any::Any + Send + Sync {
     /// Where the elements are, packed as the tensor's dimensions and type
     /// say.
     fn memory(&self) -> DeviceMemory;

@@ -1863,3 +1863,38 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
 ```
 
 With `memory => 'gpu'` the frame is decoded onto the device and the crops are made there in one pass. Where the model's session is CUDA or DirectML on the same device, the tensor is bound to the session in place and nothing is read back. With `memory => 'host'` the crops are made on the CPU with the same arithmetic. A rectangle reaching past the frame is cut to it, and a rectangle with nothing on the frame is an error. `sidecar/NN-EDGE.md`, "Inputs from the pool", has the resampling and the routes.
+
+## 164. Frames of several ticks, stacked into one tensor
+
+A model that reads several frames at once, such as a video model taking eight frames of a shot, takes them as one tensor, and the frames arrive on different ticks. A tensor the sidecar makes of a frame is the module's until it drops it, so the module keeps the ones it wants, and `ffrwd:gpu/nn.stack` joins them in the order it names them, as one tensor of the dimensions the model takes. `nn_frames` with `stack => 4` keeps four slots: frame k's tensor goes in slot k mod 4, replacing the one there, and once every slot is full each frame's row is the model run on the four slots joined. The model, `nn_frames.onnx` beside the module, returns the channel means and largest values of each slot's picture, and the rows go to the file:
+
+```pgsql
+CREATE FUNCTION nn_frames(v video_stream, model text DEFAULT 'nn_frames',
+                          memory text DEFAULT 'gpu', stack number DEFAULT NULL,
+                          width number DEFAULT 64, height number DEFAULT 48)
+RETURNS STRUCT(pts number, tensor_ms number, compute_ms number)[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/nn_frames.wasm', 'nn_frames'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT nn_frames(f.video[1], stack => 4)
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'stacked.ndjson'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts disabled \
+  -output_ts_offset 1001 -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"offset": 1001}' -nn \
+  nn_frames=../sidecar/modules/target/wasm32-wasip2/release/nn_frames.onnx -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/nn_frames.wasm -m \
+  nn_frames=../sidecar/modules/target/wasm32-wasip2/release/nn_frames.wasm \
+  -filter_complex \
+  '[0:v]decode=format=yuv420p:hw=auto[decode0];'\
+'[v=decode0]nn_frames=model=nn_frames:memory=gpu:stack=4:width=64:height=48[rows=out0]' \
+  -bound 'nn_frames=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map \
+  '[out0]' -f ndjson stacked.ndjson
+```
+
+The first three frames write no row. With `memory => 'gpu'` each frame's tensor is made on the device. Where the model's session binds the device's memory in place, CUDA or DirectML on the sidecar's device, the slots are copied together on the device and the joined tensor is bound the same way, so nothing is read back. Elsewhere each frame's tensor is read back once, when it is made, and the slots are joined in host memory. `sidecar/NN-EDGE.md`, "Tensors of several ticks", has the rules.

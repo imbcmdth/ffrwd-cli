@@ -526,3 +526,14 @@ and the rows leave on `rows`.
     '[v=decode0]nn_frames=model=nn_frames:memory=gpu:crops=\[\[40\,30\,120\,160\]\,\[200\,'\
     '60\,90\,110\]\]:width=224:height=224:filter=bicubic:antialias=1[rows=out0]' -map \
       '[out0]' -f ndjson crops.ndjson
+
+**164.** `nn_frames` keeping the tensors of the last four frames in four
+slots and running the model on them joined (`ffrwd:gpu/nn.stack`). `stack`
+is its param; frame k's tensor replaces the one in slot k mod 4, and a row
+leaves for each frame from the fourth on.
+
+    ffrwd-wasm -f nut -i pipe:0 -nn nn_frames=nn_frames.onnx -gpu nn_frames.wasm \
+      -m nn_frames=nn_frames.wasm -filter_complex \
+      '[0:v]decode=format=yuv420p:hw=auto[decode0];'\
+    '[v=decode0]nn_frames=model=nn_frames:memory=gpu:stack=4:width=64:height=48'\
+    '[rows=out0]' -map '[out0]' -f ndjson stacked.ndjson

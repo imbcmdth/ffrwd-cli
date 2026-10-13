@@ -22,6 +22,10 @@
 //!
 //! `FFRWD_NN_BIND=off` takes the downloaded route where the bound one would
 //! be taken, so the two can be compared on one session.
+//!
+//! [`stack`] joins tensors made on several ticks into one: on the device,
+//! bound the way its parts were, where every part is bound in place; in host
+//! memory otherwise.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -195,6 +199,49 @@ pub fn frame_tensor(
     Ok(Tensor::new(dimensions, TensorType::Fp32, bytes))
 }
 
+/// How many elements a tensor of `dimensions` holds.
+fn elements(dimensions: &[u32]) -> u64 {
+    dimensions.iter().map(|&d| u64::from(d)).product()
+}
+
+/// `tensors`' elements one after another, in order, as one tensor of
+/// `dimensions`. Where every tensor is bound to its session in place, the
+/// same way, the joined tensor is copied together on the device and bound
+/// that way; otherwise each tensor's elements are taken where they are, a
+/// tensor on the device read back, and joined in host memory.
+pub fn stack(tensors: &[&Tensor], dimensions: Vec<u32>) -> Result<Tensor> {
+    let Some(first) = tensors.first() else {
+        bail!("nothing to stack: the list is empty");
+    };
+    if let Some(at) = tensors.iter().position(|t| t.ty != first.ty) {
+        bail!(
+            "tensor {at} is {:?} and tensor 0 is {:?}; a stack is of one element type",
+            tensors[at].ty,
+            first.ty
+        );
+    }
+    let held: u64 = tensors.iter().map(|t| elements(&t.dimensions)).sum();
+    let asked = elements(&dimensions);
+    if asked != held {
+        bail!(
+            "dimensions {dimensions:?} hold {asked} elements, and the {} tensors hold {held}",
+            tensors.len()
+        );
+    }
+    #[cfg(windows)]
+    if let Some(joined) = bound::stack(tensors, &dimensions)? {
+        return Ok(joined);
+    }
+    let mut bytes = Vec::new();
+    for tensor in tensors {
+        match &tensor.device {
+            Some(device) => bytes.extend(device.0.read().map_err(|e| anyhow::anyhow!("{e:#}"))?),
+            None => bytes.extend_from_slice(&tensor.data),
+        }
+    }
+    Ok(Tensor::new(dimensions, first.ty, bytes))
+}
+
 /// The bound route: the process's D3D12 device, the CUDA runtime the CUDA
 /// provider loaded, and the import of the device's shared sync object.
 #[cfg(windows)]
@@ -258,6 +305,14 @@ pub(crate) mod bound {
             crops: &[Rect],
         ) -> Result<Tensor> {
             let made = frame.tensor(spec, crops, true)?;
+            let dimensions = made.dimensions();
+            self.wrap(made, dimensions)
+        }
+
+        /// `made`, a tensor in a buffer on a shared heap, as a tensor of
+        /// `dimensions` whose elements are that buffer as CUDA maps it,
+        /// mapped the first time.
+        fn wrap(&'static self, made: Arc<DeviceTensor>, dimensions: Vec<u32>) -> Result<Tensor> {
             let buffer = &made.buffer;
             let mapped = buffer
                 .cuda
@@ -278,7 +333,7 @@ pub(crate) mod bound {
                 binder: self,
             };
             Ok(Tensor::on_device(
-                made.dimensions(),
+                dimensions,
                 TensorType::Fp32,
                 DeviceHandle(Arc::new(input)),
             ))
@@ -290,15 +345,63 @@ pub(crate) mod bound {
     /// to DirectML.
     pub fn bind_directml(frame: &GpuFrame, spec: &TensorSpec, crops: &[Rect]) -> Result<Tensor> {
         let made = frame.tensor(spec, crops, true)?;
+        let dimensions = made.dimensions();
+        wrap_directml(made, dimensions)
+    }
+
+    /// `made`, a tensor in a buffer of the process's device, as a tensor of
+    /// `dimensions` whose elements are that buffer handed to DirectML.
+    fn wrap_directml(made: Arc<DeviceTensor>, dimensions: Vec<u32>) -> Result<Tensor> {
         let allocation = crate::nn::directml::allocation_of_buffer(&made.buffer)?;
         Ok(Tensor::on_device(
-            made.dimensions(),
+            dimensions,
             TensorType::Fp32,
             DeviceHandle(Arc::new(DirectMlInput {
                 allocation: allocation.pointer(),
                 tensor: made,
             })),
         ))
+    }
+
+    /// How a tensor is bound in place.
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Cuda(&'static Binder),
+        DirectMl,
+    }
+
+    /// `tensors` copied together on the device as a tensor of `dimensions`,
+    /// bound the way every one of them is; None where one is not bound in
+    /// place, or they are bound two ways.
+    pub fn stack(tensors: &[&Tensor], dimensions: &[u32]) -> Result<Option<Tensor>> {
+        let mut parts = Vec::with_capacity(tensors.len());
+        let mut kind = None;
+        for tensor in tensors {
+            let Some(device) = &tensor.device else {
+                return Ok(None);
+            };
+            let input: &dyn std::any::Any = device.0.as_ref();
+            let (this, part) = if let Some(bound) = input.downcast_ref::<Bound>() {
+                (Kind::Cuda(bound.binder), &bound.tensor)
+            } else if let Some(dml) = input.downcast_ref::<DirectMlInput>() {
+                (Kind::DirectMl, &dml.tensor)
+            } else {
+                return Ok(None);
+            };
+            match (kind, this) {
+                (None, _) => kind = Some(this),
+                (Some(Kind::Cuda(_)), Kind::Cuda(_)) | (Some(Kind::DirectMl), Kind::DirectMl) => {}
+                _ => return Ok(None),
+            }
+            parts.push(Arc::clone(part));
+        }
+        let joined = Arc::new(crate::gpu::tensor::join(&parts, true)?);
+        let dimensions = dimensions.to_vec();
+        match kind {
+            Some(Kind::Cuda(binder)) => binder.wrap(joined, dimensions).map(Some),
+            Some(Kind::DirectMl) => wrap_directml(joined, dimensions).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// A frame's tensor as a DirectML session binds it. The session runs on
@@ -379,5 +482,55 @@ pub(crate) mod bound {
             PROFILE.download.add(len, started);
             Ok(bytes[..len].to_vec())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(dimensions: &[u32], first: u8) -> Tensor {
+        let len = 4 * elements(dimensions) as usize;
+        Tensor::new(
+            dimensions.to_vec(),
+            TensorType::Fp32,
+            (0..len).map(|i| first.wrapping_add(i as u8)).collect(),
+        )
+    }
+
+    #[test]
+    fn tensors_in_host_memory_are_joined_in_the_order_named_with_the_dimensions_asked() {
+        let (a, b) = (host(&[1, 3, 2, 2], 0), host(&[2, 3, 2, 2], 100));
+        let joined = stack(&[&a, &b, &a], vec![1, 4, 3, 2, 2]).unwrap();
+        assert_eq!(joined.dimensions, [1, 4, 3, 2, 2]);
+        assert_eq!(joined.ty, TensorType::Fp32);
+        assert!(joined.device.is_none());
+        let want: Vec<u8> = [&a.data, &b.data, &a.data]
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(joined.data, want);
+    }
+
+    #[test]
+    fn a_stack_of_nothing_of_two_types_or_of_the_wrong_size_is_refused() {
+        let a = host(&[1, 3, 2, 2], 0);
+        let err = stack(&[], vec![1]).unwrap_err().to_string();
+        assert!(err.contains("the list is empty"), "{err}");
+        let mut other = host(&[1, 3, 2, 2], 0);
+        other.ty = TensorType::Fp16;
+        let err = stack(&[&a, &other], vec![2, 3, 2, 2])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("tensor 1") && err.contains("one element type"),
+            "{err}"
+        );
+        let err = stack(&[&a, &a], vec![1, 3, 2, 2]).unwrap_err().to_string();
+        assert!(
+            err.contains("hold 12 elements") && err.contains("hold 24"),
+            "{err}"
+        );
     }
 }

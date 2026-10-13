@@ -14,8 +14,8 @@
 // frame through. What `frames` adds is the planes as textures and a way to
 // emit a texture; what `nn` adds is a frame made into a model's input
 // tensor (or crops of a frame, batched into one tensor) without the module
-// fetching its bytes, and a model's output held as a texture without the
-// module reading it back.
+// fetching its bytes, tensors made on several ticks joined into one, and a
+// model's output held as a texture without the module reading it back.
 
 package ffrwd:gpu@0.1.0;
 
@@ -173,9 +173,10 @@ interface nn {
   /// the centre of the pixels it covers, and each sample made RGB before
   /// it is weighed), and the weighed value is clamped to 0 to 1. Near an
   /// edge the weights of the samples past it are dropped and the rest
-  /// scaled to sum to 1, as Pillow does. The tensor
-  /// is valid for this call of `process`; it may be passed to `compute` of
-  /// the graph `options.model` names, and `data` reads its elements back.
+  /// scaled to sum to 1, as Pillow does. The tensor is the module's until
+  /// it drops it or passes it to `compute`, across calls of `process`: it
+  /// may be passed to `compute` of the graph `options.model` names, joined
+  /// with others by `stack`, and `data` reads its elements back.
   /// A stream not bound at `init`, an index past the tick's frames, a
   /// model no `-nn` binds, a size of 0, or a `std` of 0 is an error.
   frame-tensor: func(id: u32, index: u32, options: frame-tensor-options) -> result<tensor, string>;
@@ -191,6 +192,20 @@ interface nn {
   /// nothing of it on the frame, and everything `frame-tensor` refuses are
   /// errors.
   crops-tensor: func(id: u32, index: u32, crops: list<rect>, options: frame-tensor-options) -> result<tensor, string>;
+
+  /// `tensors`' elements one after another, in the order given, as one
+  /// tensor of `dimensions`: tensors `frame-tensor` and `crops-tensor` made
+  /// on several calls of `process`, such as the frames of a shot a video
+  /// model reads at once, as the one input the model takes. A tensor may be
+  /// named more than once, and none is consumed: the module keeps each, so
+  /// a batch of slots is a list of tensors it holds, and a slot is rewritten
+  /// by dropping its tensor and holding a new one. Where every tensor is
+  /// bound to its session in place, the joined tensor is copied together on
+  /// the device and bound the same way; otherwise the elements of a tensor
+  /// on the device are read back and the tensors are joined in host memory.
+  /// An empty list, tensors of different element types, and `dimensions`
+  /// that do not hold as many elements as the tensors together are errors.
+  stack: func(tensors: list<borrow<tensor>>, dimensions: list<u32>) -> result<tensor, string>;
 
   /// An output of a graph held as a texture.
   record output-texture-options {

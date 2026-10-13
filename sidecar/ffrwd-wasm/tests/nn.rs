@@ -1002,6 +1002,12 @@ fn means_batch_model() -> PathBuf {
     sidecar_root().join("modules/nn-frames/model/channel-means-batch.onnx")
 }
 
+/// `channel-means-clip.onnx`: the six numbers of each frame of a clip,
+/// `[1, n, 3, h, w]`.
+fn means_clip_model() -> PathBuf {
+    sidecar_root().join("modules/nn-frames/model/channel-means-clip.onnx")
+}
+
 const MEANS_WIDTH: u32 = 64;
 const MEANS_HEIGHT: u32 = 48;
 const MEANS_FRAMES: usize = 4;
@@ -1712,6 +1718,150 @@ fn crops_of_a_frame_give_the_same_rows_on_every_route() {
                 downloaded_bytes(&message),
                 0,
                 "{provider}: the bound routes read nothing back: {message}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tensors_of_several_ticks_stacked_hold_each_slots_frame_on_every_route() {
+    let Some(runtime) = runtime_dir() else {
+        announce_skip("nn_frames cannot run a model without a runtime");
+        return;
+    };
+    let dir = means_dir("stack");
+    let input = means_input(&dir);
+    let options = "width=16:height=12";
+    // Each frame on its own: what the slots are read against.
+    let (alone, message) = means_run(
+        &runtime,
+        &dir,
+        &input,
+        "cpu",
+        false,
+        &format!("memory=host:{options}"),
+        &[],
+    );
+    assert_eq!(alone.len(), MEANS_FRAMES, "{message}");
+    let slots = 3;
+    // From frame `slots - 1` on, a row a frame: frame k's tensor in slot
+    // k mod `slots`, so each slot holds the last frame written there, and
+    // the slots in slot order.
+    let expected: Vec<Vec<f64>> = (slots - 1..MEANS_FRAMES)
+        .map(|k| {
+            let held: Vec<usize> = (0..slots)
+                .map(|slot| (0..=k).rev().find(|f| f % slots == slot).expect("written"))
+                .collect();
+            ["mean", "max"]
+                .into_iter()
+                .flat_map(|name| {
+                    held.iter()
+                        .flat_map(|&f| {
+                            alone[f]["outputs"][name]
+                                .as_array()
+                                .expect("a list")
+                                .iter()
+                                .map(|v| v.as_f64().expect("a number"))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
+        .collect();
+    let tensor: u64 = 16 * 12 * 3 * 4;
+    let check = |rows: &[serde_json::Value], what: &str| {
+        assert_eq!(
+            rows.len(),
+            MEANS_FRAMES - slots + 1,
+            "{what}: a row from the frame that fills the last slot on: {rows:?}"
+        );
+        for (row, want) in rows.iter().zip(&expected) {
+            let got = output_values(std::slice::from_ref(row));
+            assert_eq!(got.len(), want.len(), "{what}: six numbers a slot: {row}");
+            let worst = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f64, f64::max);
+            assert!(worst < 1e-4, "{what}: apart by up to {worst}: {row}");
+        }
+    };
+    let profile = ["-profile"];
+    for (clip, model) in [
+        ("", means_batch_model()),
+        (":clip=true", means_clip_model()),
+    ] {
+        let stacked = format!("{options}:stack={slots}{clip}");
+        let (host, message) = means_run_on(
+            &runtime,
+            &dir,
+            &input,
+            "cpu",
+            &model,
+            &format!("memory=host:{stacked}"),
+            &profile,
+        );
+        assert!(
+            message.contains("[nn] means: input in host memory, made on the CPU"),
+            "{message}"
+        );
+        check(&host, &format!("host memory{clip}"));
+
+        let (downloaded, message) = means_run_on(
+            &runtime,
+            &dir,
+            &input,
+            "cpu",
+            &model,
+            &format!("memory=gpu:{stacked}"),
+            &profile,
+        );
+        if message.contains("no GPU") {
+            eprintln!("SKIPPED: the GPU routes. This machine has no GPU adapter.");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            message.contains("[nn] means: input downloaded, CPU takes host memory"),
+            "{message}"
+        );
+        check(&downloaded, &format!("downloaded{clip}"));
+        assert_eq!(
+            downloaded_bytes(&message),
+            tensor * MEANS_FRAMES as u64,
+            "each frame's tensor is read back once, and the stack reads nothing more: {message}"
+        );
+
+        for (target, provider) in [("cuda", "CUDA"), ("directml", "DIRECTML")] {
+            let (bound, message) = means_run_on(
+                &runtime,
+                &dir,
+                &input,
+                target,
+                &model,
+                &format!("memory=gpu:{stacked}"),
+                &profile,
+            );
+            if !message.contains(&format!("[nn] means: execution provider {provider}")) {
+                eprintln!("SKIPPED: {provider} did not engage here:\n{message}");
+                continue;
+            }
+            if !cfg!(windows) {
+                continue;
+            }
+            assert!(
+                message.contains(&format!(
+                    "[nn] means: input from the pool, bound on {provider}"
+                )),
+                "{message}"
+            );
+            check(&bound, &format!("bound on {provider}{clip}"));
+            assert_eq!(
+                downloaded_bytes(&message),
+                0,
+                "{provider}: the slots are joined on the device: {message}"
             );
         }
     }

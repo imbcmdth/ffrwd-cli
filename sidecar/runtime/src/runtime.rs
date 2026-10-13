@@ -2154,6 +2154,22 @@ impl gpu_ext::ffrwd::gpu::nn::Host for Host {
         self.tensor_of_frame("crops-tensor", id, index, Some(&crops), options)
     }
 
+    fn stack(
+        &mut self,
+        tensors: Vec<Resource<wasmtime_wasi_nn::Tensor>>,
+        dimensions: Vec<u32>,
+    ) -> wasmtime::Result<Result<Resource<wasmtime_wasi_nn::Tensor>, String>> {
+        let mut held = Vec::with_capacity(tensors.len());
+        for tensor in &tensors {
+            held.push(self.table.get(tensor)?);
+        }
+        let joined = crate::nn::frame_tensor::stack(&held, dimensions);
+        match joined {
+            Ok(tensor) => Ok(Ok(self.table.push(tensor)?)),
+            Err(e) => Ok(Err(format!("stack: {e:#}"))),
+        }
+    }
+
     fn output_texture(
         &mut self,
         context: Resource<wasmtime_wasi_nn::ExecutionContext>,

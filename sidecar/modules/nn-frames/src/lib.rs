@@ -27,6 +27,15 @@
 //! value, six numbers a test can work out from the frame on its own.
 //! `model/channel-means-batch.onnx` takes a batch, crops among them, and
 //! gives the six numbers of each picture.
+//!
+//! With `stack`, a number of slots, the module keeps each frame's tensor
+//! past its tick: frame k's in slot k mod `stack`, so every slot is
+//! rewritten each `stack` frames. Once every slot holds one, each frame's
+//! row is the model run on the slots in slot order, joined into one tensor
+//! by the host (`ffrwd:gpu/nn.stack`): [`stack` * n, 3, height, width],
+//! where each slot's tensor holds n pictures, or with `clip`
+//! [1, `stack` * n, 3, height, width], a clip as a video model takes one
+//! (`model/channel-means-clip.onnx`).
 
 wit_bindgen::generate!({
     path: ["../../wit", "../../wit-gpu", "wit"],
@@ -47,7 +56,7 @@ use ffrwd::av::node_types::{
 };
 use ffrwd::av::types::{Meta, Wants};
 use ffrwd::gpu::nn::{
-    crops_tensor, frame_tensor, output_texture, ChannelOrder, Fit, FrameTensorOptions,
+    crops_tensor, frame_tensor, output_texture, stack, ChannelOrder, Fit, FrameTensorOptions,
     OutputTextureOptions, Rect, ResizeFilter, TensorLayout,
 };
 use ffrwd::gpu::types::{FrameMemory, PortMemory};
@@ -55,12 +64,13 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use wasi::nn::graph::load_by_name;
 use wasi::nn::inference::GraphExecutionContext;
+use wasi::nn::tensor::Tensor;
 use wasi::webgpu::webgpu::{
     get_gpu, GpuBufferDescriptor, GpuBufferUsage, GpuDevice, GpuExtent3D, GpuMapMode,
     GpuTexelCopyBufferInfo, GpuTexelCopyTextureInfo, GpuTexture,
 };
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"model":{"type":"string"},"input":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"layout":{"type":"string","enum":["nchw","nhwc"]},"order":{"type":"string","enum":["rgb","bgr"]},"fit":{"type":"string","enum":["stretch","letterbox"]},"pad":{"type":"number"},"scale":{"type":"number"},"mean":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"std":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"texture":{"type":"string"},"texture_width":{"type":"integer","minimum":1},"texture_height":{"type":"integer","minimum":1},"filter":{"type":"string","enum":["bilinear","bicubic"]},"antialias":{"type":"boolean"},"crops":{"type":["string","array"]}},"required":["model"],"additionalProperties":false}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"model":{"type":"string"},"input":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"layout":{"type":"string","enum":["nchw","nhwc"]},"order":{"type":"string","enum":["rgb","bgr"]},"fit":{"type":"string","enum":["stretch","letterbox"]},"pad":{"type":"number"},"scale":{"type":"number"},"mean":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"std":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"texture":{"type":"string"},"texture_width":{"type":"integer","minimum":1},"texture_height":{"type":"integer","minimum":1},"filter":{"type":"string","enum":["bilinear","bicubic"]},"antialias":{"type":"boolean"},"crops":{"type":["string","array"]},"stack":{"type":"integer","minimum":1},"clip":{"type":"boolean"}},"required":["model"],"additionalProperties":false}"#;
 
 const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"pts":{"type":"integer"},"outputs":{"type":"object"},"tensor_ms":{"type":"number"},"compute_ms":{"type":"number"},"output_ms":{"type":"number"}}}"#;
 
@@ -109,6 +119,12 @@ struct Params {
     /// height]`: a JSON list, or text holding one.
     #[serde(default)]
     crops: Option<Value>,
+    /// Slots of tensors kept past their tick, joined into one each frame.
+    #[serde(default)]
+    stack: Option<u32>,
+    /// Whether the joined tensor has a leading 1, as a clip.
+    #[serde(default)]
+    clip: bool,
 }
 
 fn gpu() -> String {
@@ -221,6 +237,35 @@ struct State {
     /// The output bound to a texture, the texture, and the device to read
     /// it back with.
     texture: Option<(String, GpuTexture, GpuDevice)>,
+    /// With `stack`: the slots, each the tensor of the last frame written
+    /// there, and how many frames have been written.
+    slots: Vec<Option<Tensor>>,
+    written: usize,
+    clip: bool,
+}
+
+impl State {
+    /// `tensor` written into its frame's slot, and, once every slot holds
+    /// one, the slots joined in slot order; the tensor itself without
+    /// `stack`.
+    fn batch(&mut self, tensor: Tensor) -> Result<Option<Tensor>, String> {
+        if self.slots.is_empty() {
+            return Ok(Some(tensor));
+        }
+        let slot = self.written % self.slots.len();
+        self.slots[slot] = Some(tensor);
+        self.written += 1;
+        let held: Option<Vec<&Tensor>> = self.slots.iter().map(Option::as_ref).collect();
+        let Some(held) = held else {
+            return Ok(None);
+        };
+        let mut dimensions = held[0].dimensions();
+        dimensions[0] *= held.len() as u32;
+        if self.clip {
+            dimensions.insert(0, 1);
+        }
+        stack(&held, &dimensions).map(Some)
+    }
 }
 
 /// `texture`'s `width` x `height` fp32 texels, read back: a copy into a
@@ -322,7 +367,7 @@ impl Guest for Node {
     }
 
     fn shape(params: String, _bound: Vec<Binding>) -> Result<NodeShape, String> {
-        parse(&params)?;
+        let params = parse(&params)?;
         let v = InputPort {
             name: "v".to_string(),
             kind: PortKind::Video,
@@ -361,7 +406,8 @@ impl Guest for Node {
             inputs: vec![v],
             outputs: vec![rows],
             clock: Clock::Input("v".to_string()),
-            pure: true,
+            // The slots carry tensors from one frame to the next.
+            pure: params.stack.is_none(),
             one_to_one: false,
             bounded: true,
             relation: Vec::new(),
@@ -381,6 +427,7 @@ impl Guest for Node {
             .map_err(|e| format!("init-execution-context: {}", e.data()))?;
         let options = params.options()?;
         let crops = params.crops()?;
+        let slots = (0..params.stack.unwrap_or(0)).map(|_| None).collect();
         let texture = match (&params.texture, params.texture_width, params.texture_height) {
             (Some(name), Some(width), Some(height)) => {
                 let texture = output_texture(
@@ -408,6 +455,9 @@ impl Guest for Node {
                 crops,
                 context,
                 texture,
+                slots,
+                written: 0,
+                clip: params.clip,
             })
         });
         Ok(())
@@ -419,14 +469,17 @@ impl Guest for Node {
 
     fn process(tick: &Tick) -> Result<Emitted, String> {
         STATE.with(|s| {
-            let state = s.borrow();
-            let state = state.as_ref().ok_or("process before init")?;
+            let mut state = s.borrow_mut();
+            let state = state.as_mut().ok_or("process before init")?;
             let mut rows = Vec::new();
             for frame in tick.frames(state.v) {
                 let started = Instant::now();
                 let tensor = match &state.crops {
                     Some(crops) => crops_tensor(state.v, frame.index, crops, &state.options)?,
                     None => frame_tensor(state.v, frame.index, &state.options)?,
+                };
+                let Some(tensor) = state.batch(tensor)? else {
+                    continue;
                 };
                 let tensor_ms = ms(started);
                 let started = Instant::now();

@@ -32,6 +32,9 @@
 //! runs, however many frames pass through it. A tensor of several crops
 //! takes a buffer sized for the next power of two of them, so a count that
 //! moves from frame to frame reuses a few buffers.
+//!
+//! [`join`] copies tensors made apart, on several ticks, into one buffer of
+//! the pool, so a batch of them reaches a session as one input.
 
 use std::borrow::Cow;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -989,8 +992,11 @@ impl Pool {
     }
 }
 
-/// What a tensor buffer is used as: written by the pass, copied out.
-const USAGE: BufferUsages = BufferUsages::STORAGE.union(BufferUsages::COPY_SRC);
+/// What a tensor buffer is used as: written by the pass or by a copy into
+/// it, copied out.
+const USAGE: BufferUsages = BufferUsages::STORAGE
+    .union(BufferUsages::COPY_SRC)
+    .union(BufferUsages::COPY_DST);
 
 /// A pool buffer on a shared heap, which another API imports.
 #[cfg(windows)]
@@ -1048,6 +1054,8 @@ pub struct DeviceTensor {
     pub spec: TensorSpec,
     /// How many pictures the tensor holds: one a crop.
     pub count: u32,
+    /// Bytes the elements take, the start of the buffer.
+    len: u64,
     /// For a buffer on a shared heap: the sync object's value once written.
     pub written_at: Option<u64>,
 }
@@ -1060,7 +1068,7 @@ impl DeviceTensor {
 
     /// Bytes the tensor's elements take, the start of its buffer.
     pub fn byte_len(&self) -> u64 {
-        self.spec.byte_len() * u64::from(self.count)
+        self.len
     }
 
     /// The tensor's bytes read back to host memory, counted as a download.
@@ -1264,6 +1272,81 @@ pub(super) fn make(
         buffer,
         spec: *spec,
         count: crops.len() as u32,
+        len,
+        written_at,
+    })
+}
+
+/// `parts` one after another in a buffer of the pool (`shared`: on a shared
+/// heap, for another API to import), copied on the device after whatever
+/// wrote each part, with commands submitted here. A part may be named more
+/// than once. The joined tensor's spec is the first part's and its count the
+/// parts' pictures together; its dimensions are the caller's to say.
+pub fn join(parts: &[Arc<DeviceTensor>], shared: bool) -> Result<DeviceTensor> {
+    let Some(first) = parts.first() else {
+        bail!("nothing to join: the list is empty");
+    };
+    if let Some(at) = parts
+        .iter()
+        .position(|p| p.byte_len() % wgpu_types::COPY_BUFFER_ALIGNMENT != 0)
+    {
+        bail!(
+            "part {at} is {} bytes, and the device copies whole multiples of {}",
+            parts[at].byte_len(),
+            wgpu_types::COPY_BUFFER_ALIGNMENT
+        );
+    }
+    let (global, device) = (&first.global, &first.device);
+    let len: u64 = parts.iter().map(|p| p.byte_len()).sum();
+    let buffer = pool(shared).take(global, device, len, shared)?;
+    let (encoder, err) = global.device_create_command_encoder(
+        device.device,
+        &wgpu_types::CommandEncoderDescriptor { label: None },
+        None,
+    );
+    if let Some(e) = err {
+        bail!("a command encoder for a join: {e}");
+    }
+    let mut at = 0;
+    for part in parts {
+        global
+            .command_encoder_copy_buffer_to_buffer(
+                encoder,
+                part.buffer.id,
+                0,
+                buffer.id,
+                at,
+                Some(part.byte_len()),
+            )
+            .map_err(|e| anyhow!("copying a part of a join: {e}"))?;
+        at += part.byte_len();
+    }
+    let (commands, err) = global.command_encoder_finish(
+        encoder,
+        &wgpu_types::CommandBufferDescriptor { label: None },
+        None,
+    );
+    if let Some((_, e)) = err {
+        bail!("finishing a join's commands: {e}");
+    }
+    global
+        .queue_submit(*device.queue, &[commands])
+        .map_err(|(_, e)| anyhow!("submitting a join: {e}"))?;
+    #[cfg(windows)]
+    let written_at = if shared {
+        Some(super::d3d12::SharedSync::get()?.signal(global, device)?)
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let written_at = None;
+    Ok(DeviceTensor {
+        global: Arc::clone(global),
+        device: Arc::clone(device),
+        buffer,
+        spec: first.spec,
+        count: parts.iter().map(|p| p.count).sum(),
+        len,
         written_at,
     })
 }
@@ -1670,5 +1753,48 @@ mod tests {
             Pil::Bilinear,
             "the whole frame, bilinear",
         );
+    }
+
+    #[test]
+    fn tensors_made_apart_are_joined_on_the_device_in_the_order_named() {
+        let Some(device) = shared_device() else {
+            eprintln!("SKIPPED: this machine has no GPU adapter.");
+            return;
+        };
+        let (w, h) = (20u32, 14u32);
+        let frame = |seed: u32| {
+            let rgba: Vec<u8> = (0..w * h * 4).map(|i| ((i * seed) % 251) as u8).collect();
+            GpuFrame::upload("rgba", w, h, Arc::new(rgba)).unwrap()
+        };
+        let (a, b) = (frame(7), frame(13));
+        let s = spec(8, 6, Layout::Nchw, Fit::Stretch);
+        let one = a.tensor(&s, &[Rect::whole(w, h)], false).unwrap();
+        let two = b
+            .tensor(
+                &s,
+                &[
+                    Rect::whole(w, h),
+                    Rect {
+                        x: 2,
+                        y: 3,
+                        width: 9,
+                        height: 7,
+                    },
+                ],
+                false,
+            )
+            .unwrap();
+        let joined = join(&[two.clone(), one.clone(), two.clone()], false).unwrap();
+        assert_eq!(joined.count, 5, "the parts' pictures together");
+        assert_eq!(joined.byte_len(), 2 * two.byte_len() + one.byte_len());
+        let mut want = two.read_back().unwrap();
+        want.extend(one.read_back().unwrap());
+        want.extend(two.read_back().unwrap());
+        assert_eq!(joined.read_back().unwrap(), want, "byte for byte, in order");
+        let Err(err) = join(&[], false) else {
+            panic!("an empty join is refused");
+        };
+        assert!(err.to_string().contains("the list is empty"), "{err}");
+        let _ = device;
     }
 }

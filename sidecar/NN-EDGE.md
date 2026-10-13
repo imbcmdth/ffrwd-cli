@@ -435,6 +435,35 @@ never of the frame, and the profile's `download` counts the tensor's bytes.
 taken (`input downloaded, FFRWD_NN_BIND is off`), so the routes can be
 compared on one session.
 
+### Tensors of several ticks
+
+A tensor `frame-tensor` or `crops-tensor` answers is the module's until it
+drops it or hands it to `compute`, across calls of `process`. A module that
+runs a model on several frames at once, such as a video model taking eight
+frames of a shot, keeps the frames' tensors as they arrive and joins them
+when it runs the model:
+
+    stack: func(tensors: list<borrow<tensor>>, dimensions: list<u32>)
+        -> result<tensor, string>;
+
+The answer holds the tensors' elements one after another, in the order
+given, as one tensor of `dimensions`: eight `[1, 3, 224, 224]` frames as
+`[1, 8, 3, 224, 224]`, for example. A tensor may be named more than once,
+and none is consumed, so a batch of slots is a list of tensors the module
+holds. A slot is rewritten by dropping its tensor and holding a new one, and
+the host reuses the dropped tensor's buffer. An empty list, tensors of
+different element types, and `dimensions` that do not hold as many elements
+as the tensors together are refused.
+
+| tensors | joined |
+|---|---|
+| every one bound in place on CUDA, or every one on DirectML | copied together on the device into a buffer of the pool, after the passes that made them, and bound the way they were; nothing is read back |
+| any other mix | in host memory, each tensor's elements where they are, a tensor on the device read back |
+
+On the downloaded route each tensor was read back when it was made, so the
+join reads nothing more. Each tensor a module keeps holds its buffer: eight
+frames at 224x224 hold eight buffers of 602 KB.
+
 ### DirectML's route
 
 The pinned `ort` 2.0.0-rc.10 carries none of DirectML's own API, and its
@@ -507,7 +536,10 @@ every session on.
 frame through `frame-tensor` and writes each output as rows, its values when
 there are 16 or fewer, else their count, mean, least and greatest. With
 `texture=<output>:texture_width=<w>:texture_height=<h>` it binds that output
-to a texture and reads its values from there. Its graphs,
+to a texture and reads its values from there. With `stack=<n>` it keeps n
+slots, frame k's tensor in slot k mod n, and runs the model on the slots
+joined by `stack`, `[n, 3, h, w]`, or with `clip=true` `[1, n, 3, h, w]`,
+which `model/channel-means-clip.onnx` takes. Its graphs,
 `model/channel-means.onnx` (NCHW) and `channel-means-nhwc.onnx`, return
 each channel's mean and largest value; `model/make-channel-means.py`
 regenerates them. The same frames give the same rows on every route, to
