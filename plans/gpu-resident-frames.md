@@ -1812,7 +1812,9 @@ What was learned:
 
 What waits:
 
-- Segment on `frame-tensor`, behind the compiler above.
+- Segment on `frame-tensor`, behind the compiler above. Done later the
+  same day: the GPU build makes its input with `frame-tensor`, and a node's
+  rows now reach an older module's annotation column (recipe 159).
 - Linux: the pool is on Vulkan there, and nothing is imported into CUDA. It
   needs, on the L4 (the one Linux machine with an NVIDIA card to run it
   on): the device opened with `VK_KHR_external_memory_fd` and
@@ -2223,6 +2225,34 @@ across frames would each move the 720p figure more than any further
 change to how frames move. The GPU builds could also be chosen by the
 compiler instead of by a `_gpu` name, when the sidecar holds the frames
 on the device.
+
+**Fixed since (2026-10-13).** Four of the problems found above:
+
+- An input read both as rgba and as yuv420p was told one colour. `-pad`'s
+  `color` is now a list, one entry per picture of the input, so each
+  reading is told the colour it is read in.
+- Pictures a region decoded carried timestamps two frames late on an mp4
+  with B-frames, more with pre-roll, because the copying ffmpeg's NUT
+  muxer shifted the clock to keep it positive and NUT cannot carry the
+  edit list's discards. That ffmpeg now writes with `avoid_negative_ts`
+  off and a fixed offset of 1001 s, the region takes the offset back off,
+  and `decode` drops the pictures before 0, as ffmpeg's own decode does.
+  The pictures and rows now carry the times ffmpeg's decode gives.
+- Files written through the sidecar's `encode` carried no colour tags,
+  and its YUV was made in whatever matrix the converter defaulted to. The
+  compiler now names the colour each `encode` makes its pictures in (the
+  stream's own where the query says it, BT.709 limited where nothing
+  does), `encode` converts and tags in it, and the copying ffmpeg stamps
+  the file. The same query split and unsplit now writes the same matrix.
+- The host and GPU builds of one model in one query failed with "-nn
+  bound twice". A model file two builds share is bound once; different
+  files under one name are bound per module with `-nn-for`.
+
+Still open from that work: encoders feeding a packet sink that joined the
+region are not told a colour; a video stream that starts after its
+file's start keeps pre-roll pictures the edit list hides; ffv1 does not
+decode as a cut codec, and mpeg4 and mpeg2video do not open on NUT's
+time base as hosted encoders.
 
 ## 5. Risks and open questions
 
