@@ -15,6 +15,16 @@ the other writes coded packets and the ffmpeg reading that pipe copies them
 into the file. Raw frames exist only inside the region, in host memory, in
 the format the module between them reads.
 
+The copying ffmpeg writes the packets 1001 seconds ahead of its own clock
+for the input, with `-output_ts_offset 1001 -avoid_negative_ts disabled`,
+and the sidecar is told so on that input's `-pad` (`"offset": 1001`) and
+takes it off as it reads. NUT cannot carry a time below zero, and without
+the offset the muxer would move the whole input later instead: two frames
+for an mp4 with B-frames, more for one cut away from a keyframe, whose edit
+list starts on a picture before zero. `decode` drops every picture before
+zero, as ffmpeg's own decode drops what an edit list hides, so the region's
+pictures carry the times ffmpeg's decode of the input gives.
+
 libavcodec is loaded at run time, never linked. The sidecar loads
 `libavutil`, `libswresample`, `libavcodec` and `libswscale` by full path,
 in that order, from one directory, then `libavfilter` where the directory

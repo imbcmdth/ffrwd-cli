@@ -1505,3 +1505,71 @@ def test_two_builds_of_one_model_run_in_one_process(
     )
     # The fixture's first second, at 15 frames a second.
     assert int(str(_video_stream(out_path)["nb_read_frames"])) == 15
+
+
+# -- a region decoding an input's packets keeps ffmpeg's clock -----------------
+
+_INVERT = _built(_SIDECAR_MODULES, "invert")
+
+
+def _region_times(source: Path, coded: bool, out_path: Path) -> list[int]:
+    """The pts of each picture `colour_probe` reads off `invert`, the region
+    decoding the source's packets itself where `coded`, ffmpeg decoding them
+    where not."""
+    colour = "STRUCT(pix_fmt text, range text, primaries text, trc text, space text)[]"
+    clause = " SET ffrwd.edges = 'coded'" if coded else ""
+    compiled = compile_all(
+        f"CREATE FUNCTION colour_probe(v video_stream, pix_fmt text DEFAULT 'yuv420p')\n"
+        f"RETURNS {colour} AS '{_COLOUR_PROBE.as_posix()}', 'colour_probe' LANGUAGE wasm;\n"
+        "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
+        f"  AS '{_INVERT.as_posix()}', 'invert' LANGUAGE wasm{clause};\n"
+        "COPY (SELECT colour_probe(invert(f.video[1]), 'rgba')\n"
+        f"      FROM input('{source.as_posix()}') f) TO '{out_path.as_posix()}'"
+    )
+    assert compiled.plan is not None
+    (sidecar,) = compiled.plan.sidecars
+    assert sidecar.av == coded, "the region decodes exactly where the edges are coded"
+    result = execute_plan(
+        compiled.plan, sidecar_argv=wasm.sidecar_argv, overwrite=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.exit_code == 0, "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    return [int(json.loads(line)["pts"]) for line in out_path.read_text().splitlines()]
+
+
+@pytest.mark.parametrize("cut", [False, True], ids=["whole", "cut-from-a-keyframe"])
+def test_a_region_decoding_packets_hands_on_the_times_ffmpegs_decode_gives(
+    cut: bool, tmp_path: Path
+) -> None:
+    """An mp4 with B-frames, so with an edit list, decoded in the region and
+    by ffmpeg: the same pictures at the same times. Cut half a second in
+    without decoding, its edit list also hides the pictures from the
+    keyframe before the cut, and the region drops them as ffmpeg does."""
+    for module in (_COLOUR_PROBE, _INVERT):
+        if not module.exists():
+            pytest.skip(f"module missing: {module}")
+    source = tmp_path / "bframes.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10",
+            "-t", "2", "-c:v", "libx264", "-bf", "2", "-pix_fmt", "yuv420p", str(source),
+        ],
+        check=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    if cut:
+        whole, source = source, tmp_path / "cut.mp4"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-ss", "0.35", "-i", str(whole), "-c", "copy",
+             str(source)],
+            check=True,
+            timeout=_SUBPROCESS_TIMEOUT,
+        )
+    by_ffmpeg = _region_times(source, False, tmp_path / "ffmpeg.ndjson")
+    in_region = _region_times(source, True, tmp_path / "region.ndjson")
+    assert by_ffmpeg[0] == 0
+    assert in_region == by_ffmpeg

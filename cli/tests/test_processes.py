@@ -27,6 +27,7 @@ from ffrwd.ir import (
 )
 from ffrwd.probe import ProbeResult, StreamMeta
 from ffrwd.processes import (
+    CODED_CLOCK_OFFSET,
     COPY_CODEC,
     NUT,
     PCM_F32LE,
@@ -3013,8 +3014,9 @@ def test_a_coded_node_region_decodes_into_its_port_and_encodes_its_output() -> N
     assert (entry.format.codec, leaving.format.codec) == (COPY_CODEC, COPY_CODEC)
     argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)
     sidecar = argv[region.id]
-    # The decoder reads the colour off the codec itself: the pad says nothing.
-    assert _pad_of(sidecar) is None
+    # The decoder reads the colour off the codec itself: the pad says only how
+    # far ahead of the source's clock the packets cross.
+    assert _pad_of(sidecar) == {"offset": CODED_CLOCK_OFFSET}
     assert sidecar[sidecar.index("-filter_complex") + 1] == (
         "[0:v]decode=format=rgba[decode0];[v=decode0]compose[v=c0];"
         "[c0]encode=codec=h264_nvenc:b=6M[out0]"
@@ -3022,6 +3024,10 @@ def test_a_coded_node_region_decodes_into_its_port_and_encodes_its_output() -> N
     assert sidecar[sidecar.index("-map") + 1] == "[out0]"
     feeder, writer = argv[entry.source], argv[leaving.target]
     assert feeder[feeder.index("-c:0") + 1] == COPY_CODEC
+    # The muxer leaves the clock alone, a picture ahead of the source's start
+    # included: the region takes the offset off again.
+    assert feeder[feeder.index("-avoid_negative_ts") + 1] == "disabled"
+    assert feeder[feeder.index("-output_ts_offset") + 1] == str(CODED_CLOCK_OFFSET)
     assert writer[writer.index("-c:0") + 1] == COPY_CODEC and "-b:0" not in writer
 
 
@@ -3036,7 +3042,8 @@ def test_a_filtered_picture_beside_a_coded_one_stays_raw_with_its_colour() -> No
     sidecar = plan_argv(plan, sidecar_argv=wasm.shown_argv)[region.id]
     # The coded picture's colour is the decoder's to read; the raw one's is the pad's.
     assert _pad_of(sidecar) == {
-        "color": [None, {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}]
+        "color": [None, {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}],
+        "offset": CODED_CLOCK_OFFSET,
     }
     network = sidecar[sidecar.index("-filter_complex") + 1]
     assert network.startswith("[0:v]decode=format=rgba[decode0];[v=decode0][over=0:v:1]compose")

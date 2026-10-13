@@ -49,6 +49,12 @@ this size in its `video-format`, an output `like` one of them takes it, and
 each frame is checked against the header's size. A picture something reads
 the pixels of is refused.
 
+    -pad '{"offset": 1001}'
+
+says the input's clock runs that many seconds ahead of its source's, as
+the ffmpeg copying a stream's packets for `decode` writes it; every time
+the input carries is read with it taken off.
+
 ## Nodes
 
     -m <name>=<path>

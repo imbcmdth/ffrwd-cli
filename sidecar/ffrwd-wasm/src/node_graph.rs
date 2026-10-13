@@ -347,8 +347,14 @@ pub fn run_carrying(args: &Args, bindings: &[Binding], wiring: &str) -> Result<A
         let defs: Vec<StreamDef> = ids.iter().map(|id| streams[*id as usize].clone()).collect();
         let timed: Vec<bool> = ids.iter().map(|id| timing.contains(id)).collect();
         let carried = Arc::clone(&carried);
+        let offset = args
+            .pads
+            .get(index)
+            .and_then(Option::as_ref)
+            .and_then(|pad| pad.offset)
+            .unwrap_or(0);
         readers.push(thread::spawn(move || {
-            let read = pump(input, &ids, &defs, &timed, &scheduler, &carried);
+            let read = pump(input, &ids, &defs, &timed, offset, &scheduler, &carried);
             match read {
                 Ok(true) => {
                     for id in &ids {
@@ -379,29 +385,42 @@ pub fn run_carrying(args: &Args, bindings: &[Binding], wiring: &str) -> Result<A
     Ok(carried)
 }
 
+/// `seconds` in ticks of `base`, to the nearest tick.
+fn ticks_of(seconds: i64, base: TimeBase) -> i64 {
+    let (num, den) = (i128::from(base.num.max(1)), i128::from(base.den));
+    let scaled = i128::from(seconds) * den;
+    ((scaled + num / 2) / num) as i64
+}
+
 /// Every frame of one input handed to the lanes reading it. True when the
 /// input ended, false when the run stopped first. A stream `timing` marks
 /// is handed its frames' times alone: a picture with no bytes, a run of
-/// samples with none and its length in samples as its duration.
+/// samples with none and its length in samples as its duration. `offset`
+/// is the seconds the input's clock runs ahead of its source's, taken off
+/// every time it carries.
 fn pump(
     input: edges::Opened,
     ids: &[u32],
     defs: &[StreamDef],
     timing: &[bool],
+    offset: i64,
     scheduler: &Scheduler,
     carried: &Carried,
 ) -> Result<bool> {
     let read: Vec<bool> = ids.iter().map(|id| scheduler.reads(*id)).collect();
     let mut counts = vec![0u64; ids.len()];
     let mut decoded: Vec<Option<i64>> = vec![None; ids.len()];
+    let ahead: Vec<i64> = defs.iter().map(|def| ticks_of(offset, def.base)).collect();
     let mut running = true;
-    input.pump(|index, packet, payload| {
+    input.pump(|index, mut packet, payload| {
         let Some(&id) = ids.get(index) else {
             return Ok(true);
         };
         if !read[index] {
             return Ok(true);
         }
+        packet.pts -= ahead[index];
+        packet.dts = packet.dts.map(|dts| dts - ahead[index]);
         let def = &defs[index];
         let number = counts[index];
         counts[index] += 1;

@@ -462,6 +462,24 @@ CSV_OPTIONS: dict[str, SinkOptionSpec] = {
 # learns of them: ``validate_option`` still rejects these names as unknown,
 # and only ``option_spec``, which emit renders through, resolves them.
 _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
+    # The clock of an input's packets a region decodes: carried ahead of
+    # ffmpeg's by a fixed offset, which the muxer is not to shift again.
+    "avoid_negative_ts": SinkOptionSpec(
+        name="avoid_negative_ts",
+        scope="container",
+        type="str",
+        doc="Whether the muxer shifts the clock so no time is negative.",
+        flag="-avoid_negative_ts",
+        per_stream=False,
+    ),
+    "output_ts_offset": SinkOptionSpec(
+        name="output_ts_offset",
+        scope="container",
+        type="int",
+        doc="Seconds added to every time the output carries.",
+        flag="-output_ts_offset",
+        per_stream=False,
+    ),
     "fifo_format": SinkOptionSpec(
         name="fifo_format",
         scope="container",

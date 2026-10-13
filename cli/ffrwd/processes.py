@@ -216,6 +216,22 @@ PCM_S16LE = "pcm_s16le"
 # when nothing on the far side filters it, so the packets cross as they came.
 COPY_CODEC = "copy"
 
+# Seconds an input's packets cross ahead of ffmpeg's clock for that input,
+# where a region decodes them. NUT cannot carry a time below zero, and a
+# picture an edit list puts before the start (the pictures before the first
+# one shown, when a file was cut away from a keyframe) is decoded and never
+# shown; without the offset the muxer would move the whole input later
+# instead. The region takes it off again and drops what lands before zero.
+# A whole number of 1001-second spans, so it is a whole number of ticks in
+# the time bases ffmpeg gives a stream.
+CODED_CLOCK_OFFSET = 1001
+# The copying ffmpeg's output options that carry the offset: the muxer is not
+# to shift the clock again.
+_CODED_CLOCK: tuple[tuple[str, object], ...] = (
+    ("avoid_negative_ts", "disabled"),
+    ("output_ts_offset", CODED_CLOCK_OFFSET),
+)
+
 # ffprobe reports no pixel format, so the wire format is one the compiler
 # picks and the producing ffmpeg is told to write.
 DEFAULT_PIX_FMT = "yuv420p"
@@ -1343,6 +1359,10 @@ class SidecarProcess:
     # is, by its position among the input's pictures, in ``-i`` order: None
     # for a picture at its own size, and empty for an input with none.
     geometries: tuple[tuple[tuple[int, int] | None, ...], ...] = ()
+    # Seconds each ``-i``'s clock runs ahead of its source's, in ``-i``
+    # order: what the copying ffmpeg added (:data:`CODED_CLOCK_OFFSET`), 0
+    # for an input it added nothing to, and empty where none has any.
+    offsets: tuple[int, ...] = ()
     # True for a region holding a `decode` or `encode` node: the sidecar
     # loads libavcodec, and is told where it is.
     av: bool = False
@@ -1449,6 +1469,8 @@ class SidecarProcess:
                 [None if size is None else list(size) for size in one]
                 for one in self.geometries
             ]
+        if self.offsets:
+            written["offsets"] = list(self.offsets)
         if self.av:
             written["av"] = True
         if self.call_pads:
@@ -1528,6 +1550,9 @@ class SidecarProcess:
                 tuple(_read_size(size) for size in one)
                 for one in _read_list(d, "geometries")
                 if isinstance(one, list)
+            ),
+            offsets=tuple(
+                one for one in _read_list(d, "offsets") if isinstance(one, int)
             ),
             av=d.get("av") is True,
             call_pads=tuple(
@@ -4892,7 +4917,12 @@ class _Partitioner:
                 self.decodes.setdefault(sidecar.id, {})[edge.ref] = wire.pix_fmt
                 if on_the_gpu:
                     self.decoded_on_device.add(sidecar.id)
-                self.edges[index] = replace(edge, format=replace(wire, codec=COPY_CODEC))
+                self.edges[index] = replace(
+                    edge,
+                    format=replace(
+                        wire, codec=COPY_CODEC, options=(*wire.options, *_CODED_CLOCK)
+                    ),
+                )
             for index, edge in enumerate(self.edges):
                 if edge.source != sidecar.id:
                     continue
@@ -6529,6 +6559,7 @@ class _Partitioner:
             if sidecar.node_network
             else (),
             geometries=self._region_geometries(incoming, read_as, read_order),
+            offsets=self._region_offsets(incoming, alias_of, read_order),
             reads_rows=any(e.annotations for e in self.edges if e.target == sidecar.id),
             writes_rows=any(e.annotations for e in self.edges if e.source == sidecar.id),
             rows_modules=self._rows_modules(sidecar, members),
@@ -6666,6 +6697,26 @@ class _Partitioner:
         if not found:
             return ()
         return tuple(tuple(found.get(alias, ())) for alias in order)
+
+    @staticmethod
+    def _region_offsets(
+        incoming: Sequence[StreamEdge],
+        alias_of: Mapping[FrameRef, str],
+        order: Sequence[str],
+    ) -> tuple[int, ...]:
+        """The seconds each ``-i``'s clock runs ahead of its source's, in
+        ``-i`` order: the offset the ffmpeg writing it puts on its output."""
+        found: dict[str, int] = {}
+        for edge in incoming:
+            alias = alias_of.get(edge.ref)
+            if alias is None or not isinstance(edge.format, VideoFormat):
+                continue
+            offset = dict(edge.format.options).get("output_ts_offset")
+            if isinstance(offset, int):
+                found[alias] = offset
+        if not found:
+            return ()
+        return tuple(found.get(alias, 0) for alias in order)
 
     def _region_tags(
         self,

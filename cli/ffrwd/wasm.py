@@ -2039,7 +2039,8 @@ def _argv(
     each of its pictures there too, by position, null for one it says nothing
     of (:attr:`SidecarProcess.colors`), since NUT writes none, and the
     ``"geometry"`` of each picture crossing smaller than it is
-    (:attr:`SidecarProcess.geometries`).
+    (:attr:`SidecarProcess.geometries`), and the ``"offset"`` in seconds its
+    clock runs ahead of its source's (:attr:`SidecarProcess.offsets`).
 
     `writes` is the mirror on the other side: one path per rows document the
     process writes, in document order, since a process writing several of
@@ -2088,6 +2089,9 @@ def _argv(
             tags = process.tags[index] if index < len(process.tags) else ()
             if tags:
                 pad["tags"] = dict(tags)
+            offset = process.offsets[index] if index < len(process.offsets) else 0
+            if offset:
+                pad["offset"] = offset
             sizes = process.geometries[index] if index < len(process.geometries) else ()
             if sizes:
                 pad["geometry"] = [

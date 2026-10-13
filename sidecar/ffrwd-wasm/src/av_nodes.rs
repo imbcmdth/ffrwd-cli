@@ -389,7 +389,9 @@ impl Decode {
         self.format
     }
 
-    /// Every picture the decoder has ready, onto `items`.
+    /// Every picture the decoder has ready, onto `items`. A picture before
+    /// zero is one the source's edit list decodes and never shows, as
+    /// ffmpeg's own decode drops it.
     fn drain(&mut self, items: &mut Vec<Emission>) -> Result<()> {
         while let Some(received) = self
             .decoder
@@ -400,6 +402,9 @@ impl Decode {
                 Received::Host(f) => (f.pts, f.duration, (f.width, f.height)),
                 Received::Device(f) => (f.pts, f.duration, (f.width, f.height)),
             };
+            if pts < 0 {
+                continue;
+            }
             if size != (self.format.width, self.format.height) {
                 bail!(
                     "{}: the stream's header says {}x{}, and the decoder made a {}x{} picture at \

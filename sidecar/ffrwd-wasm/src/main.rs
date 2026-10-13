@@ -440,6 +440,11 @@ pub(crate) struct PadSpec {
     /// network: what the query settled for it.
     #[serde(default)]
     pub(crate) pix_fmt: Option<String>,
+    /// Seconds the input's clock runs ahead of its source's: what the ffmpeg
+    /// copying its packets added so a picture before the start could cross.
+    /// Taken off every time the input carries as it is read.
+    #[serde(default)]
+    pub(crate) offset: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -4786,6 +4791,7 @@ mod pad_spec_tests {
                 tags: Default::default(),
                 geometry: Vec::new(),
                 pix_fmt: None,
+                offset: None,
             }
         );
     }

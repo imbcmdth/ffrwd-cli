@@ -688,6 +688,110 @@ fn decode_alone_writes_the_pictures_ffmpeg_decodes_at_the_same_times() {
 }
 
 #[test]
+fn decode_keeps_the_sources_times_and_drops_what_its_edit_list_hides() {
+    let test = "decode_keeps_the_sources_times_and_drops_what_its_edit_list_hides";
+    let Some(dir) = libav_and_ffmpeg(test) else {
+        return;
+    };
+    let whole = scratch("edit_list_whole.mp4");
+    let cut = scratch("edit_list_cut.mp4");
+    let carried = scratch("edit_list_carried.nut");
+    let raw = scratch("edit_list_raw.nut");
+    let out = scratch("edit_list_out.nut");
+    let ffmpeg = |args: &[&str]| {
+        run_ok(
+            Command::new("ffmpeg")
+                .args(["-v", "error", "-y"])
+                .args(args)
+                .stdin(Stdio::null()),
+            "ffmpeg",
+        )
+    };
+    let text = |path: &Path| path.to_str().expect("UTF-8").to_string();
+    // The fixture as an mp4, then cut half a second in without decoding: the
+    // cut starts at the keyframe before, and its edit list hides the
+    // pictures up to the cut.
+    ffmpeg(&["-i", &text(&fixture()), "-c", "copy", &text(&whole)]);
+    ffmpeg(&["-ss", "0.5", "-i", &text(&whole), "-c", "copy", &text(&cut)]);
+    // Its packets as a region is handed them, ahead of ffmpeg's clock, and
+    // what ffmpeg's own decode hands over raw.
+    ffmpeg(&[
+        "-i",
+        &text(&cut),
+        "-map",
+        "0:v:0",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "disabled",
+        "-output_ts_offset",
+        "1001",
+        "-f",
+        "nut",
+        &text(&carried),
+    ]);
+    ffmpeg(&[
+        "-i",
+        &text(&cut),
+        "-map",
+        "0:v:0",
+        "-c",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "nut",
+        &text(&raw),
+    ]);
+    let output = sidecar(
+        &[
+            "-f",
+            "nut",
+            "-i",
+            &text(&carried),
+            "-pad",
+            r#"{"offset": 1001}"#,
+            "-filter_complex",
+            "[0:v]decode=format=yuv420p[out0]",
+            "-map",
+            "[out0]",
+            "-f",
+            "nut",
+            &text(&out),
+        ],
+        Some(&dir),
+    );
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let (ours, decoded) = demux(&out);
+    let (theirs, expected) = demux(&raw);
+    for path in [&whole, &cut, &carried, &raw, &out] {
+        let _ = std::fs::remove_file(path);
+    }
+    let seconds = |stream: &Stream, pts: i64| {
+        (
+            i128::from(pts) * i128::from(stream.time_base.num),
+            i128::from(stream.time_base.den),
+        )
+    };
+    let same_time = |(a, b): (i128, i128), (c, d): (i128, i128)| a * d == c * b;
+    assert!(
+        expected.len() < 50,
+        "the edit list hides some of the fixture's 50 pictures"
+    );
+    assert_eq!(decoded.len(), expected.len(), "the pictures ffmpeg shows");
+    for ((pts, data), (want, bytes)) in decoded.iter().zip(&expected) {
+        assert!(
+            same_time(seconds(&ours, *pts), seconds(&theirs, *want)),
+            "pts {pts} in {:?} is not ffmpeg's {want} in {:?}",
+            ours.time_base,
+            theirs.time_base
+        );
+        assert!(data == bytes, "the picture at pts {pts} is ffmpeg's");
+    }
+}
+
+#[test]
 fn coded_in_coded_out_through_an_old_module_is_the_inverted_picture() {
     let test = "coded_in_coded_out_through_an_old_module_is_the_inverted_picture";
     let Some(dir) = libav_and_ffmpeg(test) else {
