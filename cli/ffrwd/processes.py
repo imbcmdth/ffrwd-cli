@@ -113,7 +113,7 @@ from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Literal
 
-from .av import DECODABLE, ENCODE_OPTIONS, HOSTED_ENCODERS
+from .av import DECODABLE, ENCODE_OPTIONS, HOSTED_ENCODERS, encoded_colour
 from .errors import ErrorCode, FfrwdError
 from .ir import (
     DECODE,
@@ -4955,7 +4955,8 @@ class _Partitioner:
             wire = edge.format
             if not coded or not isinstance(wire, VideoFormat) or wire.codec != RAWVIDEO:
                 continue
-            self.encodes.setdefault(edge.source, {})[edge.ref] = dict(coded)
+            colour = self._encoded_colour(edge, str(coded["codec"]), coded, {})
+            self.encodes.setdefault(edge.source, {})[edge.ref] = {**coded, **colour}
             meta = self._origin_meta(edge.ref)
             held = encoder_delay(str(coded["codec"]), {}, meta.height if meta else None)
             self.encode_delays[edge.source] = max(self.encode_delays.get(edge.source, 0), held)
@@ -5087,12 +5088,40 @@ class _Partitioner:
             if name not in ENCODE_OPTIONS
         }
         kept["video_codec"] = COPY_CODEC
+        # The NUT between the encoder and the file carries no colour, so the
+        # copy into the file states what the encoder made its pictures in.
+        colour = self._encoded_colour(edge, codec, args, unit.options)
+        args.update(colour)
+        kept.update(colour)
         meta = self._origin_meta(edge.ref)
         held = encoder_delay(codec, unit.options, meta.height if meta is not None else None)
         process.sinks = [
             replace(one, options=kept) if one is unit else one for one in process.sinks
         ]
         return args, held
+
+    def _encoded_colour(
+        self,
+        edge: StreamEdge,
+        codec: str,
+        args: Mapping[str, object],
+        options: Mapping[str, object],
+    ) -> dict[str, str]:
+        """The colorimetry the ``encode`` node coding the picture `edge`
+        carries makes and tags its pictures in (:func:`encoded_colour`): the
+        stream's as far as the query says it, through the modules on the way,
+        each field `options` names in its place."""
+        said = stream_colorimetry(self.g, edge.ref, self._origin_meta)
+        said.update(
+            (key, value)
+            for key, value in options.items()
+            if key in COLOR_OPTIONS and isinstance(value, str)
+        )
+        wire = edge.format
+        from_rgb = isinstance(wire, VideoFormat) and wire.pix_fmt.startswith(RGB_PREFIXES)
+        coded = args.get("pix_fmt")
+        coded_rgb = isinstance(coded, str) and coded.startswith(RGB_PREFIXES)
+        return encoded_colour(codec, said, from_rgb=from_rgb, coded_rgb=coded_rgb)
 
     def _encoded_for_a_sink(self, edge: StreamEdge) -> tuple[dict[str, object], int] | None:
         """The `encode` arguments for a picture `edge` hands the ffmpeg that
@@ -5139,6 +5168,7 @@ class _Partitioner:
         self.edges[self.edges.index(out[0])] = replace(
             out[0], format=replace(wire, codec=COPY_CODEC, options=())
         )
+        args.update(self._encoded_colour(edge, codec, args, pad))
         meta = self._origin_meta(edge.ref)
         held = encoder_delay(codec, pad, meta.height if meta is not None else None)
         return args, held

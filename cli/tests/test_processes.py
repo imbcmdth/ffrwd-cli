@@ -13,6 +13,7 @@ from dataclasses import replace
 import pytest
 
 from ffrwd import processes, wasm
+from ffrwd.av import encoded_colour
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import keeps_clock, plan_argv
 from ffrwd.ir import (
@@ -2793,8 +2794,9 @@ def _coded(
 
 def test_a_coded_region_copies_its_input_in_and_its_file_out() -> None:
     """The input's own h264 picture crosses as its packets and the file's
-    hosted encoder runs in the region, its options moved onto the node; the
-    sound beside it is untouched."""
+    hosted encoder runs in the region, its options moved onto the node and
+    the colour it makes the module's rgba in, BT.709 limited where nothing
+    says, written on the file too; the sound beside it is untouched."""
     plan = _coded(_coded_graph(_NVENC))
     (region,) = plan.sidecars
     entry = next(e for e in plan.stream_edges if e.target == region.id)
@@ -2806,15 +2808,24 @@ def test_a_coded_region_copies_its_input_in_and_its_file_out() -> None:
     assert [(n.filter, n.args) for n in region.graph.nodes.values()] == [
         ("decode", {"format": "rgba"}),
         ("invert", {}),
-        ("encode", {"codec": "h264_nvenc", "b": "6M", "g": 60}),
+        (
+            "encode",
+            {
+                "codec": "h264_nvenc", "b": "6M", "g": 60,
+                "color_range": "tv", "colorspace": "bt709",
+            },
+        ),
     ]
     writer = next(p for p in plan.ffmpeg if p.graph.sinks[0].path == "out.mp4")
-    assert writer.graph.sinks[0].options == {"video_codec": COPY_CODEC, "audio_codec": "aac"}
+    assert writer.graph.sinks[0].options == {
+        "video_codec": COPY_CODEC, "audio_codec": "aac",
+        "color_range": "tv", "colorspace": "bt709",
+    }
     argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)
     network = argv[region.id][argv[region.id].index("-filter_complex") + 1]
     assert network == (
         "[0:v]decode=format=rgba[decode0];[decode0]invert[e0];"
-        "[e0]encode=codec=h264_nvenc:b=6M:g=60[out0]"
+        "[e0]encode=codec=h264_nvenc:b=6M:g=60:color_range=tv:colorspace=bt709[out0]"
     )
     assert argv[region.id][argv[region.id].index("-m") + 1] == "invert=invert"
     feeder = argv[entry.source]
@@ -3017,18 +3028,62 @@ def test_a_coded_node_region_decodes_into_its_port_and_encodes_its_output() -> N
     # The decoder reads the colour off the codec itself: the pad says only how
     # far ahead of the source's clock the packets cross.
     assert _pad_of(sidecar) == {"offset": CODED_CLOCK_OFFSET}
+    # The encoder makes its YUV in the source's colour, and is told so.
     assert sidecar[sidecar.index("-filter_complex") + 1] == (
         "[0:v]decode=format=rgba[decode0];[v=decode0]compose[v=c0];"
-        "[c0]encode=codec=h264_nvenc:b=6M[out0]"
+        "[c0]encode=codec=h264_nvenc:b=6M:color_range=tv:color_primaries=bt709:"
+        "color_trc=bt709:colorspace=bt709[out0]"
     )
     assert sidecar[sidecar.index("-map") + 1] == "[out0]"
     feeder, writer = argv[entry.source], argv[leaving.target]
+    # The copy into the file says the same, which the NUT between lost.
+    assert [
+        (writer[at], writer[at + 1]) for at, word in enumerate(writer) if word.startswith("-colo")
+    ] == [
+        ("-color_range:0", "tv"),
+        ("-color_primaries:0", "bt709"),
+        ("-color_trc:0", "bt709"),
+        ("-colorspace:0", "bt709"),
+    ]
     assert feeder[feeder.index("-c:0") + 1] == COPY_CODEC
     # The muxer leaves the clock alone, a picture ahead of the source's start
     # included: the region takes the offset off again.
     assert feeder[feeder.index("-avoid_negative_ts") + 1] == "disabled"
     assert feeder[feeder.index("-output_ts_offset") + 1] == str(CODED_CLOCK_OFFSET)
     assert writer[writer.index("-c:0") + 1] == COPY_CODEC and "-b:0" not in writer
+
+
+def test_the_colour_an_encode_node_makes_its_pictures_in() -> None:
+    """What the source says where the YUV is the source's; where the encoder
+    makes YUV of rgba, a matrix and range always, BT.709 limited where nothing
+    says, and only what its conversion can make or its codec is read in; rgba
+    coded as bgra, full range and no matrix."""
+    bt601 = {
+        "color_range": "tv", "color_primaries": "smpte170m", "color_trc": "smpte170m",
+        "colorspace": "smpte170m", "chroma_sample_location": "left",
+    }
+    told_601 = {key: value for key, value in bt601.items() if key != "chroma_sample_location"}
+    cases = {
+        ("ffv1", "bgra", "bt601"): {**told_601, "color_range": "pc", "colorspace": "gbr"},
+        ("ffv1", "yuv420p", "nothing said"): {},
+        ("ffv1", "yuv420p", "bt601"): told_601,
+        ("ffv1", "rgba", "nothing said"): {"color_range": "tv", "colorspace": "bt709"},
+        ("ffv1", "rgba", "bt601"): told_601,
+        ("h264_d3d12va", "rgba", "bt2020"): {"color_range": "tv", "colorspace": "bt709"},
+        ("mjpeg", "rgba", "bt601"): {**told_601, "color_range": "pc"},
+        ("mjpeg", "rgba", "nothing said"): {"color_range": "pc", "colorspace": "bt470bg"},
+    }
+    said = {
+        "nothing said": {},
+        "bt601": bt601,
+        "bt2020": {"color_range": "tv", "colorspace": "bt2020nc"},
+    }
+    assert {
+        case: encoded_colour(
+            case[0], said[case[2]], from_rgb=case[1] != "yuv420p", coded_rgb=case[1] == "bgra"
+        )
+        for case in cases
+    } == cases
 
 
 def test_a_filtered_picture_beside_a_coded_one_stays_raw_with_its_colour() -> None:

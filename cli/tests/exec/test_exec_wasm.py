@@ -1573,3 +1573,112 @@ def test_a_region_decoding_packets_hands_on_the_times_ffmpegs_decode_gives(
     in_region = _region_times(source, True, tmp_path / "region.ndjson")
     assert by_ffmpeg[0] == 0
     assert in_region == by_ffmpeg
+
+
+# -- the colour an encoder in the region makes reaches the file ----------------
+
+
+_BT601_TAGS = {
+    "color_range": "tv", "color_space": "smpte170m",
+    "color_primaries": "smpte170m", "color_transfer": "smpte170m",
+}
+_UNSAID_TAGS = {
+    "color_range": "unknown", "color_space": "unknown",
+    "color_primaries": "unknown", "color_transfer": "unknown",
+}
+
+
+def _tags(path: Path) -> dict[str, str]:
+    """What ffprobe says of the first video stream's colour."""
+    done = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=color_range,color_space,color_primaries,color_transfer",
+            "-of", "json", str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+        check=True,
+    )
+    stream: dict[str, str] = json.loads(done.stdout)["streams"][0]
+    # A field the file leaves unsaid is left out of ffprobe's JSON.
+    return {key: stream.get(key, "unknown") for key in _UNSAID_TAGS}
+
+
+def _rgb24(path: Path, negate: bool = False) -> bytes:
+    """Every picture of `path` as rgb24, read in the colour its tags say."""
+    done = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", str(path),
+            *(["-vf", "negate"] if negate else []),
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ],
+        capture_output=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+        check=True,
+    )
+    return done.stdout
+
+
+@pytest.mark.parametrize(
+    ("tagged", "codec", "suffix", "expected"),
+    [
+        (True, "ffv1", "mkv", _BT601_TAGS),
+        (False, "ffv1", "mkv", {**_UNSAID_TAGS, "color_range": "tv", "color_space": "bt709"}),
+        (True, "mjpeg", "mp4", {**_BT601_TAGS, "color_range": "pc"}),
+        (False, "mjpeg", "mp4", {**_UNSAID_TAGS, "color_range": "pc", "color_space": "bt470bg"}),
+    ],
+    ids=["bt601-mkv", "unsaid-mkv", "bt601-mp4", "unsaid-mp4"],
+)
+def test_a_file_an_encoder_in_the_region_writes_says_the_colour_it_was_made_in(
+    tagged: bool, codec: str, suffix: str, expected: dict[str, str], tmp_path: Path
+) -> None:
+    """`invert` between the region's own decode and encode: the file carries
+    the source's colour where the source says it, and BT.709 limited (BT.601
+    full for a JPEG) where it says nothing, and read in those tags it is the
+    source's inverted picture."""
+    if not _INVERT.exists():
+        pytest.skip(f"module missing: {_INVERT}")
+    source = tmp_path / "source.mp4"
+    tags = (
+        ["-vf", "setparams=color_primaries=smpte170m:color_trc=smpte170m:"
+         "colorspace=smpte170m:range=tv"]
+        if tagged
+        else []
+    )
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10",
+            "-t", "1", *tags, "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+        ],
+        check=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    out_path = tmp_path / f"inverted.{suffix}"
+    compiled = compile_all(
+        "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
+        f"  AS '{_INVERT.as_posix()}', 'invert' LANGUAGE wasm SET ffrwd.edges = 'coded';\n"
+        f"COPY (SELECT invert(f.video[1]) FROM input('{source.as_posix()}') f)\n"
+        f"TO '{out_path.as_posix()}' WITH (video_codec '{codec}')"
+    )
+    assert compiled.plan is not None
+    (sidecar,) = compiled.plan.sidecars
+    assert sidecar.av, "the region encodes"
+    result = execute_plan(
+        compiled.plan, sidecar_argv=wasm.sidecar_argv, overwrite=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.exit_code == 0, "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    assert _tags(out_path) == expected
+    if codec == "ffv1":
+        # Read in its tags, the picture is the source's inverted one, as far as
+        # a second trip through YUV keeps it: about 2.3 levels a byte apart
+        # here, and about 8 read in the other matrix.
+        ours, theirs = _rgb24(out_path), _rgb24(source, negate=True)
+        assert len(ours) == len(theirs)
+        assert sum(abs(a - b) for a, b in zip(ours, theirs, strict=True)) / len(ours) < 4

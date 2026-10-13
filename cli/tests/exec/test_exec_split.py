@@ -447,3 +447,33 @@ def test_a_runner_killed_mid_run_stops_every_node_and_is_named(tmp_path: Path) -
     assert result.failure.lost and result.failure.node == victim
     assert result.failure.id == plan.sidecars[0].id
     assert all(runner.poll() is not None for runner in runners.values())
+
+
+def test_a_query_split_at_its_modules_writes_the_colour_its_run_on_one_node_writes(
+    tmp_path: Path,
+) -> None:
+    """Two coded `invert`s into ffv1, run on one node and cut between the
+    modules with mjpeg crossing: each file says the colour its encoder made
+    its pictures in, BT.709 limited for a source that says nothing, and the
+    two say the same."""
+    _require(_CASES["wasm region"])
+    coded = _INVERT.replace("LANGUAGE wasm;", "LANGUAGE wasm SET ffrwd.edges = 'coded';")
+    said: dict[str, dict[str, str]] = {}
+    for how, target in (
+        ("one", []),
+        ("per-module", ["--target", "split-local", "--placement", "per-module",
+                        "--cut-codec", "mjpeg"]),
+    ):  # fmt: skip
+        out = tmp_path / f"{how}.mkv"
+        sql = (
+            coded + f"COPY (SELECT invert(invert(f.video[1])) FROM input('{_AV.as_posix()}') f) "
+            f"TO '{out.as_posix()}' WITH (video_codec 'ffv1')"
+        )
+        assert cli.main(["run", sql, "-y", "-q", *target]) == 0
+        done = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=color_range,color_space", "-of", "json", str(out)],
+            capture_output=True, text=True, timeout=_TIMEOUT, check=True,
+        )  # fmt: skip
+        said[how] = json.loads(done.stdout)["streams"][0]
+    assert said["one"] == said["per-module"] == {"color_range": "tv", "color_space": "bt709"}

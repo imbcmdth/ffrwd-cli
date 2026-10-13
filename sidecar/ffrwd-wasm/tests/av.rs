@@ -792,6 +792,72 @@ fn decode_keeps_the_sources_times_and_drops_what_its_edit_list_hides() {
 }
 
 #[test]
+fn encode_makes_its_yuv_in_the_colour_it_is_told() {
+    let test = "encode_makes_its_yuv_in_the_colour_it_is_told";
+    let Some(dir) = libav_and_ffmpeg(test) else {
+        return;
+    };
+    let red = scratch("told_red.nut");
+    run_ok(
+        Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("color=c=red:s=64x48:r=10:d=0.3")
+            .args(["-c:v", "rawvideo", "-pix_fmt", "rgba", "-f", "nut"])
+            .arg(&red)
+            .stdin(Stdio::null()),
+        "ffmpeg",
+    );
+    let mut lumas = Vec::new();
+    for space in ["bt709", "bt470bg"] {
+        // What ffmpeg's own conversion makes of red in that matrix.
+        let luma = run_ok(
+            Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&red)
+                .args(["-vf"])
+                .arg(format!("scale=out_color_matrix={space}:out_range=tv"))
+                .args([
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-",
+                ])
+                .stdin(Stdio::null()),
+            "ffmpeg",
+        )
+        .stdout[0];
+        lumas.push(luma);
+        let out = scratch(&format!("told_{space}.nut"));
+        let chain = format!("[0:v]encode=codec=ffv1:colorspace={space}:color_range=tv[out0]");
+        let output = sidecar(
+            &[
+                "-f",
+                "nut",
+                "-i",
+                red.to_str().expect("UTF-8"),
+                "-filter_complex",
+                &chain,
+                "-map",
+                "[out0]",
+                "-f",
+                "nut",
+                out.to_str().expect("UTF-8"),
+            ],
+            Some(&dir),
+        );
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        let made = ffmpeg_rawvideo(&out);
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(made.first(), Some(&luma), "red's luma in {space}");
+    }
+    assert_ne!(lumas[0], lumas[1], "the two matrices make red apart");
+    let _ = std::fs::remove_file(&red);
+}
+
+#[test]
 fn coded_in_coded_out_through_an_old_module_is_the_inverted_picture() {
     let test = "coded_in_coded_out_through_an_old_module_is_the_inverted_picture";
     let Some(dir) = libav_and_ffmpeg(test) else {

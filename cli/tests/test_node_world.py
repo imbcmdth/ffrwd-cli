@@ -2469,7 +2469,10 @@ def test_a_cut_parts_a_region_into_two_sidecars_wired_to_each_other(
         ["decode", "box", "encode"], ["decode", "box", "encode"]
     )
     assert first.graph is not None and second.graph is not None
-    assert list(first.graph.nodes.values())[-1].args == {"codec": "h264_nvenc", "b": "6M"}
+    # The cut's encoder is told the colour it makes the rgba in.
+    assert list(first.graph.nodes.values())[-1].args == {
+        "codec": "h264_nvenc", "b": "6M", "color_range": "tv", "colorspace": "bt709"
+    }
     assert list(second.graph.nodes.values())[0].args == {"format": "rgba", "hw": "auto"}
     assert _between(plan) == [(first.id, second.id, "copy")]
     assert len(plan.ffmpeg) == 2  # the demuxer and the muxer, nothing between
@@ -2596,7 +2599,7 @@ def test_a_packet_filter_reading_a_picture_held_on_the_gpu_takes_the_regions_pac
     )
     (box,) = [words for words in argv.values() if any("box=" in w for w in words)]
     assert box[box.index("-filter_complex") + 1].endswith(
-        "[n1]encode=codec=h264_nvenc:b=6M[out0]"
+        "[n1]encode=codec=h264_nvenc:b=6M:color_range=tv:colorspace=bt709[out0]"
     )
     encoders = [words for pid, words in argv.items() if pid.startswith("ffmpeg")]
     assert len(encoders) == 2

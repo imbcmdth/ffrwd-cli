@@ -30,6 +30,7 @@ __all__ = [
     "HARDWARE_ENCODER_SUFFIXES",
     "HOSTED_ENCODERS",
     "RUNTIME_DIR_VAR",
+    "encoded_colour",
     "sessions",
     "sidecar_filters",
     "spawn_args",
@@ -81,6 +82,45 @@ ENCODE_OPTIONS: Mapping[str, str] = {
     "sc_threshold": "sc_threshold",
     "pix_fmt": "pix_fmt",
 }
+
+# The colorimetry the ``encode`` node is told, by ffmpeg's option names: the
+# colour it makes its pictures in and tags them with.
+ENCODE_COLOUR: tuple[str, ...] = ("color_range", "color_primaries", "color_trc", "colorspace")
+# What an encoder makes YUV of rgba in where nothing says: BT.709, limited.
+_RGB_TO_YUV: Mapping[str, str] = {"color_range": "tv", "colorspace": "bt709"}
+# The matrices an encoder reading D3D12 pictures makes of rgba on the device.
+_D3D12_MATRICES = frozenset({"bt709", "bt470bg", "smpte170m"})
+# BT.601's matrix, by both of its names.
+_BT601 = frozenset({"bt470bg", "smpte170m"})
+# Encoders that code full range, whatever range they are handed.
+_FULL_RANGE_ENCODERS = frozenset({"mjpeg"})
+# Encoders whose pictures are read in BT.601's matrix whatever a file says: a
+# JPEG's YUV is BT.601's, so rgba is made into it in that one.
+_BT601_ENCODERS = frozenset({"mjpeg"})
+
+
+def encoded_colour(
+    codec: str, said: Mapping[str, str], *, from_rgb: bool, coded_rgb: bool = False
+) -> dict[str, str]:
+    """The colorimetry the ``encode`` node running `codec` makes and tags its
+    pictures in, by ffmpeg's option names: what `said` says of the stream,
+    and, where the encoder makes the YUV of rgba itself (`from_rgb`), a
+    matrix and range always, BT.709 limited where nothing says and only one
+    the conversion can make or the codec is read in. Pictures it codes in RGB
+    (`coded_rgb`) are full range with no matrix."""
+    made = {key: said[key] for key in ENCODE_COLOUR if key in said}
+    if coded_rgb:
+        made.update(color_range="pc", colorspace="gbr")
+    elif from_rgb:
+        made = {**_RGB_TO_YUV, **made}
+        if codec.endswith("_d3d12va") and made["colorspace"] not in _D3D12_MATRICES:
+            made["colorspace"] = _RGB_TO_YUV["colorspace"]
+        if codec in _BT601_ENCODERS and made["colorspace"] not in _BT601:
+            made["colorspace"] = "bt470bg"
+    if codec in _FULL_RANGE_ENCODERS:
+        made["color_range"] = "pc"
+    return {key: made[key] for key in ENCODE_COLOUR if key in made}
+
 
 # The encoder names that run on a hardware encode session.
 HARDWARE_ENCODER_SUFFIXES = ("_nvenc", "_qsv", "_vaapi", "_amf", "_d3d12va")

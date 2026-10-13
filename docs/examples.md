@@ -569,8 +569,9 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
   '{"offset": 1001}' -m \
   invert=../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -filter_complex \
   '[0:v]decode=format=rgba[decode0];[decode0]invert[n1];'\
-'[n1]encode=codec=h264_nvenc:b=6M[out0]' -map '[out0]' -f nut pipe:1 | ffmpeg -f nut \
-  -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 copy inverted.mp4
+'[n1]encode=codec=h264_nvenc:b=6M:color_range=tv:colorspace=bt709[out0]' -map '[out0]' \
+  -f nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 copy -color_range:0 tv -colorspace:0 bt709 inverted.mp4
 ```
 
 `decode` and `encode` are the host's own nodes, like `leaky`: no module file stands behind them. The entry takes the copy only when the module reads a source's own stream, unfiltered, in a codec the sidecar's libavcodec decodes (h264, hevc, av1, vp9, mpeg2video, prores, mjpeg, ffv1, mpeg4); a filtered picture arrives raw, as before. The exit takes the copy only when the destination names an encoder the sidecar hosts (the `_nvenc`, `_amf`, `_mf`, `_videotoolbox`, `_vaapi` and `_d3d12va` families, and the software ffv1, mpeg4, mpeg2video and mjpeg), and the encoder's options move into the node under the names ffmpeg's command line uses (`b` for `video_bitrate`, `g` for `gop`). Name `libx264` instead and the entry is still copied while the exit stays raw, since that encoder is not in the LGPL build the sidecar carries. Raw frames exist only inside the region, so the raw pipes, and ffmpeg's rawvideo packing on both sides, are gone from the path. `sidecar/AV-EDGE.md` says where the libraries come from and what the sidecar refuses.
@@ -1575,10 +1576,11 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
   -m gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm \
   -filter_complex \
   '[0:v]decode=format=rgba:hw=auto[decode0];'\
-'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];[n1]encode=codec=h264_nvenc:b=6M[out0]' \
-  -bound 'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' \
-  -f nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
-  -c:0 copy boxed.mp4
+'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
+'[n1]encode=codec=h264_nvenc:b=6M:color_range=tv:colorspace=bt709[out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
+  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
+  copy -color_range:0 tv -colorspace:0 bt709 boxed.mp4
 ```
 
 With `memory => 'host'` the same module holds nothing on the GPU, and its region takes raw frames on both pipes unless the declaration says `SET ffrwd.edges = 'coded'`. The region's `decode` is told `hw=auto`: where the machine's decoder and the device share one (D3D12 on Windows) the decoder's frames land on the device directly; elsewhere the decoded picture reaches it through the sidecar's own upload at the module's input and comes back through one download at the output, which the `upload` and `download` rows of `--profile` count.
@@ -1707,7 +1709,7 @@ COPY (
 $ ffrwd compile -f query.sql -v programme=tests/fixtures/testsrc.mp4 -v left=tests/fixtures/smptebars.mp4 -v right=tests/fixtures/av.mp4 -v dest=composed.mp4
 # named pipes: sidecar0 reads ffmpeg1, ffmpeg2, ffmpeg3
 1. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
-  copy composed.mp4
+  copy -color_range:0 tv -colorspace:0 bt709 composed.mp4
 2. ffmpeg: ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts \
   disabled -output_ts_offset 1001 -f nut '<named pipe ffmpeg1-sidecar0 src:p:v:0 write>'
 3. ffmpeg: ffmpeg -i tests/fixtures/smptebars.mp4 -map 0:v:0 -c:0 copy \
@@ -1734,8 +1736,8 @@ $ ffrwd compile -f query.sql -v programme=tests/fixtures/testsrc.mp4 -v left=tes
 '[v=n1]depth_gpu=memory=gpu[out=n2];'\
 '[v=n1][inputs=n2]compose=html=<style>body{margin\\:0}img{position\\:absolute}</style><img\ src\\="ffrwd\\:0"\ style\\="width\\:100%\;'\
 'height\\:100%"><img\ src\\="ffrwd\\:1"\ style\\="right\\:4%\;bottom\\:4%\;'\
-'width\\:30%">:lead=0:renderer=gpu[video=n3];[n3]encode=codec=h264_d3d12va:b=40M[out0]' \
-  -bound \
+'width\\:30%">:lead=0:renderer=gpu[video=n3];'\
+'[n3]encode=codec=h264_d3d12va:b=40M:color_range=tv:colorspace=bt709[out0]' -bound \
   'compose=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"inputs",'\
 '"streams":[{"rate":{"num":15,"den":1}},{"rate":{"num":15,"den":1}}]}]' -bound \
   'depth_gpu=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \

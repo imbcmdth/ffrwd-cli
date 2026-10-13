@@ -25,6 +25,16 @@ list starts on a picture before zero. `decode` drops every picture before
 zero, as ffmpeg's own decode drops what an edit list hides, so the region's
 pictures carry the times ffmpeg's decode of the input gives.
 
+`encode` takes `color_range`, `color_primaries`, `color_trc` and
+`colorspace`, by ffmpeg's names, as the colour it makes its pictures in and
+tags them with: an rgba input is made YUV in that matrix and range. The
+compiler names the stream's colour as far as the query says it, and where
+the encoder makes YUV of rgba a matrix and range always (BT.709 limited
+where nothing says; BT.601 full for mjpeg; a matrix the device's conversion
+has for a `_d3d12va` encoder). The ffmpeg copying the packets into a file
+writes the same with `-color_range`, `-color_primaries`, `-color_trc` and
+`-colorspace`, since NUT carries none of it.
+
 libavcodec is loaded at run time, never linked. The sidecar loads
 `libavutil`, `libswresample`, `libavcodec` and `libswscale` by full path,
 in that order, from one directory, then `libavfilter` where the directory

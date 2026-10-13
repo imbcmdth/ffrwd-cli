@@ -35,7 +35,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
 use ffrwd_wasm_runtime::av::{self, Decoder, Encoder, Hw, Received, WIRE_PIX_FMTS};
 use ffrwd_wasm_runtime::node::{
@@ -580,6 +580,35 @@ const FROM_THE_DEVICE: &str = "from the device";
 const UPLOADED: &str = "uploaded from host memory";
 const READ_BACK: &str = "read back from the GPU and uploaded";
 
+/// The options `encode` reads as the colour its pictures are made and
+/// tagged in, by ffmpeg's names, rather than handing them to the encoder.
+const COLOR_OPTIONS: [&str; 4] = ["color_range", "color_primaries", "color_trc", "colorspace"];
+
+/// `color` with each field `told` names in its place: the colour the
+/// compiler settled for the pictures an encoder makes, where it settled one.
+fn told_color(color: Option<ColorInfo>, told: &[(&str, &str)]) -> Result<Option<ColorInfo>> {
+    if told.is_empty() {
+        return Ok(color);
+    }
+    let mut made = color.unwrap_or(ColorInfo {
+        range: "unknown",
+        primaries: "unknown",
+        trc: "unknown",
+        space: "unknown",
+    });
+    for &(key, value) in told {
+        let name = crate::codec::parse_color_name(&format!("-{key}"), value)
+            .with_context(|| format!("{ENCODE} is told the colour it makes"))?;
+        match key {
+            "color_range" => made.range = name,
+            "color_primaries" => made.primaries = name,
+            "color_trc" => made.trc = name,
+            _ => made.space = name,
+        }
+    }
+    Ok(Some(made))
+}
+
 /// The colour an encoder that reads NV12 writes an rgba input in: the
 /// stream's matrix and range where the conversion has them (`bt709`, or
 /// BT.601's, which the wire calls `bt470bg`), else BT.709 limited range.
@@ -644,12 +673,15 @@ impl Encode {
     ) -> Result<Encode> {
         let mut codec: Option<&str> = None;
         let mut handed: Vec<(String, String)> = Vec::with_capacity(options.len());
+        let mut told: Vec<(&str, &str)> = Vec::new();
         for (key, value) in options {
             if key == CODEC {
                 if codec.is_some() {
                     bail!("{ENCODE} is given the option '{CODEC}' twice");
                 }
                 codec = Some(value);
+            } else if COLOR_OPTIONS.contains(&key.as_str()) {
+                told.push((key, value));
             } else {
                 handed.push((key.clone(), value.clone()));
             }
@@ -665,6 +697,10 @@ impl Encode {
                 "{ENCODE} reads raw pictures, and {spelling} is {}",
                 carried(input)
             );
+        };
+        let video = &VideoFormat {
+            color: told_color(video.color, &told)?,
+            ..*video
         };
         // An encoder that reads NV12 has an rgba input converted to it, in
         // the colour the stream's header then declares.
