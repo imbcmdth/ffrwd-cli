@@ -2254,6 +2254,42 @@ file's start keeps pre-roll pictures the edit list hides; ffv1 does not
 decode as a cut codec, and mpeg4 and mpeg2video do not open on NUT's
 time base as hosted encoders.
 
+## Shots and clips on the GPU
+
+**What changed (2026-10-13).** `ffrwd/describe`'s `clips` (X-CLIP's video
+tower) and `ffrwd/shots`' `simple_detector`, which gives `clips` its
+cuts, have GPU builds, `clips_gpu` and `simple_detector_gpu`, on branches
+named `gpu` in their repositories. The detector scores each frame's 32x32
+grid in one compute pass and reads back 4 KB. `clips` keeps each
+reservoir pick as a `crops-tensor` of the frame's centre square, and
+`ffrwd:gpu/nn` gains `stack`, which joins tensors a module has held across
+ticks into one input, here the eight picks as `[1, 8, 3, 224, 224]`. On
+CUDA or DirectML the join is a copy on the device. Recipe 164.
+
+A host-memory module reading a picture the region holds on the GPU
+downloads a frame only when it fetches it, but both host builds fetch
+every frame, so in a GPU region they download every frame.
+
+**Measured,** a five-shot clip at 30 fps, sustained:
+
+| chain | 1080p | 4K |
+|---|---|---|
+| host builds, ffmpeg decoding | 153 fps | 46 fps |
+| GPU detector, host `clips` | 150 fps | 55 fps |
+| host detector, `clips_gpu` | 470 fps | 143 fps |
+| both GPU builds | 959 fps | 265 fps |
+
+With both GPU builds no picture byte reaches the host, and the chain runs
+at the device decoder's own rate. The detector's rows are byte for byte
+the host build's. The shots' spans are identical and `find` ranks shots
+the same; the shot vectors agree with the host build's at a cosine of
+0.994 to 0.9999. The difference is the host build's own 8-bit rounding
+after its resize and its nearest-neighbour chroma; the host build fed
+rgba instead of yuv420p differs from itself by as much.
+
+Still open: a host-memory module reading frames a region decodes is told
+the colour is unknown, so it converts BT.709 as BT.601.
+
 ## 5. Risks and open questions
 
 - **wgpu's dispatch traits are not semver-stable.** The unreleased
