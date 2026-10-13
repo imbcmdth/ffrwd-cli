@@ -1,0 +1,9 @@
+package ffrwd:testcodec;
+
+/// The test codec's GPU build: ffrwd:av's encoder and decoder, which
+/// describe and open it, and ffrwd:gpu's, which take and hand back the
+/// pictures as textures.
+world codec-gpu {
+  include ffrwd:av/codec-module@0.19.1;
+  include ffrwd:gpu/codec-module@0.1.0;
+}

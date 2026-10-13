@@ -51,6 +51,7 @@ members = [
     "data-echo",
     "data-stamp",
     "testcodec",
+    "testcodec-gpu",
     "source-files",
     "fauxlate",
     "embed-notes",

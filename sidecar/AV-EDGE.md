@@ -45,6 +45,13 @@ has for a `_d3d12va` encoder). The ffmpeg copying the packets into a file
 writes the same with `-color_range`, `-color_primaries`, `-color_trc` and
 `-colorspace`, since NUT carries none of it.
 
+A codec package's encoder or decoder (`NODE-CLI.md`) runs beside these
+nodes in a region. A build of one on `ffrwd:gpu` is handed the planes of the
+pictures `decode` leaves on the device, and hands its own pictures back as
+textures, so a region that decodes with `decode` and codes with such a
+module, or decodes with it and encodes with `encode`, holds no picture in
+host memory.
+
 libavcodec is loaded at run time, never linked. The sidecar loads
 `libavutil`, `libswresample`, `libavcodec` and `libswscale` by full path,
 in that order, from one directory, then `libavfilter` where the directory

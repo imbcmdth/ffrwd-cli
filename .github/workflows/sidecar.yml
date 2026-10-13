@@ -56,7 +56,8 @@ jobs:
 
       # The GPU frame path on mesa's lavapipe, a Vulkan driver that runs on
       # the CPU. The device, the frame pool, the planes a module reads and
-      # the texture it hands back go through wgpu's real code; speed, the
+      # the texture it hands back go through wgpu's real code, and so do a
+      # codec module's planes handed over and back as textures; speed, the
       # hardware decoder and encoder, and any vendor's driver do not. With
       # FFRWD_GPU_REQUIRED set, a run that finds no adapter fails rather
       # than skips.
@@ -67,7 +68,7 @@ jobs:
         env:
           FFRWD_GPU_REQUIRED: "1"
           WGPU_BACKEND: vulkan
-        run: cargo test -p ffrwd-wasm --test gpu_frames -- --nocapture
+        run: cargo test -p ffrwd-wasm --test gpu_frames --test gpu_codec -- --nocapture
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5

@@ -7,6 +7,12 @@ edition = "2021"
 name = "testcodec"
 crate-type = ["cdylib"]
 
+[features]
+# The GPU build: ffrwd:gpu's encoder and decoder beside ffrwd:av's, the
+# pictures crossing as textures. The `testcodec-gpu` crate builds this source
+# with it on, as testcodec_gpu.wasm.
+gpu = []
+
 [dependencies]
 wit-bindgen = "0.57.1"
 serde_json = "1.0.151"

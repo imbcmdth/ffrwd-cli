@@ -3,11 +3,14 @@
 //! cut as that run cuts them. Which half runs is what its pad carries: raw
 //! frames are encoded, coded packets decoded.
 //!
-//! The module reads and writes bytes, so a picture held on the GPU is read
-//! back once on its way into the encoder, made the format the encoder reads
-//! on the device first where it is held in another; a decoded picture is
-//! handed on in host memory, and a reader holding its frames on the GPU
-//! uploads it.
+//! A module of `ffrwd:av` alone reads and writes bytes, so a picture held on
+//! the GPU is read back once on its way into the encoder, made the format the
+//! encoder reads on the device first where it is held in another; a decoded
+//! picture is handed on in host memory, and a reader holding its frames on
+//! the GPU uploads it. A module that also exports `ffrwd:gpu`'s `encoder` or
+//! `decoder` is handed the planes as textures instead, and hands its decoded
+//! planes back the same way, wherever the pictures are held on the GPU on
+//! that side: nothing crosses host memory but the packets.
 
 use std::sync::Arc;
 
@@ -37,13 +40,86 @@ pub struct EncoderNode {
     /// which is what a decoder reads it back in.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     convert: Option<(&'static str, av_nodes::Yuv)>,
+    /// Where the frames arrive held on the GPU and the module reads
+    /// textures: the format and colour it reads them in, and the picture
+    /// not yet handed over.
+    #[cfg(feature = "gpu")]
+    textures: Option<Textures>,
+}
+
+/// Pictures on their way into an encoder that reads textures, made the
+/// format it reads on the device, each handed over once its duration is
+/// known: at once where the stream's rate settles it, else when the next
+/// one arrives.
+#[cfg(feature = "gpu")]
+struct Textures {
+    /// The format the frames arrive in, which one in host memory is put on
+    /// the device as.
+    arriving: &'static str,
+    target: ffrwd_wasm_runtime::gpu::frames::Target,
+    rate_ticks: Option<i64>,
+    held: Option<(i64, Arc<ffrwd_wasm_runtime::gpu::frames::GpuFrame>)>,
+}
+
+#[cfg(feature = "gpu")]
+impl Textures {
+    /// A frame off the wire, made the format the encoder reads, and the
+    /// pictures it completes. A frame in host memory is put on the device
+    /// first.
+    fn push(
+        &mut self,
+        pts: i64,
+        data: &FrameData,
+        out: &mut Vec<runtime::GpuPicture>,
+    ) -> Result<()> {
+        use ffrwd_wasm_runtime::gpu::frames::GpuFrame;
+        let frame = match data {
+            FrameData::Gpu(frame) => Arc::clone(frame),
+            FrameData::Host(bytes) => GpuFrame::upload(
+                self.arriving,
+                self.target.width,
+                self.target.height,
+                Arc::clone(bytes),
+            )?,
+        };
+        let frame = frame.converted(self.target)?;
+        if let Some(ticks) = self.rate_ticks {
+            out.push(runtime::GpuPicture {
+                pts,
+                duration: Some(ticks),
+                frame,
+            });
+            return Ok(());
+        }
+        if let Some((held_pts, held)) = self.held.take() {
+            out.push(runtime::GpuPicture {
+                pts: held_pts,
+                duration: Some(pts - held_pts).filter(|d| *d > 0),
+                frame: held,
+            });
+        }
+        self.held = Some((pts, frame));
+        Ok(())
+    }
+
+    /// The last picture, lasting what the rate says.
+    fn finish(&mut self, out: &mut Vec<runtime::GpuPicture>) {
+        if let Some((pts, frame)) = self.held.take() {
+            out.push(runtime::GpuPicture {
+                pts,
+                duration: self.rate_ticks,
+                frame,
+            });
+        }
+    }
 }
 
 impl EncoderNode {
     /// Opens the encoder of `path` on the frames `raw` describes, in `base`
     /// at `frame_rate`, under `header`. `pix_fmt` is the format the query
     /// settled for its pictures, and `on_gpu` says they arrive held on the
-    /// GPU, where they are made that format.
+    /// GPU, where they are made that format, and handed over as textures
+    /// where the module reads them so.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         path: &str,
@@ -117,6 +193,17 @@ impl EncoderNode {
             color.as_ref(),
         )?;
         let framer = Framer::new(format, frame_rate, described.frame_samples);
+        #[cfg(feature = "gpu")]
+        let textures = match format.media {
+            Media::Video(video) if on_gpu && encoder.on_gpu() => {
+                let arriving = match raw {
+                    StreamFormat::Video(arriving) => arriving.pix_fmt,
+                    _ => video.pix_fmt,
+                };
+                Some(textures_for(&name, arriving, &video, frame_rate, base)?)
+            }
+            _ => None,
+        };
         Ok(EncoderNode {
             shape: av_nodes::shape(kind, PortKind::Packets, coded.time_base, 0.0),
             name,
@@ -125,6 +212,8 @@ impl EncoderNode {
             header,
             framer,
             convert,
+            #[cfg(feature = "gpu")]
+            textures,
         })
     }
 
@@ -179,6 +268,10 @@ impl Node for EncoderNode {
     }
 
     fn process(&mut self, tick: Tick) -> Result<Emitted> {
+        #[cfg(feature = "gpu")]
+        if self.textures.is_some() {
+            return self.process_textures(tick);
+        }
         let mut frames: Vec<RawFrame> = Vec::new();
         for stream in &tick.streams {
             for frame in &stream.frames {
@@ -197,17 +290,84 @@ impl Node for EncoderNode {
         if tick.last {
             packets.extend(self.encoder.encode(&[], true)?);
         }
-        Ok(Emitted {
-            items: packets
-                .into_iter()
-                .map(|packet| Emission {
-                    port: 0,
-                    payload: Payload::Packet(packet),
-                })
-                .collect(),
-            rows: Vec::new(),
-            finished: false,
-        })
+        Ok(emitted(packets))
+    }
+}
+
+/// How an encoder reading textures is handed `video`, whose frames arrive
+/// in `arriving`: made its format on the device, in the colour its stream
+/// says, each picture lasting what the stream's rate settles where it does.
+#[cfg(feature = "gpu")]
+fn textures_for(
+    name: &str,
+    arriving: &'static str,
+    video: &runtime::VideoFormat,
+    frame_rate: Option<(u64, u64)>,
+    base: TimeBase,
+) -> Result<Textures> {
+    use ffrwd_wasm_runtime::gpu::frames::{Layout, Target};
+    let layout = Layout::of(video.pix_fmt)
+        .filter(|l| l.wire() == *l)
+        .ok_or_else(|| {
+            anyhow!(
+                "{name} reads {}, which the device holds no frame in",
+                video.pix_fmt
+            )
+        })?;
+    Ok(Textures {
+        arriving,
+        target: Target::new(
+            layout,
+            video.width,
+            video.height,
+            av_nodes::yuv_of(video.color.as_ref()),
+        ),
+        rate_ticks: frame_ticks(frame_rate, base),
+        held: None,
+    })
+}
+
+#[cfg(feature = "gpu")]
+impl EncoderNode {
+    /// `process` for an encoder reading textures: each picture made the
+    /// format it reads on the device and handed over as its planes.
+    fn process_textures(&mut self, tick: Tick) -> Result<Emitted> {
+        let textures = self.textures.as_mut().expect("an encoder reading textures");
+        let mut pictures = Vec::new();
+        for stream in &tick.streams {
+            for frame in &stream.frames {
+                textures
+                    .push(frame.pts, &frame.data, &mut pictures)
+                    .with_context(|| format!("{}: the picture at pts {}", self.name, frame.pts))?;
+            }
+        }
+        if tick.last {
+            textures.finish(&mut pictures);
+        }
+        let mut packets = if pictures.is_empty() {
+            Vec::new()
+        } else {
+            self.encoder.encode_gpu(&pictures, false)?
+        };
+        if tick.last {
+            packets.extend(self.encoder.encode_gpu(&[], true)?);
+        }
+        Ok(emitted(packets))
+    }
+}
+
+/// An encoder's packets, on its one output.
+fn emitted(packets: Vec<Packet>) -> Emitted {
+    Emitted {
+        items: packets
+            .into_iter()
+            .map(|packet| Emission {
+                port: 0,
+                payload: Payload::Packet(packet),
+            })
+            .collect(),
+        rows: Vec::new(),
+        finished: false,
     }
 }
 
@@ -228,13 +388,18 @@ pub struct DecoderNode {
     /// YUV is read in, where its reader holds them there in another.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     convert: Option<(&'static str, av_nodes::Yuv)>,
+    /// Where its reader holds the pictures on the GPU and the module writes
+    /// textures: the colour their YUV is read in.
+    #[cfg(feature = "gpu")]
+    textures: Option<av_nodes::Yuv>,
 }
 
 impl DecoderNode {
     /// Opens the decoder of `path` on the coded stream `coded` carries under
     /// its NUT `header`, with `color` standing over what that says. `pix_fmt`
     /// is the format its reader holds the pictures in on the GPU, where they
-    /// are made it after they are decoded.
+    /// are made it after they are decoded: left there by a module that
+    /// writes textures, else put there.
     pub fn open(
         path: &str,
         params: &str,
@@ -261,6 +426,13 @@ impl DecoderNode {
         };
         let decoded = decoder.init(&stream, &info, params)?;
         let (mut header, format) = raw_header(&name, &decoded, coded, coded_color.as_ref())?;
+        #[cfg(feature = "gpu")]
+        let textures = match format.media {
+            Media::Video(video) if pix_fmt.is_some() && decoder.on_gpu() => {
+                Some(av_nodes::yuv_of(video.color.as_ref()))
+            }
+            _ => None,
+        };
         let mut convert = None;
         let handed = match format.media {
             Media::Video(mut video) => {
@@ -285,6 +457,8 @@ impl DecoderNode {
             written: 0,
             handed,
             convert,
+            #[cfg(feature = "gpu")]
+            textures,
         })
     }
 
@@ -337,6 +511,7 @@ impl Node for DecoderNode {
     }
 
     fn process(&mut self, tick: Tick) -> Result<Emitted> {
+        let last = tick.last;
         let packets: Vec<Packet> = tick
             .streams
             .into_iter()
@@ -346,12 +521,16 @@ impl Node for DecoderNode {
                 ..packet
             })
             .collect();
+        #[cfg(feature = "gpu")]
+        if let Some(yuv) = self.textures {
+            return self.process_textures(packets, last, yuv);
+        }
         let mut frames = if packets.is_empty() {
             Vec::new()
         } else {
             self.decoder.decode(&packets, false)?
         };
-        if tick.last {
+        if last {
             frames.extend(self.decoder.decode(&[], true)?);
         }
         let mut items = Vec::with_capacity(frames.len());
@@ -365,6 +544,59 @@ impl Node for DecoderNode {
                     pts: frame.pts,
                     duration: frame.duration,
                     data: self.handed(frame.data)?,
+                    rows: Vec::new(),
+                }),
+            });
+        }
+        Ok(Emitted {
+            items,
+            rows: Vec::new(),
+            finished: false,
+        })
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl DecoderNode {
+    /// `process` for a decoder writing textures: each picture left on the
+    /// device, made its reader's format there where that is another, its
+    /// YUV read in `yuv`.
+    fn process_textures(
+        &mut self,
+        packets: Vec<Packet>,
+        last: bool,
+        yuv: av_nodes::Yuv,
+    ) -> Result<Emitted> {
+        use ffrwd_wasm_runtime::gpu::frames::{Layout, Target};
+        let mut pictures = if packets.is_empty() {
+            Vec::new()
+        } else {
+            self.decoder.decode_gpu(&packets, false, yuv)?
+        };
+        if last {
+            pictures.extend(self.decoder.decode_gpu(&[], true, yuv)?);
+        }
+        let mut items = Vec::with_capacity(pictures.len());
+        for picture in pictures {
+            let frame = match (self.convert, &self.handed) {
+                (Some((to, yuv)), StreamFormat::Video(video)) => {
+                    let layout = Layout::of(to).expect("a wire format the device holds");
+                    picture
+                        .frame
+                        .converted(Target::new(layout, video.width, video.height, yuv))
+                        .with_context(|| {
+                            format!("{}: making a picture {to} on the device", self.name)
+                        })?
+                }
+                _ => picture.frame,
+            };
+            self.written += 1;
+            items.push(Emission {
+                port: 0,
+                payload: Payload::Frame(OutFrame {
+                    pts: picture.pts,
+                    duration: picture.duration,
+                    data: FrameData::Gpu(frame),
                     rows: Vec::new(),
                 }),
             });

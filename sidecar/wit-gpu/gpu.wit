@@ -16,6 +16,11 @@
 // tensor (or crops of a frame, batched into one tensor) without the module
 // fetching its bytes, tensors made on several ticks joined into one, and a
 // model's output held as a texture without the module reading it back.
+//
+// A codec package's module may export `encoder` and `decoder` beside
+// `ffrwd:av`'s interfaces of those names, which still describe it and open
+// it: a host whose pictures are on its device then calls these in their
+// place, and hands the planes over as textures each way.
 
 package ffrwd:gpu@0.1.0;
 
@@ -235,6 +240,62 @@ interface nn {
   output-texture: func(context: borrow<graph-execution-context>, options: output-texture-options) -> result<gpu-texture, string>;
 }
 
+/// The pictures and packets a codec's halves exchange with a host whose
+/// pictures are on the GPU.
+interface codec-types {
+  use wasi:webgpu/webgpu@0.0.1.{gpu-texture};
+
+  /// A picture on the device, at `pts` for `duration` in the stream's time
+  /// base, as `ffrwd:av`'s `raw-frame` would carry it: one texture per plane
+  /// in the wire's plane order, three `r8unorm` textures for a planar YUV
+  /// format, the chroma planes at their own size.
+  record picture {
+    pts: s64,
+    duration: option<s64>,
+    planes: list<gpu-texture>,
+  }
+
+  /// One coded packet, as `ffrwd:av`'s `packet`.
+  record packet {
+    pts: s64,
+    dts: option<s64>,
+    duration: option<s64>,
+    keyframe: bool,
+    data: list<u8>,
+  }
+}
+
+/// A codec package's encoder reading its pictures on the GPU. The module
+/// exports `ffrwd:av/encoder` too: `describe` and `init` are that
+/// interface's, and once `init` has opened it, a host whose pictures are on
+/// its device calls `encode` here in place of that interface's.
+interface encoder {
+  use codec-types.{picture, packet};
+
+  /// `ffrwd:av/encoder.encode` with the pictures as textures, in the format
+  /// `init` was given. The textures are the host's: valid for this call,
+  /// read-only to the module (`texture-binding` and `copy-src`), and
+  /// dropping a handle drops nothing. A picture the module reads after the
+  /// call returns must be copied on the device first.
+  encode: func(pictures: list<picture>, last: bool) -> result<list<packet>, string>;
+}
+
+/// A codec package's decoder writing its pictures on the GPU. The module
+/// exports `ffrwd:av/decoder` too: `describe` and `init` are that
+/// interface's, and once `init` has opened it, a host holding the pictures
+/// on its device calls `decode` here in place of that interface's.
+interface decoder {
+  use codec-types.{picture, packet};
+
+  /// `ffrwd:av/decoder.decode` with the pictures as textures, in the format
+  /// `init` answered. Each texture is one the module made on its device,
+  /// two-dimensional with one level and one sample, the plane's size and
+  /// format, and `texture-binding` and `copy-src` at least; the host takes
+  /// it, and the module's handle is spent. The work that writes the planes
+  /// is submitted before the call returns.
+  decode: func(packets: list<packet>, last: bool) -> result<list<picture>, string>;
+}
+
 /// What a module includes beside `ffrwd:av/node-module`.
 world gpu-module {
   import wasi:webgpu/webgpu@0.0.1;
@@ -249,4 +310,24 @@ world gpu-module {
 world gpu-nn-module {
   include gpu-module;
   import nn;
+}
+
+/// A codec package's module on the GPU: what it exports beside
+/// `ffrwd:av/codec-module`, which describes and opens it.
+world codec-module {
+  import wasi:webgpu/webgpu@0.0.1;
+  export encoder;
+  export decoder;
+}
+
+/// `codec-module` for a module that only encodes.
+world encoder-module {
+  import wasi:webgpu/webgpu@0.0.1;
+  export encoder;
+}
+
+/// `codec-module` for a module that only decodes.
+world decoder-module {
+  import wasi:webgpu/webgpu@0.0.1;
+  export decoder;
 }

@@ -194,7 +194,13 @@ as when it rides alone:
   where it names none, as libswscale reads it), which is what a decoder
   of the stream reads it back in; one in host memory is refused. The decoder's pictures leave in host
   memory, or, where `-pads` names a format, are put on the GPU and made
-  that format there. Each is one instance, called in order.
+  that format there. A module that also exports `ffrwd:gpu`'s `encoder`
+  and `decoder` (`wit-gpu/gpu.wit`) is handed a picture held on the GPU
+  as its planes, textures of the sidecar's device, made the format it
+  reads there first, and nothing is read back; where `-pads` names a
+  format, its decoder hands its pictures back as textures, made that
+  format on the device, and nothing is uploaded. Each is one instance,
+  called in order.
 
     -pads <name>=<json>
 

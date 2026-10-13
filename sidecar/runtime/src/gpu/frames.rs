@@ -275,6 +275,32 @@ impl GpuFrame {
         )))
     }
 
+    /// Takes over the planes of a `pix_fmt` picture a module made on the
+    /// process's device, one texture each in the wire's order, whose YUV is
+    /// read in `yuv`. The caller has checked each against the format's
+    /// layout and removed the module's handles; the frame now owns the
+    /// textures and drops them.
+    pub fn adopt_planes(
+        pix_fmt: &str,
+        width: u32,
+        height: u32,
+        yuv: Yuv,
+        planes: Vec<Plane>,
+    ) -> Result<Arc<GpuFrame>> {
+        let held = Layout::of(pix_fmt)
+            .filter(|l| l.wire() == *l)
+            .ok_or_else(|| anyhow!("{pix_fmt} is not a format frames are held on the GPU in"))?;
+        let (global, device) = device()?;
+        Ok(Arc::new(GpuFrame::made(
+            global,
+            device,
+            held,
+            (width, height),
+            yuv,
+            planes,
+        )))
+    }
+
     /// The backend of the device the frame is on.
     pub fn backend(&self) -> wgpu_types::Backend {
         self.device.info.backend

@@ -494,6 +494,23 @@ mod world_0191 {
     }
 }
 
+#[cfg(feature = "gpu")]
+mod gpu_codec;
+#[cfg(feature = "gpu")]
+use gpu_codec::GpuHalves;
+#[cfg(feature = "gpu")]
+pub use gpu_codec::GpuPicture;
+
+/// A build without the `gpu` feature binds no `ffrwd:gpu` codec.
+#[cfg(not(feature = "gpu"))]
+#[derive(Default)]
+struct GpuHalves;
+
+/// The exports carrying a codec package's encoder reading textures, and its
+/// decoder writing them.
+pub const GPU_ENCODER_EXPORT: &str = "ffrwd:gpu/encoder@0.1.0";
+pub const GPU_DECODER_EXPORT: &str = "ffrwd:gpu/decoder@0.1.0";
+
 mod node_world;
 pub use node_world::{
     describe_node, exports_node, node_shape, output_format, FormatOf, WitNode, NODE_WORLD,
@@ -6571,6 +6588,17 @@ pub fn exports_decoder(module_path: &str) -> Result<bool> {
     Ok(world_exporting(&component, "decoder").is_some())
 }
 
+/// Whether the component at `module_path` exports `ffrwd:gpu`'s encoder and
+/// decoder: which of its codec's halves take and hand back their pictures
+/// as textures.
+pub fn exports_textures(module_path: &str) -> Result<(bool, bool)> {
+    let component = compile(module_path)?;
+    Ok((
+        has_export(&component, GPU_ENCODER_EXPORT),
+        has_export(&component, GPU_DECODER_EXPORT),
+    ))
+}
+
 /// A codec's tag as a container writes it: exactly four printable ASCII
 /// characters. `who` names the module and the half declaring it.
 fn check_fourcc(tag: &str, who: &str) -> Result<()> {
@@ -6787,7 +6815,10 @@ impl CodecInstance {
 /// carrying both. Linked like every other module, so a codec importing
 /// `wasi:webgpu` is refused a run without its `-gpu` grant and handed the
 /// GPU with one.
-fn instantiate_codec(module_path: &str, purpose: Purpose) -> Result<(Store<Host>, CodecInstance)> {
+fn instantiate_codec(
+    module_path: &str,
+    purpose: Purpose,
+) -> Result<(Store<Host>, CodecInstance, GpuHalves)> {
     let component = compile(module_path)?;
     let current = has_export(&component, &interface("encoder", "0.19.1"))
         || has_export(&component, &interface("decoder", "0.19.1"));
@@ -6829,53 +6860,88 @@ fn instantiate_codec(module_path: &str, purpose: Purpose) -> Result<(Store<Host>
             gpu_outputs: Default::default(),
         },
     );
-    let context = || format!("instantiating {module_path}");
+    let bound = linker
+        .instantiate(&mut store, &component)
+        .map_err(wasm_err)
+        .with_context(|| format!("instantiating {module_path}"))?;
+    let context = || format!("binding the codec world of {module_path}");
     let instance = match (current, encoder, decoder) {
         (true, true, true) => CodecInstance::Both0191(
-            world_0191::codec::CodecModule::instantiate(&mut store, &component, &linker)
+            world_0191::codec::CodecModule::new(&mut store, &bound)
                 .map_err(wasm_err)
                 .with_context(context)?,
         ),
         (true, true, false) => CodecInstance::Encoder0191(
-            world_0191::encoder::EncoderModule::instantiate(&mut store, &component, &linker)
+            world_0191::encoder::EncoderModule::new(&mut store, &bound)
                 .map_err(wasm_err)
                 .with_context(context)?,
         ),
         (true, false, _) => CodecInstance::Decoder0191(
-            world_0191::decoder::DecoderModule::instantiate(&mut store, &component, &linker)
+            world_0191::decoder::DecoderModule::new(&mut store, &bound)
                 .map_err(wasm_err)
                 .with_context(context)?,
         ),
         (false, true, true) => CodecInstance::Both(
-            world_0180::codec::CodecModule::instantiate(&mut store, &component, &linker)
+            world_0180::codec::CodecModule::new(&mut store, &bound)
                 .map_err(wasm_err)
                 .with_context(context)?,
         ),
         (false, true, false) => CodecInstance::Encoder(
-            world_0180::encoder::EncoderModule::instantiate(&mut store, &component, &linker)
+            world_0180::encoder::EncoderModule::new(&mut store, &bound)
                 .map_err(wasm_err)
                 .with_context(context)?,
         ),
         _ => CodecInstance::Decoder(
-            world_0180::decoder::DecoderModule::instantiate(&mut store, &component, &linker)
+            world_0180::decoder::DecoderModule::new(&mut store, &bound)
                 .map_err(wasm_err)
                 .with_context(context)?,
         ),
     };
-    Ok((store, instance))
+    let gpu = gpu_halves(&mut store, &component, &bound)
+        .with_context(|| format!("binding the ffrwd:gpu codec of {module_path}"))?;
+    Ok((store, instance, gpu))
+}
+
+/// The halves of `ffrwd:gpu`'s codec the component exports, bound to its
+/// instance.
+#[cfg(feature = "gpu")]
+fn gpu_halves(
+    store: &mut Store<Host>,
+    component: &Component,
+    instance: &wasmtime::component::Instance,
+) -> Result<GpuHalves> {
+    GpuHalves::bind(
+        store,
+        instance,
+        (
+            has_export(component, GPU_ENCODER_EXPORT),
+            has_export(component, GPU_DECODER_EXPORT),
+        ),
+    )
+}
+
+/// A build without the `gpu` feature holds no picture on a GPU, so it binds
+/// no `ffrwd:gpu` codec: such a module runs on `ffrwd:av`'s halves.
+#[cfg(not(feature = "gpu"))]
+fn gpu_halves(
+    _store: &mut Store<Host>,
+    _component: &Component,
+    _instance: &wasmtime::component::Instance,
+) -> Result<GpuHalves> {
+    Ok(GpuHalves)
 }
 
 /// Compiles and instantiates the component at `module_path` far enough to
 /// call its encoder's `describe()`, checked, without opening it.
 pub fn describe_encoder(module_path: &str) -> Result<DescribedEncoder> {
-    let (mut store, instance) = instantiate_codec(module_path, Purpose::Describe)?;
+    let (mut store, instance, _) = instantiate_codec(module_path, Purpose::Describe)?;
     instance.describe_encoder(&mut store, module_path)
 }
 
 /// Compiles and instantiates the component at `module_path` far enough to
 /// call its decoder's `describe()`, checked, without opening it.
 pub fn describe_decoder(module_path: &str) -> Result<DescribedDecoder> {
-    let (mut store, instance) = instantiate_codec(module_path, Purpose::Describe)?;
+    let (mut store, instance, _) = instantiate_codec(module_path, Purpose::Describe)?;
     instance.describe_decoder(&mut store, module_path)
 }
 
@@ -6885,6 +6951,9 @@ pub fn describe_decoder(module_path: &str) -> Result<DescribedDecoder> {
 pub struct Encoder {
     store: Store<Host>,
     instance: CodecInstance,
+    /// `ffrwd:gpu/encoder`, where the module exports it.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    gpu: GpuHalves,
     described: DescribedEncoder,
     /// The stream `init` answered; None until it has been called.
     stream: Option<CodedStream>,
@@ -6901,11 +6970,12 @@ impl Encoder {
     /// is not yet called: a host settles the input's format from what this
     /// publishes first.
     pub fn load(module_path: &str) -> Result<Encoder> {
-        let (mut store, instance) = instantiate_codec(module_path, Purpose::Run)?;
+        let (mut store, instance, gpu) = instantiate_codec(module_path, Purpose::Run)?;
         let described = instance.describe_encoder(&mut store, module_path)?;
         Ok(Encoder {
             store,
             instance,
+            gpu,
             described,
             stream: None,
             last_dts: None,
@@ -6980,14 +7050,7 @@ impl Encoder {
     /// still held leaves on it. Answers the packets that left, in decode
     /// order: a dts, where one is given, never steps back.
     pub fn encode(&mut self, frames: &[RawFrame], last: bool) -> Result<Vec<Packet>> {
-        let name = self.described.meta.name.clone();
-        if self.stream.is_none() {
-            bail!("{name}: encode called before init");
-        }
-        if self.finished {
-            bail!("{name}: called again after the final call, which happens once");
-        }
-        self.finished = last;
+        let name = self.begin(last)?;
         let store = &mut self.store;
         let packets = on_encoder!(&self.instance, |g, w, _c| (|| -> Result<Vec<Packet>> {
             let carried: Vec<_> = frames
@@ -7014,22 +7077,60 @@ impl Encoder {
                 .collect())
         })())
         .expect("loaded for its encoder")?;
-        let mut left = Vec::with_capacity(packets.len());
-        for p in packets {
+        self.in_decode_order(&name, packets)
+    }
+
+    /// Whether the module reads pictures held on the GPU as textures
+    /// (`ffrwd:gpu/encoder`).
+    pub fn on_gpu(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        return self.gpu.encoder.is_some();
+        #[cfg(not(feature = "gpu"))]
+        false
+    }
+
+    /// `encode` with the pictures held on the GPU, handed over as their
+    /// planes, in the format `init` was given: nothing is read back.
+    #[cfg(feature = "gpu")]
+    pub fn encode_gpu(&mut self, pictures: &[GpuPicture], last: bool) -> Result<Vec<Packet>> {
+        let name = self.begin(last)?;
+        let Some(module) = &self.gpu.encoder else {
+            bail!("{name} reads no picture held on the GPU: it exports no {GPU_ENCODER_EXPORT}");
+        };
+        let packets = gpu_codec::encode(&mut self.store, module, &name, pictures, last)?;
+        self.in_decode_order(&name, packets)
+    }
+
+    /// The checks before a call: opened, and not past the final call, which
+    /// `last` marks. Answers the module's name.
+    fn begin(&mut self, last: bool) -> Result<String> {
+        let name = self.described.meta.name.clone();
+        if self.stream.is_none() {
+            bail!("{name}: encode called before init");
+        }
+        if self.finished {
+            bail!("{name}: called again after the final call, which happens once");
+        }
+        self.finished = last;
+        Ok(name)
+    }
+
+    /// `packets` as they left, checked: a dts, where one is given, never
+    /// steps back.
+    fn in_decode_order(&mut self, name: &str, packets: Vec<Packet>) -> Result<Vec<Packet>> {
+        for p in &packets {
             if let Some(dts) = p.dts {
                 if let Some(before) = self.last_dts {
                     if dts < before {
                         bail!(
-                            "{name}: wrote a packet at dts {dts} after one at {before}; packets \
-                             leave in decode order, so a dts never steps back"
+                            "{name}: wrote a packet at dts {dts} after one at {before}; packets                              leave in decode order, so a dts never steps back"
                         );
                     }
                 }
                 self.last_dts = Some(dts);
             }
-            left.push(p);
         }
-        Ok(left)
+        Ok(packets)
     }
 }
 
@@ -7038,6 +7139,9 @@ impl Encoder {
 pub struct Decoder {
     store: Store<Host>,
     instance: CodecInstance,
+    /// `ffrwd:gpu/decoder`, where the module exports it.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    gpu: GpuHalves,
     described: DescribedDecoder,
     /// The frames `init` answered; None until it has been called.
     format: Option<DecodedFormat>,
@@ -7053,11 +7157,12 @@ impl Decoder {
     /// at `module_path` and reads its decoder's description, checked. `init`
     /// is not yet called.
     pub fn load(module_path: &str) -> Result<Decoder> {
-        let (mut store, instance) = instantiate_codec(module_path, Purpose::Run)?;
+        let (mut store, instance, gpu) = instantiate_codec(module_path, Purpose::Run)?;
         let described = instance.describe_decoder(&mut store, module_path)?;
         Ok(Decoder {
             store,
             instance,
+            gpu,
             described,
             format: None,
             last_pts: None,
@@ -7165,14 +7270,7 @@ impl Decoder {
     /// held leaves on it. Answers the frames that left, in presentation
     /// order: a pts never steps back.
     pub fn decode(&mut self, packets: &[Packet], last: bool) -> Result<Vec<RawFrame>> {
-        let name = self.described.meta.name.clone();
-        if self.format.is_none() {
-            bail!("{name}: decode called before init");
-        }
-        if self.finished {
-            bail!("{name}: called again after the final call, which happens once");
-        }
-        self.finished = last;
+        let name = self.begin(last)?;
         let store = &mut self.store;
         let frames = on_decoder!(&self.instance, |g, w, _c| (|| -> Result<Vec<RawFrame>> {
             let carried: Vec<_> = packets
@@ -7199,21 +7297,84 @@ impl Decoder {
                 .collect())
         })())
         .expect("loaded for its decoder")?;
-        let mut left = Vec::with_capacity(frames.len());
-        for f in frames {
-            if let Some(before) = self.last_pts {
-                if f.pts < before {
-                    bail!(
-                        "{name}: wrote a frame at pts {} after one at {before}; frames leave in \
-                         presentation order",
-                        f.pts
-                    );
-                }
-            }
-            self.last_pts = Some(f.pts);
-            left.push(f);
+        for f in &frames {
+            self.in_presentation_order(&name, f.pts)?;
         }
-        Ok(left)
+        Ok(frames)
+    }
+
+    /// Whether the module writes its pictures on the GPU as textures
+    /// (`ffrwd:gpu/decoder`).
+    pub fn on_gpu(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        return self.gpu.decoder.is_some();
+        #[cfg(not(feature = "gpu"))]
+        false
+    }
+
+    /// `decode` with the pictures left on the GPU, each taken over as a
+    /// frame of the video format `init` answered whose YUV is read in
+    /// `yuv`: nothing is read back.
+    #[cfg(feature = "gpu")]
+    pub fn decode_gpu(
+        &mut self,
+        packets: &[Packet],
+        last: bool,
+        yuv: crate::gpu::frames::Yuv,
+    ) -> Result<Vec<GpuPicture>> {
+        let name = self.begin(last)?;
+        let Some(DecodedFormat::Video {
+            width,
+            height,
+            pix_fmt,
+            ..
+        }) = self.format.clone()
+        else {
+            bail!("{name} decodes no video, so no picture is held on the GPU");
+        };
+        let Some(module) = &self.gpu.decoder else {
+            bail!("{name} writes no picture on the GPU: it exports no {GPU_DECODER_EXPORT}");
+        };
+        let pictures = gpu_codec::decode(
+            &mut self.store,
+            module,
+            &name,
+            packets,
+            last,
+            (&pix_fmt, width, height),
+            yuv,
+        )?;
+        for picture in &pictures {
+            self.in_presentation_order(&name, picture.pts)?;
+        }
+        Ok(pictures)
+    }
+
+    /// The checks before a call: opened, and not past the final call, which
+    /// `last` marks. Answers the module's name.
+    fn begin(&mut self, last: bool) -> Result<String> {
+        let name = self.described.meta.name.clone();
+        if self.format.is_none() {
+            bail!("{name}: decode called before init");
+        }
+        if self.finished {
+            bail!("{name}: called again after the final call, which happens once");
+        }
+        self.finished = last;
+        Ok(name)
+    }
+
+    /// A frame leaving at `pts`, checked: a pts never steps back.
+    fn in_presentation_order(&mut self, name: &str, pts: i64) -> Result<()> {
+        if let Some(before) = self.last_pts {
+            if pts < before {
+                bail!(
+                    "{name}: wrote a frame at pts {pts} after one at {before}; frames leave in                      presentation order"
+                );
+            }
+        }
+        self.last_pts = Some(pts);
+        Ok(())
     }
 }
 

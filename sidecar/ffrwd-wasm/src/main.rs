@@ -3506,6 +3506,10 @@ struct EncoderDescription {
     params_schema: serde_json::Value,
     pixel_formats: Vec<String>,
     sample_formats: Vec<String>,
+    /// Whether it also takes its pictures as textures where they are held
+    /// on the GPU (`ffrwd:gpu/encoder`). Present only when it does.
+    #[serde(skip_serializing_if = "is_false")]
+    textures: bool,
 }
 
 /// A codec package's decoder, as its `describe()` published it, checked.
@@ -3516,6 +3520,11 @@ struct DecoderDescription {
     params_schema: serde_json::Value,
     pixel_formats: Vec<String>,
     sample_formats: Vec<String>,
+    /// Whether it also hands its pictures back as textures where its reader
+    /// holds them on the GPU (`ffrwd:gpu/decoder`). Present only when it
+    /// does.
+    #[serde(skip_serializing_if = "is_false")]
+    textures: bool,
 }
 
 /// One feeder argument, as a window module's `describe()` declared it.
@@ -3579,6 +3588,12 @@ fn describe_module(module_path: &str) -> Result<String> {
     let has_decoder = ffrwd_wasm_runtime::runtime::exports_decoder(module_path)
         .with_context(|| format!("describing {module_path}"))?;
     let has_codec = has_encoder || has_decoder;
+    let (encodes_textures, decodes_textures) = if has_codec {
+        ffrwd_wasm_runtime::runtime::exports_textures(module_path)
+            .with_context(|| format!("describing {module_path}"))?
+    } else {
+        (false, false)
+    };
     let has_node = ffrwd_wasm_runtime::runtime::exports_node(module_path)
         .with_context(|| format!("describing {module_path}"))?;
 
@@ -3941,6 +3956,7 @@ fn describe_module(module_path: &str) -> Result<String> {
             params_schema,
             pixel_formats: meta.pixel_formats,
             sample_formats: meta.sample_formats,
+            textures: decodes_textures,
         });
     }
 
@@ -3963,6 +3979,7 @@ fn describe_module(module_path: &str) -> Result<String> {
             params_schema,
             pixel_formats: meta.pixel_formats,
             sample_formats: meta.sample_formats,
+            textures: encodes_textures,
         });
     }
 

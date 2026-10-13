@@ -1,0 +1,19 @@
+[package]
+name = "testcodec-gpu"
+version = "0.1.0"
+edition = "2021"
+
+# testcodec's own source with the `gpu` feature on: the build whose pictures
+# cross as textures, as testcodec_gpu.wasm beside testcodec.wasm.
+[lib]
+name = "testcodec_gpu"
+path = "../testcodec/src/lib.rs"
+crate-type = ["cdylib"]
+
+[features]
+default = ["gpu"]
+gpu = []
+
+[dependencies]
+wit-bindgen = "0.57.1"
+serde_json = "1.0.151"

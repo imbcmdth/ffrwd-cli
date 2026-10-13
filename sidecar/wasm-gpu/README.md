@@ -54,6 +54,15 @@ batched tensor, and passes that tensor to `compute`; `ffrwd:gpu/nn.stack`
 joins tensors kept from several ticks into one. `sidecar/NN-EDGE.md`, "Inputs from the
 pool", has the routes; `sidecar/modules/nn-frames` is such a module.
 
+A codec package's module, beside `ffrwd:av/codec-module`, includes
+`codec-module` (or `encoder-module` or `decoder-module` for one half) and
+exports `ffrwd:gpu/encoder` and `ffrwd:gpu/decoder`: where the sidecar
+holds the pictures on the GPU, `encode` is handed each picture's planes as
+textures and `decode` hands its pictures back as textures it made, in
+place of `ffrwd:av`'s `encode` and `decode`, which still serve elsewhere.
+`ffrwd:av`'s `describe` and `init` open it as for host memory.
+`sidecar/modules/testcodec`, built as `testcodec_gpu`, is such a module.
+
 This package carries `wit/gpu.wit` and, under `wit/deps/`, the same
 `wasi:webgpu`, `wasi:graphics-context` and `wasi:io` copies `ffrwd/wasm`
 carries, and `wasi:nn`, whose tensor `nn` hands out. The tree's one

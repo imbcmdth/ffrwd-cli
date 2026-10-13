@@ -14,11 +14,29 @@
 //! The extradata is the tag, a version byte and the pixel format's byte, so
 //! a decoder opened on the stream writes the format that was coded. A header
 //! without the format's byte decodes as yuv420p.
+//!
+//! Built with the `gpu` feature (testcodec_gpu.wasm), it also exports
+//! ffrwd:gpu's encoder and decoder, the same codec with the pictures crossing
+//! as textures (see `gpu.rs`).
 
+#[cfg(not(feature = "gpu"))]
 wit_bindgen::generate!({
     path: "../../wit",
     world: "codec-module",
 });
+
+// `generate_all`: the world's interfaces come from ffrwd:av, ffrwd:gpu and
+// wasi:webgpu. The paths are the `testcodec` crate's, so the
+// `testcodec-gpu` crate reaching this file finds them too.
+#[cfg(feature = "gpu")]
+wit_bindgen::generate!({
+    path: ["../../wit", "../../wit-gpu", "../testcodec/wit-gpu"],
+    world: "ffrwd:testcodec/codec-gpu",
+    generate_all,
+});
+
+#[cfg(feature = "gpu")]
+mod gpu;
 
 use std::cell::RefCell;
 
