@@ -30,6 +30,7 @@ from ffrwd.probe import ProbeResult, is_url
 from ffrwd.project import (
     LinkEntry,
     RegistryEntry,
+    discover,
     links_path,
     read_manifest,
     write_linksfile,
@@ -1338,6 +1339,65 @@ def test_a_pin_in_a_linked_packages_own_lockfile_travels_with_it(
     document = json.loads(lock)
     assert document["packages"][0]["dependencies"] == {"broadcast/helper": "2.1.0"}
     assert "c" * 64 not in lock
+
+
+def _tools_pinning_helper(project: Path, *, also_linked: Path | None) -> Path:
+    """A project linking broadcast/tools, whose own lockfile pins helper 2.1.0.
+
+    `also_linked` is a second directory the project links as well.
+    """
+    tools = _linked_package(project / "tools")
+    write_lockfile(
+        tools / "ffrwd.lock",
+        [_registry_entry(*HELPER, "b" * 64)],
+        dependencies={"broadcast/helper": "2.1.0"},
+    )
+    links = [LinkEntry(path="tools")]
+    if also_linked is not None:
+        links.append(LinkEntry(path=str(also_linked)))
+    write_lockfile(project / "ffrwd.lock", [])
+    write_linksfile(links_path(project / "ffrwd.lock"), links)
+    return tools
+
+
+def test_a_name_the_project_links_is_what_a_linked_package_depends_on_in_the_job(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The project links tools and a newer helper. tools' own lockfile pins
+    helper 2.1.0, but the job's lock binds tools to the linked helper and
+    uploads it, the way the local compile resolves the call."""
+    monkeypatch.chdir(tmp_path)
+    helper = _linked_package(tmp_path / "helper", name="broadcast/helper", version="2.2.0")
+    tools = _tools_pinning_helper(tmp_path, also_linked=helper)
+    tools_archive, tools_digest = _packed(tools)
+    helper_archive, helper_digest = _packed(helper)
+    _submit_accepted(served, packages=(tools_digest, helper_digest))
+
+    remote.submit_run(_query(STREAM_QUERY), discover(tmp_path), _run_args(), resolved={TOOLS})
+
+    lock = _submitted_lock(served)
+    assert _pinned(lock) == [TOOLS, ("broadcast/helper", "2.2.0")]
+    document = json.loads(lock or "")
+    assert document["packages"][0]["dependencies"] == {"broadcast/helper": "2.2.0"}
+    assert "b" * 64 not in (lock or "")
+    assert _uploaded(served) == {helper_digest: helper_archive, tools_digest: tools_archive}
+
+
+def test_a_name_only_a_linked_package_pins_stays_pinned_in_the_job(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The project links tools alone: tools' own pin on helper 2.1.0 travels."""
+    monkeypatch.chdir(tmp_path)
+    tools = _tools_pinning_helper(tmp_path, also_linked=None)
+    _archive, digest = _packed(tools)
+    _submit_accepted(served, packages=(digest,))
+
+    remote.submit_run(_query(STREAM_QUERY), discover(tmp_path), _run_args(), resolved={TOOLS})
+
+    lock = _submitted_lock(served)
+    assert _pinned(lock) == [TOOLS, HELPER]
+    assert json.loads(lock or "")["packages"][0]["dependencies"] == {"broadcast/helper": "2.1.0"}
+    assert _submitted_packages(served) == [digest]
 
 
 def test_a_link_cycle_is_refused_naming_the_loop(

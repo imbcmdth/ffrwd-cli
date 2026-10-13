@@ -1143,8 +1143,10 @@ record it, transitively. The project's lockfile is the source of
 versions; the machine-wide one contributes only a resolved package the
 project does not pin. A linked package among them is packed, uploaded
 with the job and pinned by the archive's digest, its own lockfile and
-links file read the same way, so what it depends on travels too; the
-files on disk are untouched. A resolved package no lockfile pins is
+links file read the same way, so what it depends on travels too. A name
+the project links is bound to that link wherever the job's lockfile
+records a dependency on it, so the runner resolves the same packages the
+local compile does; the files on disk are untouched. A resolved package no lockfile pins is
 refused before anything uploads. Nothing else installed on the machine
 travels, so the runner installs what the query uses and no more.
 

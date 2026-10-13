@@ -47,9 +47,13 @@ digest, so it is packed at submit time -- the same :func:`ffrwd.store.pack`
 ignore files allow, models excluded -- PUT to the entry its own digest keys,
 and spelled in the submitted lock as a pin against that archive's digest.
 Its own lockfile and links file are read the same way, so a package it
-depends on is pinned or packed too. The lockfile ON DISK is untouched: a
-link stays a link for local development, and the rewrite exists only on
-the wire.
+depends on is pinned or packed too. A name the project's own links file
+links is bound to that link everywhere in the submitted lock -- in the
+project's own pins, in every package's recorded dependencies, at every
+depth -- the way :meth:`~ffrwd.project.PackageSet.resolve` binds it here, so
+the runner resolves the packages this machine's compile did. The lockfile ON
+DISK is untouched: a link stays a link for local development, and the
+rewrite exists only on the wire.
 
 What does NOT ride along: the project's own source files. A query resolving a
 call through the project's OWN manifest package compiles here and fails
@@ -645,7 +649,9 @@ def _lock(
     only a resolved package the project does not pin. A link among them is
     packed and replaced by a pin against its archive's digest, its own
     lockfile and links file read the same way, so a package it depends on
-    travels too. A resolved package no lockfile pins is refused here,
+    travels too. Every recorded dependency on a name the project links is
+    bound to that link's version, so the link is what travels and what the
+    runner resolves. A resolved package no lockfile pins is refused here,
     before anything uploads, rather than failing the runner's install.
     Nothing on disk is written.
 
@@ -663,6 +669,11 @@ def _lock(
         list(held_links(global_lock)) if found is None or global_lock != found else []
     )
     needed = _needed(packages, resolved, owner)
+    linked = (
+        {name: package.version for name, package in packages.linked.items()}
+        if packages is not None
+        else {}
+    )
     if local is None and machine_wide is None and not global_links:
         if needed:
             raise _unpinned(needed)
@@ -675,12 +686,12 @@ def _lock(
     catalogue: dict[_Identity, _Held] = {}
     if local is not None:
         _catalogue_links(catalogue, held_links(local.path))
-        _catalogue_pins(catalogue, local)
+        _catalogue_pins(catalogue, local, linked)
     _catalogue_links(catalogue, global_links)
     if machine_wide is not None:
-        _catalogue_pins(catalogue, machine_wide)
+        _catalogue_pins(catalogue, machine_wide, linked)
 
-    kept = _closure(needed, catalogue)
+    kept = _closure(needed, catalogue, linked)
     missing = [identity for identity in needed if identity not in kept]
     if missing:
         raise _unpinned(missing)
@@ -697,7 +708,7 @@ def _lock(
         else:
             entries.append(_pin(held, kept, [], packed, archives))
     recorded = local if local is not None else machine_wide
-    direct = recorded.dependencies.items() if recorded is not None else ()
+    direct = _rebound(recorded.dependencies.items(), linked) if recorded is not None else ()
     dependencies = {name: version for name, version in direct if (name, version) in kept}
     return lockfile_text(entries, dependencies=dependencies), tuple(archives)
 
@@ -730,11 +741,25 @@ def _unpinned(missing: Sequence[_Identity]) -> FfrwdError:
     )
 
 
-def _catalogue_pins(catalogue: dict[_Identity, _Held], lock: Lockfile) -> None:
-    """Add `lock`'s registry entries under the identities nothing claimed yet."""
+def _rebound(wants: Iterable[_Identity], linked: Mapping[str, str]) -> tuple[_Identity, ...]:
+    """`wants` with each name the project links bound to its link's version."""
+    return tuple((name, linked.get(name, version)) for name, version in wants)
+
+
+def _catalogue_pins(
+    catalogue: dict[_Identity, _Held], lock: Lockfile, linked: Mapping[str, str]
+) -> None:
+    """Add `lock`'s registry entries under the identities nothing claimed yet.
+
+    Each entry's own dependencies are rebound to the project's links, so the
+    submitted entry records what this machine's compile bound its calls to.
+    """
     for entry in lock.entries:
         if isinstance(entry, RegistryEntry):
-            held = _Held(entry, lock.path, wants=tuple(entry.dependencies.items()))
+            wants = _rebound(entry.dependencies.items(), linked)
+            if dict(wants) != dict(entry.dependencies):
+                entry = replace(entry, dependencies=dict(wants))
+            held = _Held(entry, lock.path, wants=wants)
             catalogue.setdefault(held.identity, held)
 
 
@@ -754,7 +779,7 @@ def _linked(entry: LinkEntry, source: Path) -> _Held:
 
 
 def _closure(
-    needed: Sequence[_Identity], catalogue: dict[_Identity, _Held]
+    needed: Sequence[_Identity], catalogue: dict[_Identity, _Held], linked: Mapping[str, str]
 ) -> dict[_Identity, _Held]:
     """Every catalogued package `needed` reaches through recorded dependencies.
 
@@ -773,15 +798,16 @@ def _closure(
         if held is None:
             continue
         if held.root is not None:
-            held = _settled(held, catalogue)
+            held = _settled(held, catalogue, linked)
         kept[identity] = held
         queue.extend(held.wants)
     return kept
 
 
-def _settled(held: _Held, catalogue: dict[_Identity, _Held]) -> _Held:
+def _settled(held: _Held, catalogue: dict[_Identity, _Held], linked: Mapping[str, str]) -> _Held:
     """The link `held` with its own pins read: what it depends on, with the
-    packages its lockfile pins and its links file links joining the catalogue."""
+    packages its lockfile pins and its links file links joining the catalogue.
+    A dependency on a name the project links is bound to that link."""
     assert held.root is not None
     own_path = held.root / LOCKFILE_NAME
     wants: list[_Identity] = []
@@ -795,9 +821,9 @@ def _settled(held: _Held, catalogue: dict[_Identity, _Held]) -> _Held:
         present = False
     if present:
         own = read_lockfile(own_path)
-        _catalogue_pins(catalogue, own)
+        _catalogue_pins(catalogue, own, linked)
         wants.extend(own.dependencies.items())
-    return replace(held, wants=tuple(wants))
+    return replace(held, wants=_rebound(wants, linked))
 
 
 def _link_root(entry: LinkEntry, lock_path: Path) -> Path:
