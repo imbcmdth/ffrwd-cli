@@ -2383,9 +2383,9 @@ on the device.
   debug-layer error. The test now runs with `WGPU_VALIDATION=1` and
   refuses any such line: 20 of 20 quiet and 20 of 20 loaded after, and
   10 of 10 failures with the wait alone switched off. The compiler keeps
-  mapping `scale` onto `scale_d3d12`. The proper fix is to backport the
-  two upstream commits into ffrwd-av's build, after which the wait can go
-  for builds that carry them.
+  mapping `scale` onto `scale_d3d12`. The owner's call (2026-10-14): no
+  backport; ffrwd-av moves to the next FFmpeg release that carries the two
+  upstream commits, and the wait goes for builds that do.
 
 Still open from that work: encoders feeding a packet sink that joined the
 region are not told a colour; a video stream that starts after its
