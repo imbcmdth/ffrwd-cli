@@ -2133,4 +2133,6 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
   -chroma_sample_location:0 left boxed.nut
 ```
 
+Pyrowave's shaders use subgroups, which wgpu's D3D12 backend offers only through DXC. The release wheel's sidecar for Windows x86_64 has DXC compiled in, so it needs nothing more. A sidecar without it, the Windows aarch64 wheel or one built with the GNU toolchains, reports `The adapter does not support the subgroups feature` and the codec refuses to open: put `dxcompiler.dll` (the Windows SDK's, or the DirectX Shader Compiler release's) on the PATH and set `WGPU_DX12_COMPILER=dxc`.
+
 `-pads` tells the encoder the format its pictures are made in on the device. Declared from `pyrowave.wasm`, the command differs only in the module, whose encoder is handed bytes, so each picture is read back once on its way in; `ffrwd run --profile` counts that under `download`. The decoder works the same way: `input('enc.nut', decoder => ffrwd.pyrowave.decode_gpu())`, read by a module holding its pictures on the GPU, decodes into textures in that module's region. Since both builds read `PYRW`, a stream whose decoder is not named is decoded by `decode`, the bytes build.

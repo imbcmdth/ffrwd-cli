@@ -2175,9 +2175,10 @@ with it between two GPU regions never crosses host memory as pictures.
   stream says it.
 
 **Measured.** RTX 4090, D3D12, quiet (under 5% from others), median of
-three. Pyrowave's shaders still need `dxcompiler.dll` on the path and
-`WGPU_DX12_COMPILER=dxc`; without them the device has no subgroups and the
-codec refuses to open.
+three. This machine's sidecar is a gnullvm build, which cannot link DXC,
+so pyrowave's subgroups need `dxcompiler.dll` on the path and
+`WGPU_DX12_COMPILER=dxc`; the x86_64 MSVC build the release wheel carries
+has DXC compiled in and needs neither (recipe 170 says so).
 
 - Exactness. At 1080p, 30 frames of testsrc2 through `gpu_box` into the
   encoder at 125,000 bytes a frame, the GPU build's packets are the bytes
@@ -2218,7 +2219,10 @@ codec refuses to open.
   to encode and 6.6 ms to decode, 14.8 ms together; `pyrowave_roundtrip`'s
   call took 32 ms.
 
-**Open.** The fork's branch (`gpu-textures` of imbcmdth/pyrowave) and the
+**Open.** `ffrwd/gpu` 0.1.0 has never been published: the release workflow
+stages it beside `ffrwd/wasm`, but no release has run from this branch, so
+every extension to it so far, this one included, is to an unpublished
+version, and the first release publishes 0.1.0 as it then stands. The fork's branch (`gpu-textures` of imbcmdth/pyrowave) and the
 package's (`gpu` of ffrwd-package-pyrowave) are pushed, unpublished. The package's
 manifest still says `ffrwd >= 0.24.0`: an ffrwd before this change refuses
 an unasked `PYRW` stream once both builds are declared, so a release of the
