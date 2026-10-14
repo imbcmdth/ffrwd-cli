@@ -3557,16 +3557,29 @@ fn a_d3d12_device_without_dxc_says_how_to_get_subgroups() {
             ),
         "expected the refusal to name the fix, got: {device}"
     );
+    // Asking the adapter whether it has subgroups says the same on stderr,
+    // for a module that checks before it asks for a device.
+    assert!(
+        stderr.contains(
+            "wasi:webgpu: The D3D12 device has no subgroups without DXC; put dxcompiler.dll \
+             on the PATH and set WGPU_DX12_COMPILER=dxc to get them."
+        ),
+        "expected the fix on stderr, got:\n{stderr}"
+    );
 
     if with_dxc.is_empty() {
         eprintln!("SKIPPED the second half: no dxcompiler.dll on the PATH to open the device with");
         return;
     }
-    let (row, _) = probe_subgroups(&path, Some("dxc"));
+    let (row, stderr) = probe_subgroups(&path, Some("dxc"));
     assert_eq!(
         row["device"],
         serde_json::json!(""),
         "with dxcompiler.dll on the PATH and WGPU_DX12_COMPILER=dxc the device opens: {row}"
+    );
+    assert!(
+        !stderr.contains("without DXC"),
+        "and nothing says DXC is missing:\n{stderr}"
     );
 }
 

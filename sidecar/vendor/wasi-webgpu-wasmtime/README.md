@@ -46,7 +46,8 @@ and C guests to [wasi-webgpu-headers](https://github.com/wasi-gfx/wasi-webgpu-he
   getting a mapped range of a buffer that is not mapped (an error, not a
   panic). Unknown `required-limits` keys and features the adapter lacks reject
   the device request as WebGPU says; a refused request for `subgroups` on a
-  D3D12 adapter without DXC says how to get them.
+  D3D12 adapter without DXC says how to get them, and so does stderr, once,
+  when a module asks the shared device whether it has them.
 * No host panics a guest can reach through a call that is not implemented:
   every remaining `todo!()` is a trap naming the function, and passes used
   after `end` trap instead of unwrapping.

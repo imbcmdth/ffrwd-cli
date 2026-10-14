@@ -3169,9 +3169,15 @@ impl webgpu::HostGpuSupportedFeatures for WasiWebGpuCtx<'_> {
             "dual-source-blending" => features.contains(wgpu_types::Features::DUAL_SOURCE_BLENDING),
             // wgpu's own SUBGROUP stands in for the standard feature it does
             // not have yet; see the device descriptor conversion.
-            "subgroups" => features
-                .features_wgpu
-                .contains(wgpu_types::FeaturesWGPU::SUBGROUP),
+            "subgroups" => {
+                let has = features
+                    .features_wgpu
+                    .contains(wgpu_types::FeaturesWGPU::SUBGROUP);
+                if let (false, Some(shared)) = (has, self.shared) {
+                    crate::note_missing_subgroups(shared);
+                }
+                has
+            }
             "texture-formats-tier1" => {
                 // TODO: enable once wgpu does
                 // features.contains(wgpu_types::Features::TEXTURE_FORMATS_TIER1)

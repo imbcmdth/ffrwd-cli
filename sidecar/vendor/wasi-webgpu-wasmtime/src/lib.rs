@@ -168,14 +168,35 @@ pub fn request_device_message(
     adapter_has_subgroups: bool,
     compiler_is_dxc: bool,
 ) -> String {
-    if requested_subgroups
-        && backend == wgpu_types::Backend::Dx12
-        && !adapter_has_subgroups
-        && !compiler_is_dxc
-    {
+    if requested_subgroups && d3d12_without_dxc(backend, adapter_has_subgroups, compiler_is_dxc) {
         format!("{refusal}. {SUBGROUPS_HINT}")
     } else {
         refusal.to_string()
+    }
+}
+
+/// Whether the adapter is a D3D12 one without subgroups because DXC is not
+/// compiling its shaders.
+fn d3d12_without_dxc(
+    backend: wgpu_types::Backend,
+    adapter_has_subgroups: bool,
+    compiler_is_dxc: bool,
+) -> bool {
+    backend == wgpu_types::Backend::Dx12 && !adapter_has_subgroups && !compiler_is_dxc
+}
+
+/// Prints how to get subgroups on stderr, once per process, when a module
+/// asks whether the shared device has them and it is a D3D12 one without
+/// them for want of DXC. A module that checks before it asks for a device
+/// refuses with its own message, which cannot carry the fix.
+pub(crate) fn note_missing_subgroups(shared: &SharedDevice) {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    if d3d12_without_dxc(
+        shared.info.backend,
+        shared.features.contains(wgpu_types::Features::SUBGROUP),
+        dx12_compiler_is_dxc(),
+    ) {
+        NOTED.call_once(|| eprintln!("wasi:webgpu: {SUBGROUPS_HINT}"));
     }
 }
 
