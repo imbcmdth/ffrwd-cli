@@ -93,12 +93,12 @@ _RGB_TO_YUV: Mapping[str, str] = {"color_range": "tv", "colorspace": "bt709"}
 _DEVICE_MATRICES = frozenset({"bt709", "bt470bg", "smpte170m"})
 # The encoders that may read their pictures on the device.
 _DEVICE_ENCODER_SUFFIXES = ("_d3d12va", "_videotoolbox")
-# BT.601's matrix, by both of its names.
-_BT601 = frozenset({"bt470bg", "smpte170m"})
 # Encoders that code full range, whatever range they are handed.
 _FULL_RANGE_ENCODERS = frozenset({"mjpeg"})
 # Encoders whose pictures are read in BT.601's matrix whatever a file says: a
-# JPEG's YUV is BT.601's, so rgba is made into it in that one.
+# JPEG's YUV is BT.601's, so rgba is made into it in that one, and the
+# matrix is named as a JPEG names it, `bt470bg`, whichever of BT.601's two
+# names the source used: ffmpeg writes that name for the codec regardless.
 _BT601_ENCODERS = frozenset({"mjpeg"})
 
 
@@ -118,7 +118,7 @@ def encoded_colour(
         made = {**_RGB_TO_YUV, **made}
         if codec.endswith(_DEVICE_ENCODER_SUFFIXES) and made["colorspace"] not in _DEVICE_MATRICES:
             made["colorspace"] = _RGB_TO_YUV["colorspace"]
-        if codec in _BT601_ENCODERS and made["colorspace"] not in _BT601:
+        if codec in _BT601_ENCODERS:
             made["colorspace"] = "bt470bg"
     if codec in _FULL_RANGE_ENCODERS:
         made["color_range"] = "pc"

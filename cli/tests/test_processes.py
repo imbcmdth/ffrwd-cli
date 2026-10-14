@@ -3075,7 +3075,7 @@ def test_the_colour_an_encode_node_makes_its_pictures_in() -> None:
         ("ffv1", "rgba", "bt601"): told_601,
         ("h264_d3d12va", "rgba", "bt2020"): {"color_range": "tv", "colorspace": "bt709"},
         ("h264_videotoolbox", "rgba", "bt2020"): {"color_range": "tv", "colorspace": "bt709"},
-        ("mjpeg", "rgba", "bt601"): {**told_601, "color_range": "pc"},
+        ("mjpeg", "rgba", "bt601"): {**told_601, "color_range": "pc", "colorspace": "bt470bg"},
         ("mjpeg", "rgba", "nothing said"): {"color_range": "pc", "colorspace": "bt470bg"},
     }
     said = {

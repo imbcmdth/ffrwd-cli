@@ -1693,7 +1693,7 @@ def _rgb24(path: Path, negate: bool = False) -> bytes:
     [
         (True, "ffv1", "mkv", _BT601_TAGS),
         (False, "ffv1", "mkv", {**_UNSAID_TAGS, "color_range": "tv", "color_space": "bt709"}),
-        (True, "mjpeg", "mp4", {**_BT601_TAGS, "color_range": "pc"}),
+        (True, "mjpeg", "mp4", {**_BT601_TAGS, "color_range": "pc", "color_space": "bt470bg"}),
         (False, "mjpeg", "mp4", {**_UNSAID_TAGS, "color_range": "pc", "color_space": "bt470bg"}),
     ],
     ids=["bt601-mkv", "unsaid-mkv", "bt601-mp4", "unsaid-mp4"],
