@@ -401,6 +401,11 @@ def test_offline_example_compiles_to_the_shown_command(
     _assert_shlex_invariant(actual, expected)
 
 
+# The module a `CREATE FUNCTION ... AS '<module>', '<export>' LANGUAGE wasm`
+# declaration names.
+_WASM_DECLARATION_RE = re.compile(r"AS\s+'([^']+)'\s*,\s*'[^']+'\s+LANGUAGE\s+wasm", re.I)
+
+
 def _require_modules(example: Example) -> None:
     """Skip a recipe naming a wasm module the machine cannot describe.
 
@@ -415,12 +420,14 @@ def _require_modules(example: Example) -> None:
     if binaries.ffrwd_wasm_path() is None:
         pytest.skip("ffrwd-wasm not found (uv sync --extra wasm)")
     try:
-        declared = resolve(parse(example.sql)).wasm
-    except FfrwdError:  # a rejection the compile below will report properly
-        return
-    for function in declared.values():
-        if not (PROJECT_ROOT / function.module).exists():
-            pytest.skip(f"module missing: {function.module}")
+        modules = [function.module for function in resolve(parse(example.sql)).wasm.values()]
+    except FfrwdError:
+        # A recipe with variables does not resolve without them; the
+        # declarations still say which modules it names.
+        modules = _WASM_DECLARATION_RE.findall(example.sql)
+    for module in modules:
+        if not (PROJECT_ROOT / module).exists():
+            pytest.skip(f"module missing: {module}")
 
 
 def _require_device_filters(example: Example) -> None:
@@ -438,7 +445,17 @@ def _require_device_filters(example: Example) -> None:
     missing: set[str] = set()
     machine = registry_module.load()
     if in_ffmpeg and machine.available():
-        missing |= {name for name in in_ffmpeg if machine.get(name) is None}
+        # The card pass keeps a picture on a card only where the ffmpeg has
+        # every variant of the family, so one of them missing means the
+        # pin's command is not what this machine compiles.
+        for family in hardware._FAMILIES:
+            if any(name.endswith(family.filter_suffix) for name in in_ffmpeg):
+                if not hardware._build_has_variants(machine, family):
+                    missing |= {
+                        f"{name}{family.filter_suffix}"
+                        for name in family.variants
+                        if machine.get(f"{name}{family.filter_suffix}") is None
+                    }
     sidecar = av.sidecar_filters()
     if in_sidecar and sidecar is not None:
         missing |= in_sidecar - sidecar

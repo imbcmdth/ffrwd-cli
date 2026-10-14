@@ -93,6 +93,15 @@ jobs:
         working-directory: sidecar
         run: cargo build --release
 
+      # The libav the decode, encode and filter nodes load: the same fetch
+      # the release runs before it builds the wheel, pointed at by the
+      # variable the sidecar reads, since the binary here is not the wheel's.
+      - name: Fetch the pinned libav libraries
+        working-directory: sidecar/ffrwd-wasm
+        run: |
+          python3 fetch_av.py --target x86_64 --os ${{ runner.os }}
+          echo "FFRWD_AV_RUNTIME=$GITHUB_WORKSPACE/sidecar/ffrwd-wasm/ffrwd_wasm_av" >> "$GITHUB_ENV"
+
       - name: Build the wasm modules
         working-directory: sidecar/modules
         run: cargo build --target wasm32-wasip2 --release
