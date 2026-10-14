@@ -5,6 +5,10 @@
 //! whether an adapter was found, whether it has subgroups, and its name.
 //! Without a `-gpu` grant the host refuses to run it at all; with one on a
 //! machine without a GPU the row says `"adapter": false`.
+//!
+//! With `{"subgroups": true}` it also asks the adapter for a device with
+//! subgroups, and the row's `device` is the error `request-device` returned,
+//! or empty when the device opened.
 
 wit_bindgen::generate!({
     path: [
@@ -22,18 +26,19 @@ wit_bindgen::generate!({
 use std::cell::RefCell;
 
 use exports::ffrwd::av::filter::{FrameInfo, Guest, Meta, Outcome, Output, StreamInfo};
-use wasi::webgpu::webgpu::get_gpu;
+use wasi::webgpu::webgpu::{get_gpu, GpuDeviceDescriptor, GpuFeatureName};
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
-const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"adapter":{"type":"boolean"},"subgroups":{"type":"boolean"},"name":{"type":"string"}},"required":["adapter","subgroups","name"]}"#;
+const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{"subgroups":{"type":"boolean"}},"additionalProperties":false}"#;
+const ROWS_SCHEMA: &str = r#"{"type":"object","properties":{"adapter":{"type":"boolean"},"subgroups":{"type":"boolean"},"name":{"type":"string"},"device":{"type":"string"}},"required":["adapter","subgroups","name"]}"#;
 
 thread_local! {
     /// The row the first frame carries, taken when it is emitted.
     static FOUND: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// What the host's GPU looks like to this module, as one row.
-fn probe() -> String {
+/// What the host's GPU looks like to this module, as one row; with
+/// `request_subgroups`, also what asking for a device with subgroups got.
+fn probe(request_subgroups: bool) -> String {
     let adapter = get_gpu().request_adapter(None);
     let (found, subgroups, name) = match &adapter {
         Some(adapter) => (
@@ -43,8 +48,24 @@ fn probe() -> String {
         ),
         None => (false, false, String::new()),
     };
+    let device = match (&adapter, request_subgroups) {
+        (Some(adapter), true) => {
+            let descriptor = GpuDeviceDescriptor {
+                required_features: Some(vec![GpuFeatureName::Subgroups]),
+                required_limits: None,
+                default_queue: None,
+                label: None,
+            };
+            let error = match adapter.request_device(Some(descriptor)) {
+                Ok(_) => String::new(),
+                Err(error) => error.message,
+            };
+            format!(r#","device":{}"#, json_string(&error))
+        }
+        _ => String::new(),
+    };
     format!(
-        r#"{{"adapter":{found},"subgroups":{subgroups},"name":{}}}"#,
+        r#"{{"adapter":{found},"subgroups":{subgroups},"name":{}{device}}}"#,
         json_string(&name)
     )
 }
@@ -63,10 +84,25 @@ fn json_string(text: &str) -> String {
     out
 }
 
-fn validate_params(params: &str) -> Result<(), String> {
-    match params.trim() {
-        "" | "{}" => Ok(()),
-        other => Err(format!("gpu-probe takes no params, got: {other}")),
+/// Whether the params ask for a device with subgroups.
+fn parse_params(params: &str) -> Result<bool, String> {
+    if params.trim().is_empty() {
+        return Ok(false);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(params).map_err(|e| format!("gpu-probe params: {e}"))?;
+    let Some(object) = value.as_object() else {
+        return Err(format!("gpu-probe params are an object, got: {params}"));
+    };
+    if let Some(key) = object.keys().find(|key| *key != "subgroups") {
+        return Err(format!("gpu-probe takes only `subgroups`, got: {key}"));
+    }
+    match object.get("subgroups") {
+        None => Ok(false),
+        Some(serde_json::Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!(
+            "gpu-probe's `subgroups` is a boolean, got: {other}"
+        )),
     }
 }
 
@@ -94,13 +130,13 @@ impl Guest for GpuProbe {
         _stream_info: StreamInfo,
         params: String,
     ) -> Result<(), String> {
-        validate_params(&params)?;
-        FOUND.with(|found| *found.borrow_mut() = Some(probe()));
+        let request_subgroups = parse_params(&params)?;
+        FOUND.with(|found| *found.borrow_mut() = Some(probe(request_subgroups)));
         Ok(())
     }
 
     fn set_params(params: String) -> Result<(), String> {
-        validate_params(&params)
+        parse_params(&params).map(|_| ())
     }
 
     fn frame_independent() -> bool {

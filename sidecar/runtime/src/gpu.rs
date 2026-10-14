@@ -283,3 +283,37 @@ pub(crate) fn add_to_linker<T: 'static>(
 /// `wasi:webgpu`.
 pub(crate) const NOT_BUILT: &str = "this ffrwd-wasm was built without GPU support \
      (the `gpu` cargo feature), so it cannot run a module that imports wasi:webgpu";
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    use wasi_webgpu_wasmtime::reexports::wgpu_types::Backend;
+    use wasi_webgpu_wasmtime::request_device_message;
+
+    const REFUSAL: &str = "required-features names Features { features_wgpu: \
+         FeaturesWGPU(SUBGROUP), features_webgpu: FeaturesWebGPU(0x0) }, which this device \
+         does not have";
+
+    #[test]
+    fn a_d3d12_device_without_dxc_says_how_to_get_subgroups() {
+        assert_eq!(
+            request_device_message(REFUSAL, true, Backend::Dx12, false, false),
+            format!(
+                "{REFUSAL}. The D3D12 device has no subgroups without DXC; put dxcompiler.dll \
+                 on the PATH and set WGPU_DX12_COMPILER=dxc to get them."
+            )
+        );
+        // Any one condition unmet leaves the refusal as it is.
+        for (requested, backend, adapter_has, dxc) in [
+            (false, Backend::Dx12, false, false),
+            (true, Backend::Vulkan, false, false),
+            (true, Backend::Dx12, true, false),
+            (true, Backend::Dx12, false, true),
+        ] {
+            assert_eq!(
+                request_device_message(REFUSAL, requested, backend, adapter_has, dxc),
+                REFUSAL,
+                "requested {requested}, {backend:?}, adapter has {adapter_has}, dxc {dxc}"
+            );
+        }
+    }
+}

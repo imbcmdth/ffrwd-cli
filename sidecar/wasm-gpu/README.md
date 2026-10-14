@@ -63,6 +63,14 @@ place of `ffrwd:av`'s `encode` and `decode`, which still serve elsewhere.
 `ffrwd:av`'s `describe` and `init` open it as for host memory.
 `sidecar/modules/testcodec`, built as `testcodec_gpu`, is such a module.
 
+A module's `request-device` is answered with the sidecar's one device,
+and a feature that device lacks is refused. On Windows the device is
+D3D12, whose `subgroups` need DXC: the release wheel's sidecar for
+Windows x86_64 has it compiled in, and any other build needs
+`dxcompiler.dll` (the Windows SDK's, or the DirectX Shader Compiler
+release's) on the PATH and `WGPU_DX12_COMPILER=dxc`. A request for
+`subgroups` refused for want of DXC says so.
+
 This package carries `wit/gpu.wit` and, under `wit/deps/`, the same
 `wasi:webgpu`, `wasi:graphics-context` and `wasi:io` copies `ffrwd/wasm`
 carries, and `wasi:nn`, whose tensor `nn` hands out. The tree's one

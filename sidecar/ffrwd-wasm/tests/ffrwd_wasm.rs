@@ -3474,6 +3474,102 @@ fn a_gpu_module_runs_under_its_grant() {
     }
 }
 
+/// gpu_probe asking for a device with subgroups, with `dxcompiler.dll` kept
+/// on the PATH or not and `WGPU_DX12_COMPILER` set to `compiler` or unset:
+/// the row, and the sidecar's stderr.
+fn probe_subgroups(path: &std::ffi::OsStr, compiler: Option<&str>) -> (serde_json::Value, String) {
+    ensure_modules_built();
+    let frames: Vec<Vec<u8>> = (0..2u8).map(synthetic_frame).collect();
+    let module = module_path("gpu_probe");
+    let module_str = module.to_str().expect("module path is valid UTF-8");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"));
+    cmd.args([
+        "-gpu",
+        module_str,
+        "-f",
+        "nut",
+        "-i",
+        "-",
+        "-m",
+        module_str,
+        "-params",
+        r#"{"subgroups":true}"#,
+        "-f",
+        "ndjson",
+        "-",
+    ])
+    .env("PATH", path)
+    .env_remove("WGPU_DX12_COMPILER")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if let Some(compiler) = compiler {
+        cmd.env("WGPU_DX12_COMPILER", compiler);
+    }
+    let mut child = cmd.spawn().expect("spawn ffrwd-wasm");
+    let mut stdin = child.stdin.take().expect("child stdin");
+    let _ = stdin.write_all(&nut_stream(&frames));
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for ffrwd-wasm");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "gpu_probe exited with {:?}\nstderr:\n{stderr}",
+        output.status.code()
+    );
+    let stdout = String::from_utf8(output.stdout).expect("rows are UTF-8");
+    let row =
+        serde_json::from_str(stdout.lines().next().expect("one row")).expect("the row is JSON");
+    (row, stderr)
+}
+
+#[test]
+fn a_d3d12_device_without_dxc_says_how_to_get_subgroups() {
+    let path = env::var_os("PATH").unwrap_or_default();
+    let (with_dxc, without_dxc): (Vec<PathBuf>, Vec<PathBuf>) =
+        env::split_paths(&path).partition(|dir| dir.join("dxcompiler.dll").is_file());
+    let scrubbed = env::join_paths(without_dxc).expect("the PATH joins again");
+
+    let (row, stderr) = probe_subgroups(&scrubbed, None);
+    if row["adapter"] == serde_json::json!(false) {
+        eprintln!("SKIPPED: no GPU adapter");
+        return;
+    }
+    if row["subgroups"] == serde_json::json!(true) {
+        eprintln!(
+            "SKIPPED: the adapter has subgroups without dxcompiler.dll on the PATH (a build \
+             with DXC compiled in, or a backend other than D3D12), so there is nothing to hint"
+        );
+        return;
+    }
+    if !stderr.contains("(Dx12)") {
+        eprintln!("SKIPPED: the device is not D3D12, whose subgroups are the ones DXC provides");
+        return;
+    }
+    let device = row["device"]
+        .as_str()
+        .expect("the row says what the request got");
+    assert!(
+        device.contains("which this device does not have")
+            && device.ends_with(
+                ". The D3D12 device has no subgroups without DXC; put dxcompiler.dll on the \
+                 PATH and set WGPU_DX12_COMPILER=dxc to get them."
+            ),
+        "expected the refusal to name the fix, got: {device}"
+    );
+
+    if with_dxc.is_empty() {
+        eprintln!("SKIPPED the second half: no dxcompiler.dll on the PATH to open the device with");
+        return;
+    }
+    let (row, _) = probe_subgroups(&path, Some("dxc"));
+    assert_eq!(
+        row["device"],
+        serde_json::json!(""),
+        "with dxcompiler.dll on the PATH and WGPU_DX12_COMPILER=dxc the device opens: {row}"
+    );
+}
+
 #[test]
 fn an_http_module_posts_each_row_under_its_grant() {
     ensure_modules_built();

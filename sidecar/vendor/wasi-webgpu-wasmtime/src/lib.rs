@@ -131,6 +131,54 @@ pub struct SharedDevice {
     pub info: wgpu_types::AdapterInfo,
 }
 
+/// Whether wgpu-core is built with `static-dxc`: true on the targets
+/// Cargo.toml turns it on for.
+const STATIC_DXC: bool = cfg!(all(
+    target_os = "windows",
+    target_env = "msvc",
+    not(target_arch = "aarch64")
+));
+
+/// Whether wgpu's D3D12 backend compiles shaders with DXC, as
+/// `WGPU_DX12_COMPILER` and the build choose it. Without the variable, wgpu
+/// uses static DXC where it is built in, and elsewhere `dxcompiler.dll` if
+/// it loads and FXC if not; that last choice is taken as FXC.
+pub fn dx12_compiler_is_dxc() -> bool {
+    match wgpu_types::Dx12Compiler::from_env() {
+        Some(wgpu_types::Dx12Compiler::Fxc) => false,
+        Some(wgpu_types::Dx12Compiler::DynamicDxc { .. } | wgpu_types::Dx12Compiler::StaticDxc) => {
+            true
+        }
+        Some(wgpu_types::Dx12Compiler::Auto) | None => STATIC_DXC,
+    }
+}
+
+/// How a D3D12 device without DXC gets subgroups.
+const SUBGROUPS_HINT: &str = "The D3D12 device has no subgroups without DXC; put \
+     dxcompiler.dll on the PATH and set WGPU_DX12_COMPILER=dxc to get them.";
+
+/// The message a refused `request-device` carries: `refusal` as it stands,
+/// followed by how to get subgroups when the request asked for them and the
+/// adapter is a D3D12 one without them because DXC is not compiling its
+/// shaders.
+pub fn request_device_message(
+    refusal: &str,
+    requested_subgroups: bool,
+    backend: wgpu_types::Backend,
+    adapter_has_subgroups: bool,
+    compiler_is_dxc: bool,
+) -> String {
+    if requested_subgroups
+        && backend == wgpu_types::Backend::Dx12
+        && !adapter_has_subgroups
+        && !compiler_is_dxc
+    {
+        format!("{refusal}. {SUBGROUPS_HINT}")
+    } else {
+        refusal.to_string()
+    }
+}
+
 struct HasWasiWebGpuCtx;
 
 impl HasData for HasWasiWebGpuCtx {

@@ -1028,6 +1028,25 @@ impl webgpu::HostGpuRenderPipeline for WasiWebGpuCtx<'_> {
     }
 }
 
+/// A refused device request's message, with how to get subgroups where the
+/// adapter is D3D12 and lacks them for want of DXC.
+fn refused_device_message(
+    instance: &wgpu_core::global::Global,
+    adapter: wgpu_core::id::AdapterId,
+    required: wgpu_types::Features,
+    refusal: &str,
+) -> String {
+    crate::request_device_message(
+        refusal,
+        required.contains(wgpu_types::Features::SUBGROUP),
+        instance.adapter_get_info(adapter).backend,
+        instance
+            .adapter_features(adapter)
+            .contains(wgpu_types::Features::SUBGROUP),
+        crate::dx12_compiler_is_dxc(),
+    )
+}
+
 impl webgpu::HostGpuAdapter for WasiWebGpuCtx<'_> {
     fn request_device(
         &mut self,
@@ -1059,8 +1078,13 @@ impl webgpu::HostGpuAdapter for WasiWebGpuCtx<'_> {
             if !missing.is_empty() {
                 return Ok(Err(webgpu::RequestDeviceError {
                     kind: webgpu::RequestDeviceErrorKind::TypeError,
-                    message: format!(
-                        "required-features names {missing:?}, which this device does not have"
+                    message: refused_device_message(
+                        self.instance,
+                        *adapter,
+                        desc.required_features,
+                        &format!(
+                            "required-features names {missing:?}, which this device does not have"
+                        ),
                     ),
                 }));
             }
@@ -1109,7 +1133,12 @@ impl webgpu::HostGpuAdapter for WasiWebGpuCtx<'_> {
             }
 
             Err(err) => {
-                let message = err.to_string();
+                let message = refused_device_message(
+                    self.instance,
+                    *adapter,
+                    desc.required_features,
+                    &err.to_string(),
+                );
                 // https://www.w3.org/TR/webgpu/#dom-gpuadapter-requestdevice:
                 // a feature the adapter lacks rejects with a TypeError, a
                 // limit better than the adapter's with an OperationError, and
