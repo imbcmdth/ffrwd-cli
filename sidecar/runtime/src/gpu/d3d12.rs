@@ -981,7 +981,9 @@ impl EncoderFeed {
 /// as [`EncoderFeed`] does into an encoder's, after the filter is done
 /// reading the textures its pool hands out again: a D3D12 filter reads a
 /// picture on a queue of its own and never signals it, so the copy waits
-/// on what the filter signalled for the last picture it wrote.
+/// on what the filter signalled for the last picture it wrote. The graph
+/// is handed the picture only once the filter has run everything before
+/// it ([`FilterFeed::settle`]).
 #[derive(Default)]
 pub struct FilterFeed {
     feed: EncoderFeed,
@@ -1014,6 +1016,30 @@ impl FilterFeed {
                 .context("waiting on the filter")?;
         }
         self.feed.feed(frame, yuv, picture)
+    }
+
+    /// Blocks until the filter has run everything it was given, which is
+    /// when its sync object reaches the value of the last picture taken
+    /// from it. Called before each picture is handed to the graph.
+    ///
+    /// FFmpeg 9.0's D3D12 filters (`scale_d3d12`, `deinterlace_d3d12`)
+    /// record every picture with one command allocator and reset it for the
+    /// next without waiting for the device to finish the last, which the
+    /// D3D12 debug layer reports and answers by removing the device. FFmpeg
+    /// fixed both after 9.0 (commits b227d1e4be and 7bc357691081).
+    pub fn settle(&self) -> Result<()> {
+        let Some((sync, value)) = &self.written else {
+            return Ok(());
+        };
+        // SAFETY: COM calls on a live object; a null event blocks until the
+        // value is reached.
+        unsafe {
+            if sync.GetCompletedValue() < *value {
+                sync.SetEventOnCompletion(*value, windows::Win32::Foundation::HANDLE::default())
+                    .context("waiting for the filter")?;
+            }
+        }
+        Ok(())
     }
 
     /// Notes a picture the filter handed back: everything the filter read
@@ -1308,6 +1334,65 @@ impl ForeignSync {
         unsafe { queue(global, device)?.Wait(&self.sync, value) }
             .context("having the queue wait on the shared sync object")
     }
+}
+
+/// Turns off the D3D12 debug layer's synchronized command queue
+/// validation, before the device is made, where wgpu turns the layer on (a
+/// debug build, or `WGPU_VALIDATION`). With it on, a decoder, a filter and
+/// an encoder on this device submitting from several threads crash the
+/// process inside the layer, with no error reported first. The layer's
+/// other checks stay on.
+pub fn quiet_queue_validation() {
+    let mut debug: Option<ID3D12Debug1> = None;
+    // SAFETY: COM calls; the interface is released when dropped.
+    unsafe {
+        if D3D12GetDebugInterface(&mut debug).is_ok() {
+            if let Some(debug) = debug {
+                debug.SetEnableSynchronizedCommandQueueValidation(false);
+            }
+        }
+    }
+}
+
+/// Writes every error the D3D12 debug layer reports on stderr, as
+/// `[gpu] D3D12 debug layer: <message>`, for the rest of the process: the
+/// layer otherwise writes only to an attached debugger. Does nothing where
+/// the layer is off or the device is not a D3D12 one.
+pub fn report_debug_layer(global: &Global, device: wgpu_core::id::DeviceId) {
+    // SAFETY: the device is only referenced, never destroyed here.
+    let Some(hal) = (unsafe { global.device_as_hal::<Dx12>(device) }) else {
+        return;
+    };
+    let Ok(messages) = hal.raw_device().cast::<ID3D12InfoQueue1>() else {
+        return;
+    };
+    let mut cookie = 0u32;
+    // SAFETY: a COM call on a live object; the callback is a plain function
+    // and the queue lives as long as the device, which is the process's.
+    let _ = unsafe {
+        messages.RegisterMessageCallback(
+            Some(debug_layer_message),
+            D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+            std::ptr::null_mut(),
+            &mut cookie,
+        )
+    };
+}
+
+unsafe extern "system" fn debug_layer_message(
+    _category: D3D12_MESSAGE_CATEGORY,
+    severity: D3D12_MESSAGE_SEVERITY,
+    _id: D3D12_MESSAGE_ID,
+    description: windows::core::PCSTR,
+    _context: *mut std::ffi::c_void,
+) {
+    if severity != D3D12_MESSAGE_SEVERITY_ERROR && severity != D3D12_MESSAGE_SEVERITY_CORRUPTION {
+        return;
+    }
+    use std::io::Write;
+    // SAFETY: the layer passes a NUL-terminated string valid for the call.
+    let text = unsafe { description.to_string() }.unwrap_or_default();
+    let _ = writeln!(std::io::stderr(), "[gpu] D3D12 debug layer: {text}");
 }
 
 /// The queue every module and the host submit to, as D3D12 has it, for an

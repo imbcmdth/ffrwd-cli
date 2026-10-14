@@ -561,6 +561,19 @@ fn path_str(path: &Path) -> &str {
 /// `chain` over the NUT file `input`, its `[out0]` written to `out`, with
 /// `-profile`; gpu_box bound when `module` is given.
 fn run_chain(dir: &Path, input: &Path, chain: &str, out: &Path, module: Option<&str>) -> Output {
+    chain_command(dir, input, chain, out, module)
+        .output()
+        .expect("spawn ffrwd-wasm")
+}
+
+/// The command [`run_chain`] runs.
+fn chain_command(
+    dir: &Path,
+    input: &Path,
+    chain: &str,
+    out: &Path,
+    module: Option<&str>,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"));
     command.env("FFRWD_AV_RUNTIME", dir).arg("-profile");
     if let Some(module) = module {
@@ -573,10 +586,13 @@ fn run_chain(dir: &Path, input: &Path, chain: &str, out: &Path, module: Option<&
     command
         .args(["-filter_complex", chain, "-map", "[out0]", "-f", "nut"])
         .arg(out)
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn ffrwd-wasm")
+        .stdin(Stdio::null());
+    command
 }
+
+/// What the D3D12 debug layer's errors start with on stderr, where wgpu's
+/// validation turns the layer on.
+const DEBUG_LAYER_ERROR: &str = "[gpu] D3D12 debug layer: ";
 
 /// The profile row a `-profile` run wrote on stderr.
 fn profile_row(stderr: &str) -> serde_json::Value {
@@ -1777,7 +1793,13 @@ fn scale_d3d12_runs_between_a_decoder_and_an_encoder_on_the_device() {
     let chain = "[0:v]decode=format=yuv420p:hw=d3d12va[d];\
                  [d]filter=graph=scale_d3d12=w=160\\\\:h=120[f];\
                  [f]encode=codec=h264_d3d12va:b=2M[out0]";
-    let output = run_chain(&dir, &source, chain, &out, None);
+    // Under the D3D12 debug layer, whatever the build: a filter whose
+    // commands are recorded again before the device has run them is an
+    // error there, and without the layer it goes unseen.
+    let output = chain_command(&dir, &source, chain, &out, None)
+        .env("WGPU_VALIDATION", "1")
+        .output()
+        .expect("spawn ffrwd-wasm");
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
         return;
@@ -1789,6 +1811,7 @@ fn scale_d3d12_runs_between_a_decoder_and_an_encoder_on_the_device() {
         output.status.code()
     );
     assert!(stderr.contains(&decoded_line("d3d12va")), "{stderr}");
+    assert!(!stderr.contains(DEBUG_LAYER_ERROR), "{stderr}");
     assert!(stderr.contains(FILTER_LINE), "{stderr}");
     assert!(
         stderr.contains("[av] filter scale_d3d12: frames copied on the device"),

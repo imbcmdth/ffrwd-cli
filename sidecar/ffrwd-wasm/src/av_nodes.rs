@@ -1426,9 +1426,25 @@ impl AvFilter {
             FrameData::Gpu(_) => READ_BACK,
         });
         let bytes = data.bytes().map_err(|e| anyhow!("{}: {e}", self.name))?;
+        self.settle()?;
         self.filter
             .send(self.input.pix_fmt, pts, duration, &bytes)
             .map_err(|e| anyhow!("{}: {e}", self.name))
+    }
+
+    /// Waits until the graph has run everything it was given, where it
+    /// runs on the process's device: before it is handed the next picture.
+    #[cfg(all(feature = "gpu", windows))]
+    fn settle(&self) -> Result<()> {
+        match &self.feed {
+            Some(feed) => feed.settle().map_err(|e| anyhow!("{}: {e:#}", self.name)),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(not(all(feature = "gpu", windows)))]
+    fn settle(&self) -> Result<()> {
+        Ok(())
     }
 
     /// The frame copied on the device into one of the graph's pictures and
@@ -1455,6 +1471,7 @@ impl AvFilter {
             .map_err(|e| anyhow!("{name}: {e}"))?;
         feed.feed(frame, self.yuv.unwrap_or(Yuv::DEFAULT), &mut picture)
             .map_err(|e| anyhow!("{name}: copying a frame into the graph's: {e:#}"))?;
+        feed.settle().map_err(|e| anyhow!("{name}: {e:#}"))?;
         self.filter
             .send_picture(picture, pts, duration)
             .map_err(|e| anyhow!("{name}: {e}"))?;

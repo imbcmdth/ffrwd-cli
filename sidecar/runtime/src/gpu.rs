@@ -175,6 +175,14 @@ mod enabled {
             force_fallback_adapter: false,
             compatible_surface: None,
         };
+        #[cfg(windows)]
+        let validating = wgpu_types::InstanceDescriptor::new_without_display_handle_from_env()
+            .flags
+            .contains(wgpu_types::InstanceFlags::VALIDATION);
+        #[cfg(windows)]
+        if validating {
+            super::d3d12::quiet_queue_validation();
+        }
         let mut found = None;
         for backends in PREFERENCE {
             match instance.request_adapter(&options, *backends, None) {
@@ -208,6 +216,10 @@ mod enabled {
             }
         };
         eprintln!("[gpu] device: {} ({:?})", info.name, info.backend);
+        #[cfg(windows)]
+        if validating && info.backend == wgpu_types::Backend::Dx12 {
+            super::d3d12::report_debug_layer(instance, device);
+        }
         Some(Arc::new(SharedDevice {
             adapter: Arc::new(adapter),
             device,
