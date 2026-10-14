@@ -2366,6 +2366,27 @@ on the device.
   bound twice". A model file two builds share is bound once; different
   files under one name are bound per module with `-nn-for`.
 
+- The `scale_d3d12` test in `gpu_frames` failed 14 of 20 quiet runs and 18
+  of 20 loaded, on the base code too. The cause is FFmpeg 9.0's
+  `scale_d3d12`: it resets its one command allocator for the next picture
+  while the GPU may still be executing the last (upstream issue 24483,
+  fixed after 9.0 by b227d1e4be; `deinterlace_d3d12` had the same bug,
+  fixed by 7bc357691081; neither is on `release/9.0`). D3D12's debug
+  layer, which wgpu turns on in every debug build, reports the reset and
+  removes the device; release builds run the same undefined behaviour
+  silently. ffmpeg 9.0.1 alone reproduces it 5 of 5 with
+  `-init_hw_device d3d12va=d:,debug=1`. The host now waits on the CPU for
+  the filter's sync object before handing it the next picture (0.3 ms a
+  frame at 1080p, 14%); with validation on it also turns off the debug
+  layer's synchronized command queue validation, which corrupted its own
+  heap on 9 to 14 of 30 runs with four workers, and prints every other
+  debug-layer error. The test now runs with `WGPU_VALIDATION=1` and
+  refuses any such line: 20 of 20 quiet and 20 of 20 loaded after, and
+  10 of 10 failures with the wait alone switched off. The compiler keeps
+  mapping `scale` onto `scale_d3d12`. The proper fix is to backport the
+  two upstream commits into ffrwd-av's build, after which the wait can go
+  for builds that carry them.
+
 Still open from that work: encoders feeding a packet sink that joined the
 region are not told a colour; a video stream that starts after its
 file's start keeps pre-roll pictures the edit list hides; ffv1 does not

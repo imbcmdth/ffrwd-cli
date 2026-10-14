@@ -255,6 +255,17 @@ writes and writes a texture of its pool again without waiting on anyone,
 so a picture taken from the graph is kept until the device has finished
 reading it rather than handed back by a signal, and a frame is copied
 into the source only once the filter has finished with what it read
-before. `deinterlace_d3d12` does not run on NVIDIA's driver: creating its
+before. FFmpeg 9.0's `scale_d3d12` records every picture with one command
+allocator and resets it for the next picture without waiting for the GPU
+to finish the last, which D3D12's debug layer reports and answers by
+removing the device (fixed upstream after 9.0 by b227d1e4be; ffrwd-av
+v1.2.0 does not carry it). So before the host hands the graph a picture,
+it waits on the CPU until the filter's sync object has reached the last
+picture it took from it, about 0.3 ms a frame at 1080p. Where wgpu's
+validation is on (a debug build, or `WGPU_VALIDATION`), the host turns
+off the debug layer's synchronized command queue validation, which
+corrupts its own heap under several queues, and writes every other
+debug-layer error to stderr as `[gpu] D3D12 debug layer: ...`.
+`deinterlace_d3d12` does not run on NVIDIA's driver: creating its
 video processor removes the device (0x887A0005), ffmpeg's own command
 line included.
