@@ -2742,6 +2742,40 @@ def test_a_source_read_by_a_region_in_host_memory_and_by_ffmpeg_crosses_raw(
     assert feeder[feeder.index("-c:0") + 1] == "rawvideo"
 
 
+def test_a_source_read_on_the_gpu_and_in_host_memory_in_one_region_is_split_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`box` holds the input on the GPU and `spot` reads it in host memory,
+    both in one region, so the two legs leave ffmpeg in different formats:
+    the GPU leg as the input's packets, mapped from the input and decoded
+    once in the region, and the host leg raw, out of the split ffmpeg keeps
+    for it. The NUT's clock is moved for both, as the region takes the
+    offset off both."""
+    plan = _plan(
+        "COPY (SELECT ring(box(f.video[1]), spot(f.video[1])), f.audio[1] "
+        "FROM input('f.mp4') f) TO 'out.ts'",
+        monkeypatch,
+    )
+    argv = _shown(plan)
+    (region,) = plan.sidecars
+    (feeder,) = {edge.source for edge in plan.stream_edges if edge.target == region.id}
+    graph = argv[region.id][argv[region.id].index("-filter_complex") + 1].split(";")
+    decodes = [step for step in graph if "decode=" in step]
+    assert decodes == ["[0:v]decode=format=rgba:hw=auto[decode0]"]
+    assert any(re.match(r"\[v=decode0\]box", step) for step in graph)
+    assert any(re.match(r"\[v=0:v:1\]spot", step) for step in graph)
+    words = argv[feeder]
+    split = re.fullmatch(r"\[0:v:0\]split=1(\[\w+\])", words[words.index("-filter_complex") + 1])
+    assert split is not None
+    maps = [words[i + 1] for i, word in enumerate(words) if word == "-map"]
+    assert maps == ["0:v:0", split.group(1)]
+    assert words[words.index("-c:0") + 1] == "copy"
+    assert words[words.index("-c:1") + 1] == "rawvideo"
+    assert words[words.index("-pix_fmt:1") + 1] == "yuv420p"
+    assert words[words.index("-avoid_negative_ts") + 1] == "disabled"
+    assert words[words.index("-output_ts_offset") + 1] == "1001"
+
+
 def test_a_filter_on_a_split_copy_of_an_input_runs_on_the_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1642,6 +1642,72 @@ def test_a_picture_the_region_decodes_is_told_the_sources_colour(tmp_path: Path)
     }
 
 
+# -- one input read as packets on the GPU and raw in host memory --------------
+
+_GPU_BOX = _built(_SIDECAR_MODULES, "gpu_box")
+
+
+def test_an_input_read_on_the_gpu_and_raw_in_one_region_reaches_both(tmp_path: Path) -> None:
+    """One input read by `gpu_box`, which holds it on the GPU, and by a
+    `colour_probe` reading it as yuv420p in host memory, in one region: the
+    GPU leg crosses as the input's packets and is decoded once in the
+    region, the other crosses raw, and both readings see every picture at
+    the input's own times."""
+    for module in (_COLOUR_PROBE, _GPU_BOX):
+        if not module.exists():
+            pytest.skip(f"module missing: {module}")
+    source = tmp_path / "in.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=10",
+            "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+        ],
+        check=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    out_path = tmp_path / "colour.ndjson"
+    colour = "STRUCT(pix_fmt text, range text, primaries text, trc text, space text)[]"
+    compiled = compile_all(
+        f"CREATE FUNCTION colour_probe(v video_stream, pix_fmt text DEFAULT 'yuv420p',\n"
+        f"                             seen {colour} DEFAULT NULL)\n"
+        f"RETURNS {colour}\n"
+        f"  AS '{_COLOUR_PROBE.as_posix()}', 'colour_probe' LANGUAGE wasm;\n"
+        "CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu',\n"
+        "                        size number DEFAULT 8) RETURNS video_stream\n"
+        f"  AS '{_GPU_BOX.as_posix()}', 'gpu_box' LANGUAGE wasm;\n"
+        "COPY (SELECT colour_probe(f.video[1], 'yuv420p',\n"
+        "                          colour_probe(gpu_box(f.video[1]), 'rgba'))\n"
+        f"      FROM input('{source.as_posix()}') f) TO '{out_path.as_posix()}'"
+    )
+    assert compiled.plan is not None
+    (sidecar,) = compiled.plan.sidecars
+    assert sidecar.graph is not None
+    decoded = [
+        str(node.args["format"]) for node in sidecar.graph.nodes.values()
+        if node.filter == "decode"
+    ]
+    assert decoded == ["rgba"], "the region decodes the GPU leg, and only that"
+    result = execute_plan(
+        compiled.plan, sidecar_argv=wasm.sidecar_argv, overwrite=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    told = "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    if result.exit_code != 0 and "no GPU" in told:
+        pytest.skip("this machine has no GPU adapter")
+    assert result.exit_code == 0, told
+    times: dict[str, list[float]] = {}
+    for row in map(json.loads, out_path.read_text().splitlines()):
+        times.setdefault(row["pix_fmt"], []).append(row["time"])
+    assert sorted(times) == ["rgba", "yuv420p"]
+    assert len(times["yuv420p"]) == 10
+    assert times["rgba"] == times["yuv420p"]
+    assert times["yuv420p"][0] == 0
+
+
 # -- the colour an encoder in the region makes reaches the file ----------------
 
 

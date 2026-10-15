@@ -2136,3 +2136,48 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
 Pyrowave's shaders use subgroups, which wgpu's D3D12 backend offers only through DXC. The release wheel's sidecar for Windows x86_64 has DXC compiled in, so it needs nothing more. A sidecar without it, the Windows aarch64 wheel or one built with the GNU toolchains, reports `The adapter does not support the subgroups feature` and the codec refuses to open: put `dxcompiler.dll` (the Windows SDK's, or the DirectX Shader Compiler release's) on the PATH and set `WGPU_DX12_COMPILER=dxc`.
 
 `-pads` tells the encoder the format its pictures are made in on the device. Declared from `pyrowave.wasm`, the command differs only in the module, whose encoder is handed bytes, so each picture is read back once on its way in; `ffrwd run --profile` counts that under `download`. The decoder works the same way: `input('enc.nut', decoder => ffrwd.pyrowave.decode_gpu())`, read by a module holding its pictures on the GPU, decodes into textures in that module's region. Since both builds read `PYRW`, a stream whose decoder is not named is decoded by `decode`, the bytes build.
+
+## 171. One input on the GPU and in host memory, in one region
+
+A region reading one input twice, once by a module holding its pictures on the GPU and once by a module reading them in host memory in another format, takes it as two streams of one NUT. The GPU leg crosses as the input's own packets, copied from the input, and is decoded once in the region, onto the device; the other crosses raw, out of the split the ffmpeg in front keeps for it, `split=1` here. Both ride the clock offset the copied packets need, and the region takes it off both. `colour_probe` reads the input as yuv420p and says so, beside what a second `colour_probe` reads off `gpu_box`:
+
+```pgsql
+CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu', size number DEFAULT 8)
+  RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm', 'gpu_box'
+  LANGUAGE wasm;
+
+CREATE FUNCTION colour_probe(v video_stream, pix_fmt text DEFAULT 'yuv420p',
+                             seen STRUCT(pix_fmt text, range text, primaries text,
+                                         trc text, space text)[] DEFAULT NULL)
+RETURNS STRUCT(pix_fmt text, range text, primaries text, trc text, space text)[]
+  AS '../sidecar/modules/target/wasm32-wasip2/release/colour_probe.wasm', 'colour_probe'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT colour_probe(f.video[1], 'yuv420p', colour_probe(gpu_box(f.video[1]), 'rgba'))
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO 'colours.ndjson'
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex '[0:v:0]split=1[out1]' -map 0:v:0 \
+  -map '[out1]' -c:0 copy -c:1 rawvideo -avoid_negative_ts disabled -output_ts_offset \
+  1001 -pix_fmt:1 yuv420p -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": [{"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}, {"range": "unknown", "primaries": "unknown", "trc": "unknown",'\
+' "space": "unknown"}], "offset": 1001}' -gpu \
+  ../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  gpu_box=../sidecar/modules/target/wasm32-wasip2/release/gpu_box.wasm -m \
+  colour_probe=../sidecar/modules/target/wasm32-wasip2/release/colour_probe.wasm \
+  -filter_complex \
+  '[0:v]decode=format=rgba:hw=auto[decode0];'\
+'[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
+'[v=n1]colour_probe=pix_fmt=rgba[colour=n2];'\
+'[v=0:v:1][seen=n2]colour_probe=pix_fmt=yuv420p[colour=out0]' -bound \
+  'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
+  'colour_probe=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
+  'colour_probe=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},'\
+'{"input":"seen","streams":[{"rate":null}]}]' -map '[out0]' -f ndjson colours.ndjson
+```

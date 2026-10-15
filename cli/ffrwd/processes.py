@@ -4857,6 +4857,7 @@ class _Partitioner:
         self._add_rows_edges()
         self._add_rows_documents()
         self._bundle_node_edges()
+        self._offset_whole_nuts()
         self._bound_edges()
         self._mark_live_edges()
         self._check_handed_once()
@@ -4909,12 +4910,10 @@ class _Partitioner:
                 continue
             if sidecar.packet_source or sidecar.data_filter or sidecar.codec:
                 continue
-            for index, edge in enumerate(self.edges):
-                if edge.target != sidecar.id or self._reader(sidecar.id, edge.ref) is None:
-                    continue
+            for index in self._packet_legs(sidecar.id):
+                edge = self.edges[index]
                 wire = edge.format
-                if not isinstance(wire, VideoFormat) or not self._decodable(edge):
-                    continue
+                assert isinstance(wire, VideoFormat)
                 self.decodes.setdefault(sidecar.id, {})[edge.ref] = wire.pix_fmt
                 if on_the_gpu:
                     self.decoded_on_device.add(sidecar.id)
@@ -4941,6 +4940,30 @@ class _Partitioner:
                     self.encode_delays.get(sidecar.id, 0), held
                 )
                 self.edges[index] = replace(edge, format=replace(wire, codec=COPY_CODEC))
+
+    def _packet_legs(self, target: str) -> list[int]:
+        """The indices of the edges into region `target` that cross as an
+        input's packets: each decodable edge, but of several split legs of one
+        input only one, the first read by a node holding its picture on the
+        GPU, else the first. The other legs cross raw."""
+
+        def on_the_gpu(edge: StreamEdge) -> bool:
+            reader = self._reader(target, edge.ref)
+            return reader is not None and self._holds_on_the_gpu(
+                self._past_split(target, reader) or reader
+            )
+
+        chosen: dict[FrameRef, int] = {}
+        for index, edge in enumerate(self.edges):
+            if edge.target != target or self._reader(target, edge.ref) is None:
+                continue
+            if not self._decodable(edge):
+                continue
+            source = self._past_splits(edge.ref)
+            first = chosen.get(source)
+            if first is None or (on_the_gpu(edge) and not on_the_gpu(self.edges[first])):
+                chosen[source] = index
+        return sorted(chosen.values())
 
     def _code_cuts(self) -> None:
         """Code each picture a cut hands from one sidecar to another with the
@@ -5197,6 +5220,31 @@ class _Partitioner:
                 continue
             if edge.source in nodes or edge.target in nodes:
                 self.edges[index] = replace(edge, nut=f"{edge.source}>{edge.target}")
+
+    def _offset_whole_nuts(self) -> None:
+        """Give every picture riding a NUT with a copied input's packets the
+        clock options those carry.
+
+        The offset is the muxer's, so it moves every stream of the NUT, and
+        the region reading it takes it off every stream. Said on one picture
+        and not another, the two would disagree and ffmpeg be told neither.
+        """
+        coded = {
+            edge.nut
+            for edge in self.edges
+            if edge.nut
+            and isinstance(edge.format, VideoFormat)
+            and dict(edge.format.options).get("output_ts_offset") == CODED_CLOCK_OFFSET
+        }
+        for index, edge in enumerate(self.edges):
+            wire = edge.format
+            if edge.nut not in coded or not isinstance(wire, VideoFormat):
+                continue
+            missing = tuple(item for item in _CODED_CLOCK if item[0] not in dict(wire.options))
+            if missing:
+                self.edges[index] = replace(
+                    edge, format=replace(wire, options=(*wire.options, *missing))
+                )
 
     def _add_data_read(self, source: str, target: str, ref: FrameRef, depth: int) -> None:
         """One more reader of the data stream `ref`, which sidecar `source` writes.
@@ -6304,11 +6352,19 @@ class _Partitioner:
 
         A split read once here dissolves: its consumer reads the split's own
         input instead. One read several times keeps a split that size, its
-        surviving pads renumbered. One read not at all is dropped. Returns the
+        surviving pads renumbered. One read not at all is dropped. A split
+        whose one read pad is a pipe beside one copying the split's input
+        keeps that pad, so the NUT does not map the input twice. Returns the
         node ids that remain, the splits that changed size, and the
         substitution the payload's refs need.
         """
         read = self._split_pads(process)
+        nut_of = {edge.ref: edge.nut for edge in self.edges if edge.source == process.id}
+        copied: set[tuple[FrameRef, str]] = set()
+        for ref in process.pipes:
+            source = self._copied_leg(process, ref)
+            if source is not None:
+                copied.add((source, nut_of.get(ref, "")))
         keep: list[str] = []
         resized: dict[str, Node] = {}
         dissolved: dict[FrameRef, FrameRef] = {}
@@ -6333,8 +6389,11 @@ class _Partitioner:
                 keep.append(name)
                 continue
             if len(pads) == 1:
-                dissolved[next(iter(pads.values()))] = undissolve(node.inputs[0])
-                continue
+                only = next(iter(pads.values()))
+                source = undissolve(node.inputs[0])
+                if only not in process.pipes or (source, nut_of.get(only, "")) not in copied:
+                    dissolved[only] = source
+                    continue
             keep.append(name)
             for new_pad, old_pad in enumerate(sorted(pads)):
                 ref = pads[old_pad]

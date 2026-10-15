@@ -464,9 +464,13 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   decoding the input for itself and another region taking the packets
   as well. Where one process opens the input for every reader, as for a
   live input, it copies the packets onto the region's pipe from the
-  input and splits the input only among the others. Recipes
-  [157](examples.md#157-a-module-holding-its-frames-on-the-gpu-takes-the-packets)
-  and [169](examples.md#169-one-input-in-a-region-on-the-gpu-and-in-ffmpeg).
+  input and splits the input only among the others. A node of the region
+  reading the input in host memory in another format than the GPU's
+  takes it raw beside the packets, in the same NUT, out of a split ffmpeg
+  keeps for it. Recipes
+  [157](examples.md#157-a-module-holding-its-frames-on-the-gpu-takes-the-packets),
+  [169](examples.md#169-one-input-in-a-region-on-the-gpu-and-in-ffmpeg)
+  and [171](examples.md#171-one-input-on-the-gpu-and-in-host-memory-in-one-region).
   Recipe [155](examples.md#155-decode-and-encode-inside-the-sidecar);
   `sidecar/AV-EDGE.md` has the sidecar side.
 - A **filter between pictures on the sidecar's device** runs there
