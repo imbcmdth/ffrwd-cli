@@ -54,7 +54,8 @@ the pixels of is refused.
 
 says the input's clock runs that many seconds ahead of its source's, as
 the ffmpeg copying a stream's packets for `decode` writes it; every time
-the input carries is read with it taken off.
+the input carries is read with it taken off. A stream whose first time is
+less than half the offset was written without it, and is refused.
 
 ## Nodes
 

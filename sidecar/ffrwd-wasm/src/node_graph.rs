@@ -429,10 +429,20 @@ fn pump(
         if !read[index] {
             return Ok(true);
         }
-        packet.pts -= ahead[index];
-        packet.dts = packet.dts.map(|dts| dts - ahead[index]);
         let def = &defs[index];
         let number = counts[index];
+        // A stream written with the offset starts near it, one written
+        // without it near zero, where every picture would land before zero.
+        if number == 0 && packet.pts < ahead[index] / 2 {
+            bail!(
+                "{}: its first time is {:.3} s, and -pad says the input's clock runs {offset} s \
+                 ahead of its source's: the input was written without that offset",
+                def.spelling,
+                packet.pts as f64 * def.base.num as f64 / def.base.den.max(1) as f64,
+            );
+        }
+        packet.pts -= ahead[index];
+        packet.dts = packet.dts.map(|dts| dts - ahead[index]);
         counts[index] += 1;
         running = match &def.format {
             StreamFormat::Video(_) | StreamFormat::Audio(_) => {

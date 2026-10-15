@@ -18,12 +18,14 @@ the format the module between them reads.
 The copying ffmpeg writes the packets 1001 seconds ahead of its own clock
 for the input, with `-output_ts_offset 1001 -avoid_negative_ts disabled`,
 and the sidecar is told so on that input's `-pad` (`"offset": 1001`) and
-takes it off as it reads. NUT cannot carry a time below zero, and without
-the offset the muxer would move the whole input later instead: two frames
-for an mp4 with B-frames, more for one cut away from a keyframe, whose edit
-list starts on a picture before zero. `decode` drops every picture before
-zero, as ffmpeg's own decode drops what an edit list hides, so the region's
-pictures carry the times ffmpeg's decode of the input gives.
+takes it off as it reads. The offset is the whole file's, so a raw stream
+written on the same pipe, a producer's clock say, carries it too. NUT
+cannot carry a time below zero, and without the offset the muxer would
+move the whole input later instead: two frames for an mp4 with B-frames,
+more for one cut away from a keyframe, whose edit list starts on a picture
+before zero. `decode` drops every picture before zero, as ffmpeg's own
+decode drops what an edit list hides, so the region's pictures carry the
+times ffmpeg's decode of the input gives.
 
 The NUT the copying ffmpeg writes carries none of the input's colour, so
 the same `-pad` says the colour the input was probed in (`"color"`,

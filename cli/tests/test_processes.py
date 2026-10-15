@@ -3099,10 +3099,17 @@ def test_a_filtered_picture_beside_a_coded_one_stays_raw_with_its_colour() -> No
     raw = entering["n0"]
     assert isinstance(raw, VideoFormat)
     assert (raw.codec, raw.pix_fmt) == (RAWVIDEO, "yuv420p")
-    sidecar = plan_argv(plan, sidecar_argv=wasm.shown_argv)[region.id]
+    argv = plan_argv(plan, sidecar_argv=wasm.shown_argv)
+    sidecar = argv[region.id]
     # Each picture is told its own colour: the coded one the source's, which
     # its decoded pictures carry, and the raw one what reached the pipe.
     tv = {"range": "tv", "primaries": "bt709", "trc": "bt709", "space": "bt709"}
     assert _pad_of(sidecar) == {"color": [tv, tv], "offset": CODED_CLOCK_OFFSET}
+    # Both cross on one pipe, whose ffmpeg writes the offset the pad says for
+    # the whole file, the raw picture's times included.
+    (feeder,) = {e.source for e in plan.stream_edges if e.target == region.id}
+    written = argv[feeder]
+    assert written[written.index("-avoid_negative_ts") + 1] == "disabled"
+    assert written[written.index("-output_ts_offset") + 1] == str(CODED_CLOCK_OFFSET)
     network = sidecar[sidecar.index("-filter_complex") + 1]
     assert network.startswith("[0:v]decode=format=rgba[decode0];[v=decode0][over=0:v:1]compose")

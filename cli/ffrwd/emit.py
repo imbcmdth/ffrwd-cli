@@ -1088,7 +1088,9 @@ def _bundle_options(
     """The sink options writing every stream one edge carries.
 
     Streams of one kind share an option where they agree on it; where they
-    differ it is given per track, in map order, as a WITH list is.
+    differ it is given per track, in map order, as a WITH list is. An option
+    of the whole file is never per track: one stream giving it gives it for
+    the file.
     """
     written: dict[str, object] = {}
     kinds: dict[type, list[dict[str, object]]] = {}
@@ -1099,8 +1101,16 @@ def _bundle_options(
     for tracks in kinds.values():
         for key in dict.fromkeys(key for options in tracks for key in options):
             values = [options.get(key) for options in tracks]
-            if any(value != values[0] for value in values):
+            if all(value == values[0] for value in values):
+                continue
+            spec = option_spec(key)
+            if spec is None or spec.per_stream:
                 written[key] = values
+                continue
+            given = [value for value in values if value is not None]
+            if any(value != given[0] for value in given):
+                raise _internal(f"the streams of one edge disagree on {key!r}: {given}")
+            written[key] = given[0]
     return written
 
 

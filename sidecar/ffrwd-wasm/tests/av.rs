@@ -554,6 +554,10 @@ fn built_modules() {
                 "shape-switch",
                 "-p",
                 "colour-probe",
+                "-p",
+                "quiet-rows",
+                "-p",
+                "burn",
             ])
             .current_dir(sidecar_root().join("modules"))
             .output()
@@ -855,6 +859,103 @@ fn decode_hands_its_pictures_the_colour_the_pad_gives_the_stream() {
             }
         }
     }
+}
+
+#[test]
+fn a_reader_of_a_silent_producers_rows_takes_every_frame_under_the_pad_offset() {
+    let test = "a_reader_of_a_silent_producers_rows_takes_every_frame_under_the_pad_offset";
+    let Some(dir) = libav_and_ffmpeg(test) else {
+        return;
+    };
+    let carried = scratch("silent_rows_carried.nut");
+    let unshifted = scratch("silent_rows_unshifted.nut");
+    let out = scratch("silent_rows_out.nut");
+    let text = |path: &Path| path.to_str().expect("UTF-8").to_string();
+    // One input carrying the picture twice, as the ffmpeg feeding a region
+    // writes it: raw for the producer's clock and as packets for `decode`.
+    let write = |path: &Path, clock: &[&str]| {
+        run_ok(
+            Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-i"])
+                .arg(fixture())
+                .args([
+                    "-filter_complex",
+                    "[0:v:0]format=pix_fmts=yuv420p[raw]",
+                    "-map",
+                    "[raw]",
+                    "-map",
+                    "0:v:0",
+                    "-c:0",
+                    "rawvideo",
+                    "-c:1",
+                    "copy",
+                ])
+                .args(clock)
+                .args(["-f", "nut"])
+                .arg(path)
+                .stdin(Stdio::null()),
+            "ffmpeg",
+        )
+    };
+    write(
+        &carried,
+        &[
+            "-avoid_negative_ts",
+            "disabled",
+            "-output_ts_offset",
+            "1001",
+        ],
+    );
+    write(&unshifted, &[]);
+    let quiet = module("quiet_rows");
+    let burn = module("burn");
+    let run = |input: &Path| {
+        sidecar(
+            &[
+                "-f",
+                "nut",
+                "-i",
+                &text(input),
+                "-pad",
+                r#"{"offset": 1001}"#,
+                "-m",
+                &quiet,
+                "-m",
+                &burn,
+                "-filter_complex",
+                "[0:v:1]decode=format=rgba[d];[v=0:v]quiet_rows[cues=n1];\
+                 [v=d][words=n1]burn[v=out0]",
+                "-map",
+                "[out0]",
+                "-f",
+                "nut",
+                &text(&out),
+            ],
+            Some(&dir),
+        )
+    };
+
+    let output = run(&carried);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let (_, frames) = demux(&out);
+    let pictures = ffmpeg_rawvideo(&fixture()).len() / (64 * 48 * 3 / 2);
+    assert_eq!(frames.len(), pictures, "every picture reaches the reader");
+    assert!(
+        frames.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "in time order"
+    );
+
+    // The same input written without the offset the pad says it carries.
+    let output = run(&unshifted);
+    for path in [&carried, &unshifted, &out] {
+        let _ = std::fs::remove_file(path);
+    }
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "refused:\n{stderr}");
+    assert!(
+        stderr.contains("the input was written without that offset"),
+        "{stderr}"
+    );
 }
 
 /// `path` decoded by ffmpeg to rgba, its YUV read in `matrix`, limited

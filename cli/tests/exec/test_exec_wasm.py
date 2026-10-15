@@ -1815,3 +1815,50 @@ def test_a_file_an_encoder_in_the_region_writes_says_the_colour_it_was_made_in(
         ours, theirs = _rgb24(out_path), _rgb24(source, negate=True)
         assert len(ours) == len(theirs)
         assert sum(abs(a - b) for a, b in zip(ours, theirs, strict=True)) / len(ours) < 4
+
+
+# -- a producer's rows beside a picture the region decodes ---------------------
+
+# ffrwd/blitz's build, from a checkout beside this one.
+_BLITZ = _REPO_ROOT.parent / "ffrwd-package-blitz"
+_COMPOSE = _built(_BLITZ, "compose")
+_EMIT_CHANGES = _built(_BLITZ, "emit_changes")
+
+
+def test_a_reader_of_a_producers_rows_takes_every_frame_of_a_picture_decoded_beside_it(
+    tmp_path: Path,
+) -> None:
+    """blitz's `compose` reads the programme's packets, decoded in the
+    region, and change rows from `emit_changes`, whose clock is the same
+    input's raw picture. Both cross on one pipe, whose ffmpeg writes them
+    ahead of its clock by the offset the sidecar takes off. A producer that
+    writes no rows still lets every frame through."""
+    for module in (_COMPOSE, _EMIT_CHANGES):
+        if not module.exists():
+            pytest.skip(f"module missing: {module}")
+    out_path = tmp_path / "composed.mkv"
+    changes = 'STRUCT(at number, "select" text, change text, text text, html text)'
+    compiled = compile_all(
+        f"CREATE FUNCTION emit_changes(v video_stream, emit text) RETURNS {changes}[]\n"
+        f"  AS '{_EMIT_CHANGES.as_posix()}', 'emit_changes' LANGUAGE wasm;\n"
+        f"CREATE FUNCTION compose(v video_stream, changes {changes}[][] DEFAULT NULL,\n"
+        "                        html text DEFAULT '') RETURNS video_stream\n"
+        f"  AS '{_COMPOSE.as_posix()}', 'compose' LANGUAGE wasm;\n"
+        "COPY (SELECT compose(f.video[1],\n"
+        "                     changes => emit_changes(ffmpeg.format(f.video[1], 'yuv420p'),\n"
+        "                                             emit => '[]'),\n"
+        "                     html => '<img src=\"ffrwd:0\">')\n"
+        f"      FROM input('{_SOURCE.as_posix()}') f)\n"
+        f"TO '{out_path.as_posix()}' WITH (video_codec 'ffv1')"
+    )
+    assert compiled.plan is not None
+    result = execute_plan(
+        compiled.plan, sidecar_argv=wasm.sidecar_argv, overwrite=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.exit_code == 0, "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    assert _video_stream(out_path)["nb_read_frames"] == _video_stream(_SOURCE)["nb_read_frames"]
