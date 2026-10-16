@@ -64,7 +64,12 @@ place of `ffrwd:av`'s `encode` and `decode`, which still serve elsewhere.
 `sidecar/modules/testcodec`, built as `testcodec_gpu`, is such a module.
 
 A module's `request-device` is answered with the sidecar's one device,
-and a feature that device lacks is refused. On Windows the device is
+and a feature that device lacks is refused. The device is on the adapter
+wgpu picks for high performance, unless `-gpu-adapter` or
+`FFRWD_GPU_ADAPTER` names another (`sidecar/NODE-CLI.md`, "The GPU
+adapter"); a module's `request-adapter` answers that adapter whatever it
+asks for, and the decoder, the encoders and the filters that hold
+pictures on the GPU use the same device. On Windows the device is
 D3D12, whose `subgroups` need DXC: the release wheel's sidecar for
 Windows x86_64 has it compiled in, and any other build needs
 `dxcompiler.dll` (the Windows SDK's, or the DirectX Shader Compiler

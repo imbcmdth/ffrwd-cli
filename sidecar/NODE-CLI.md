@@ -433,6 +433,45 @@ tick that held them.
   rate the first stream bound to that port states in its header, or at
   its time base's inverse where it states none.
 
+## The GPU adapter
+
+    ffrwd-wasm ... -gpu-adapter <spec>
+
+names the adapter the process's one GPU device is opened on: the device
+the modules granted `-gpu` are handed, a decoder holding its pictures on
+the GPU decodes onto, the encoders read from and `filter` runs on.
+`<spec>` is a zero-based index into the list `--gpu-info` prints, or a
+case-insensitive part of an adapter's name (`radeon`, `4090`); digits
+past the end of the list are read as a name. A name is looked for in the
+preferred backend first (D3D12 on Windows, Metal on macOS, Vulkan
+elsewhere), so `4090` is the D3D12 adapter where Vulkan reports the same
+card; a name two adapters of that backend share is refused, and an index
+names either. `FFRWD_GPU_ADAPTER` says the same where the flag is absent.
+With neither, the device is on the adapter wgpu picks for high
+performance, which `--gpu-info` marks `default`.
+
+A spec naming no one adapter ends the run, exit 2, when the device is
+first opened, with one line naming the spec and the adapters there are:
+
+    ffrwd-wasm: -gpu-adapter radeon: no adapter's name contains 'radeon'; the adapters are 0 NVIDIA GeForce RTX 4090 (dx12), 1 Microsoft Basic Render Driver (dx12), 2 NVIDIA GeForce RTX 4090 (vulkan); `ffrwd-wasm --gpu-info` lists them
+
+No other adapter is opened in its place. A run that never opens the
+device does not read the spec.
+
+    ffrwd-wasm --gpu-info [-gpu-adapter <spec>]
+
+prints one JSON line listing the adapters in the order an index counts
+them, and opens none:
+
+    {"adapters":[{"backend":"dx12","default":true,"device":9860,"index":0,"name":"NVIDIA GeForce RTX 4090","type":"discrete","vendor":4318},{"backend":"dx12","default":false,"device":140,"index":1,"name":"Microsoft Basic Render Driver","type":"software","vendor":5140},{"backend":"vulkan","default":false,"device":9860,"index":2,"name":"NVIDIA GeForce RTX 4090","type":"discrete","vendor":4318}]}
+
+`type` is `discrete`, `integrated`, `virtual`, `software` (WARP,
+lavapipe) or `other`; `vendor` and `device` are the backend's ids for
+the adapter, the PCI ids on D3D12 and Vulkan. Given a spec, or with
+`FFRWD_GPU_ADAPTER` set, it adds `spec`, `chosen` (the index the spec
+names, or null) and `refused` (the line a run would end with, or null).
+`WGPU_BACKEND` narrows the list as it narrows what a run opens.
+
 ## `-profile`
 
     ffrwd-wasm ... -profile

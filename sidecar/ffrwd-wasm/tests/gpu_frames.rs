@@ -103,9 +103,28 @@ fn run(memory: &str, jobs: &str, frames: &[Vec<u8>]) -> Output {
 
 /// `run` with `extra` ahead of the inputs.
 fn run_with(memory: &str, jobs: &str, frames: &[Vec<u8>], extra: &[&str]) -> Output {
+    run_in(memory, jobs, frames, extra, None)
+}
+
+/// The environment variable naming the adapter when the argv does not.
+const ADAPTER_VAR: &str = "FFRWD_GPU_ADAPTER";
+
+/// `run_with`, with [`ADAPTER_VAR`] set to `adapter` or, for None, unset.
+fn run_in(
+    memory: &str,
+    jobs: &str,
+    frames: &[Vec<u8>],
+    extra: &[&str],
+    adapter: Option<&str>,
+) -> Output {
     let module = module();
     let wiring = format!("[v=0:v]gpu_box=memory={memory}:size={SIDE}[out=o]");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"));
+    match adapter {
+        Some(spec) => command.env(ADAPTER_VAR, spec),
+        None => command.env_remove(ADAPTER_VAR),
+    };
+    let mut child = command
         .args(extra)
         .args(["-gpu", &module, "-jobs", jobs, "-f", "nut", "-i", "-", "-m"])
         .arg(format!("gpu_box={module}"))
@@ -243,6 +262,197 @@ fn frames_held_on_the_gpu_come_back_with_the_same_box() {
     assert_eq!(got, host, "the GPU path writes what the host path writes");
     let again = frames_of(&run("gpu", "4", &frames), "gpu_box on the GPU at -jobs 4");
     assert_eq!(got, again, "-jobs 1 and -jobs 4 write the same bytes");
+}
+
+/// What `--gpu-info` lists on this machine, None where it lists nothing
+/// (and [`GPU_REQUIRED`] does not say there is something).
+fn adapters() -> Option<Vec<serde_json::Value>> {
+    let output = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .arg("--gpu-info")
+        .env_remove(ADAPTER_VAR)
+        .output()
+        .expect("spawn ffrwd-wasm --gpu-info");
+    assert!(
+        output.status.success(),
+        "--gpu-info exited {:?}:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).expect("one JSON line");
+    let listed = info["adapters"]
+        .as_array()
+        .expect("a list of adapters")
+        .clone();
+    let required = std::env::var_os(GPU_REQUIRED).is_some_and(|v| !v.is_empty());
+    assert!(
+        !(listed.is_empty() && required),
+        "{GPU_REQUIRED} is set, and --gpu-info lists no adapter"
+    );
+    (!listed.is_empty()).then_some(listed)
+}
+
+/// The adapter a run's `[gpu] device:` line names, as `<name> (<Backend>)`.
+fn device_line(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("[gpu] device: "))
+        .unwrap_or_else(|| panic!("no [gpu] device: line on stderr:\n{stderr}"))
+        .to_string()
+}
+
+/// How the `[gpu] device:` line names `adapter`: wgpu's Debug spelling of
+/// its backend.
+fn named_as(adapter: &serde_json::Value) -> String {
+    let backend = match adapter["backend"].as_str().expect("a backend") {
+        "dx12" => "Dx12",
+        "vulkan" => "Vulkan",
+        "metal" => "Metal",
+        "gl" => "Gl",
+        other => panic!("a backend wgpu does not name: {other}"),
+    };
+    format!("{} ({backend})", adapter["name"].as_str().expect("a name"))
+}
+
+#[test]
+fn gpu_info_lists_each_adapter_and_marks_the_one_opened_by_default() {
+    let Some(listed) = adapters() else {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    };
+    let rank = |kind: &str| match kind {
+        "discrete" => 1,
+        "integrated" => 2,
+        "other" => 3,
+        "virtual" => 4,
+        "software" => 5,
+        other => panic!("a type --gpu-info does not spell: {other}"),
+    };
+    for (index, adapter) in listed.iter().enumerate() {
+        assert_eq!(adapter["index"], index, "{adapter}");
+        assert!(
+            adapter["vendor"].is_u64() && adapter["device"].is_u64(),
+            "{adapter}"
+        );
+        rank(adapter["type"].as_str().expect("a type"));
+    }
+    let defaults: Vec<&serde_json::Value> =
+        listed.iter().filter(|a| a["default"] == true).collect();
+    let [default] = defaults[..] else {
+        panic!("one adapter is the default: {listed:?}");
+    };
+    // The best kind the first backend has, the first of it where several are.
+    let first = &listed[0]["backend"];
+    let best = listed
+        .iter()
+        .filter(|a| &a["backend"] == first)
+        .min_by_key(|a| rank(a["type"].as_str().unwrap()))
+        .unwrap();
+    assert_eq!(default, best, "{listed:?}");
+
+    let frames: Vec<Vec<u8>> = (0..2u8).map(picture).collect();
+    let output = run("gpu", "1", &frames);
+    assert_eq!(device_line(&output), named_as(default));
+}
+
+#[test]
+fn an_adapter_named_by_index_or_by_name_is_the_one_opened() {
+    let Some(listed) = adapters() else {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    };
+    let frames: Vec<Vec<u8>> = (0..3u8).map(picture).collect();
+    let host = frames_of(&run("host", "1", &frames), "gpu_box in host memory");
+    for adapter in &listed {
+        let index = adapter["index"].to_string();
+        let output = run_with("gpu", "1", &frames, &["-gpu-adapter", &index]);
+        assert_eq!(
+            device_line(&output),
+            named_as(adapter),
+            "-gpu-adapter {index}"
+        );
+        assert_eq!(frames_of(&output, &named_as(adapter)), host);
+    }
+    // A name in another case names the first backend's adapter of that name.
+    let first = &listed[0];
+    let name = first["name"].as_str().unwrap().to_uppercase();
+    let alone = listed
+        .iter()
+        .filter(|a| a["backend"] == first["backend"] && a["name"] == first["name"])
+        .count()
+        == 1;
+    if alone {
+        let output = run_with("gpu", "1", &frames, &["-gpu-adapter", &name]);
+        assert_eq!(device_line(&output), named_as(first), "-gpu-adapter {name}");
+        let output = run_in("gpu", "1", &frames, &[], Some(&name));
+        assert_eq!(
+            device_line(&output),
+            named_as(first),
+            "{ADAPTER_VAR}={name}"
+        );
+    }
+}
+
+#[test]
+fn a_software_adapter_named_runs_the_module_on_itself() {
+    let Some(listed) = adapters() else {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    };
+    let Some(software) = listed.iter().find(|a| a["type"] == "software") else {
+        eprintln!("skipped: this machine lists no software adapter");
+        return;
+    };
+    let name = software["name"].as_str().unwrap();
+    let frames: Vec<Vec<u8>> = (0..3u8).map(picture).collect();
+    let output = run_with("gpu", "1", &frames, &["-gpu-adapter", name]);
+    assert_eq!(device_line(&output), named_as(software));
+    let got = frames_of(&output, name);
+    assert_eq!(got.len(), 3);
+    for (index, (_, data)) in got.iter().enumerate() {
+        assert_eq!(*data, boxed(index as u8), "frame {index} on {name}");
+    }
+}
+
+#[test]
+fn an_adapter_spec_naming_none_ends_the_run_rather_than_open_another() {
+    if adapters().is_none() {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    let frames: Vec<Vec<u8>> = (0..2u8).map(picture).collect();
+    let hint = "`ffrwd-wasm --gpu-info` lists them";
+    for (output, said) in [
+        (
+            run_with("gpu", "1", &frames, &["-gpu-adapter", "no such card"]),
+            "ffrwd-wasm: -gpu-adapter no such card: no adapter's name contains 'no such card'; \
+             the adapters are 0 ",
+        ),
+        (
+            run_with("gpu", "1", &frames, &["-gpu-adapter", "987654321"]),
+            "ffrwd-wasm: -gpu-adapter 987654321: there is no adapter 987654321, they are \
+             numbered from 0 to ",
+        ),
+        (
+            run_in("gpu", "1", &frames, &[], Some("no such card")),
+            "ffrwd-wasm: FFRWD_GPU_ADAPTER=no such card: no adapter's name contains",
+        ),
+    ] {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains(said) && stderr.contains(hint), "{stderr}");
+        assert!(!stderr.contains("[gpu] device:"), "{stderr}");
+        assert!(output.stdout.is_empty(), "nothing is written");
+    }
+    // The flag replaces the variable.
+    let output = run_in(
+        "gpu",
+        "1",
+        &frames,
+        &["-gpu-adapter", "0"],
+        Some("no such card"),
+    );
+    assert_eq!(frames_of(&output, "-gpu-adapter 0").len(), 2);
 }
 
 // A decoder on the process's own device: `decode` with `hw=d3d12va` on

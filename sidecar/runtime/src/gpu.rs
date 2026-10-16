@@ -19,11 +19,15 @@
 //! backend is the platform's own, D3D12 on Windows, Metal on macOS, Vulkan
 //! elsewhere, since every decoder there writes that API's images;
 //! `WGPU_BACKEND` (wgpu's own variable, a comma list such as `vulkan` or
-//! `dx12`) narrows what is tried.
+//! `dx12`) narrows what is tried. The adapter is the one wgpu picks for a
+//! high-performance request, unless `-gpu-adapter` or `FFRWD_GPU_ADAPTER`
+//! names another ([`adapters`]); the decoder, the encoders and the filters
+//! that share the device move with it.
 
 use anyhow::Result;
 use wasmtime::component::{Component, Linker};
 
+pub mod adapters;
 #[cfg(feature = "gpu")]
 mod convert;
 #[cfg(all(feature = "gpu", windows))]
@@ -83,6 +87,8 @@ mod enabled {
 
     use wasi_webgpu_wasmtime::reexports::{wgpu_core, wgpu_types};
     use wasi_webgpu_wasmtime::SharedDevice;
+
+    use super::adapters::{self, Kind, Listed, Refusal, Spec};
 
     /// A store's GPU: the wgpu instance its module's calls go to, and the
     /// process's device when the module is granted one.
@@ -165,16 +171,100 @@ mod enabled {
             | wgpu_types::Features::TEXTURE_FORMAT_NV12
     }
 
-    /// Opens the process's device on the first adapter a preferred backend
-    /// finds. None when the machine has no adapter at all, which every
-    /// caller treats as "no GPU".
-    fn open_device() -> Option<Arc<SharedDevice>> {
+    /// The adapter `-gpu-adapter` or `FFRWD_GPU_ADAPTER` names, set before
+    /// anything opens the device.
+    static SPEC: OnceLock<Spec> = OnceLock::new();
+
+    fn kind(device_type: wgpu_types::DeviceType) -> Kind {
+        match device_type {
+            wgpu_types::DeviceType::DiscreteGpu => Kind::Discrete,
+            wgpu_types::DeviceType::IntegratedGpu => Kind::Integrated,
+            wgpu_types::DeviceType::VirtualGpu => Kind::Virtual,
+            wgpu_types::DeviceType::Cpu => Kind::Software,
+            wgpu_types::DeviceType::Other => Kind::Other,
+        }
+    }
+
+    /// Every adapter of each preferred backend, in the order
+    /// [`adapters`] lists them, each with its id on the shared instance.
+    fn enumerate() -> Vec<(wgpu_core::id::AdapterId, Listed)> {
         let instance = shared();
+        let mut found = Vec::new();
+        for backends in PREFERENCE {
+            for id in instance.enumerate_adapters(*backends) {
+                let info = instance.adapter_get_info(id);
+                found.push((
+                    id,
+                    Listed {
+                        name: info.name,
+                        backend: info.backend.to_str(),
+                        vendor: info.vendor,
+                        device: info.device,
+                        kind: kind(info.device_type),
+                    },
+                ));
+            }
+        }
+        found
+    }
+
+    /// The adapters `--gpu-info` lists.
+    pub fn list_adapters() -> Vec<Listed> {
+        enumerate()
+            .into_iter()
+            .map(|(id, listed)| {
+                shared().adapter_drop(id);
+                listed
+            })
+            .collect()
+    }
+
+    /// Names the adapter the process's device is opened on. Nothing is
+    /// enumerated until the device is first wanted, so a run that never
+    /// opens it pays nothing for the spec.
+    pub fn choose_adapter(spec: Spec) {
+        let _ = SPEC.set(spec);
+    }
+
+    /// The adapter `spec` names, the others dropped.
+    fn named(spec: &Spec) -> Result<wgpu_core::id::AdapterId, Refusal> {
+        let found = enumerate();
+        let list: Vec<Listed> = found.iter().map(|(_, listed)| listed.clone()).collect();
+        let chosen = adapters::resolve(spec, &list);
+        for (index, (id, _)) in found.iter().enumerate() {
+            if chosen.as_ref().ok() != Some(&index) {
+                shared().adapter_drop(*id);
+            }
+        }
+        chosen.map(|index| found[index].0)
+    }
+
+    /// The first adapter a preferred backend finds for a high-performance
+    /// request.
+    fn requested() -> Option<wgpu_core::id::AdapterId> {
         let options = wgpu_types::RequestAdapterOptions {
             power_preference: wgpu_types::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: None,
         };
+        for backends in PREFERENCE {
+            match shared().request_adapter(&options, *backends, None) {
+                Ok(adapter) => return Some(adapter),
+                Err(wgpu_types::RequestAdapterError::NotFound { .. }) => continue,
+                Err(e) => {
+                    eprintln!("[gpu] asking for an adapter: {e}");
+                    continue;
+                }
+            }
+        }
+        None
+    }
+
+    /// Opens the process's device on the adapter a spec names, else on the
+    /// first adapter a preferred backend finds. None when the machine has
+    /// no adapter at all, which every caller treats as "no GPU".
+    fn open_device() -> Option<Arc<SharedDevice>> {
+        let instance = shared();
         #[cfg(windows)]
         let validating = wgpu_types::InstanceDescriptor::new_without_display_handle_from_env()
             .flags
@@ -183,21 +273,16 @@ mod enabled {
         if validating {
             super::d3d12::quiet_queue_validation();
         }
-        let mut found = None;
-        for backends in PREFERENCE {
-            match instance.request_adapter(&options, *backends, None) {
-                Ok(adapter) => {
-                    found = Some(adapter);
-                    break;
-                }
-                Err(wgpu_types::RequestAdapterError::NotFound { .. }) => continue,
-                Err(e) => {
-                    eprintln!("[gpu] asking for an adapter: {e}");
-                    continue;
-                }
-            }
-        }
-        let adapter = found?;
+        let adapter = match SPEC.get() {
+            // A spec naming no one adapter ends the run: falling back to
+            // another device, or to none, would run somewhere it did not
+            // ask for.
+            Some(spec) => named(spec).unwrap_or_else(|refusal| {
+                eprintln!("ffrwd-wasm: {refusal}");
+                std::process::exit(2);
+            }),
+            None => requested()?,
+        };
         let features = instance.adapter_features(adapter) & wanted_features();
         let limits = instance.adapter_limits(adapter);
         let info = instance.adapter_get_info(adapter);
@@ -255,7 +340,7 @@ mod enabled {
 }
 
 #[cfg(feature = "gpu")]
-pub use enabled::{shared, shared_device, StoreGpu};
+pub use enabled::{choose_adapter, list_adapters, shared, shared_device, StoreGpu};
 
 /// A build without the `gpu` feature holds nothing per store.
 #[cfg(not(feature = "gpu"))]
@@ -267,6 +352,17 @@ impl StoreGpu {
         StoreGpu
     }
 }
+
+/// A build without the `gpu` feature has no adapter to list.
+#[cfg(not(feature = "gpu"))]
+pub fn list_adapters() -> Vec<adapters::Listed> {
+    Vec::new()
+}
+
+/// A build without the `gpu` feature opens no device, so a spec chooses
+/// nothing.
+#[cfg(not(feature = "gpu"))]
+pub fn choose_adapter(_spec: adapters::Spec) {}
 
 /// Adds `wasi:webgpu` (and the `wasi:graphics-context` its types name) to a
 /// linker whose store data hands out a webgpu view.

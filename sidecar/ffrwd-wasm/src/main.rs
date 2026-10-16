@@ -47,6 +47,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
+use ffrwd_wasm_runtime::gpu::adapters as gpu_adapters;
 use ffrwd_wasm_runtime::profile::PROFILE;
 use ffrwd_wasm_runtime::runtime::{
     self, AudioFormat, Filter, Format, Frame, Media, StreamInfo, TimeBase, VideoFormat,
@@ -776,6 +777,64 @@ fn take_grant_args(argv: Vec<String>) -> Result<Vec<String>> {
         }
     }
     Ok(rest)
+}
+
+/// Takes `-gpu-adapter <spec>` out of the argv and leaves the rest: the
+/// adapter the process's device is opened on, by its index in the list
+/// `--gpu-info` prints or by a case-insensitive part of its name. Read
+/// before the argv is dispatched, the way the grants are.
+fn take_gpu_adapter_args(argv: Vec<String>) -> Result<(Option<String>, Vec<String>)> {
+    let mut spec = None;
+    let mut rest = Vec::with_capacity(argv.len());
+    let mut it = argv.into_iter();
+    while let Some(arg) = it.next() {
+        if arg == gpu_adapters::ADAPTER_FLAG {
+            let value = it
+                .next()
+                .ok_or_else(|| anyhow!("{} requires a value", gpu_adapters::ADAPTER_FLAG))?;
+            spec = Some(value);
+        } else {
+            rest.push(arg);
+        }
+    }
+    Ok((spec, rest))
+}
+
+/// What `--gpu-info` prints: every adapter the device could be opened on,
+/// which one it is by default, and, where `-gpu-adapter` or
+/// `FFRWD_GPU_ADAPTER` names one, which that is or why it is refused.
+fn gpu_info(spec: Option<&gpu_adapters::Spec>) -> serde_json::Value {
+    let listed = ffrwd_wasm_runtime::gpu::list_adapters();
+    let default = gpu_adapters::default_index(&listed);
+    let adapters: Vec<serde_json::Value> = listed
+        .iter()
+        .enumerate()
+        .map(|(index, one)| {
+            serde_json::json!({
+                "index": index,
+                "name": one.name,
+                "backend": one.backend,
+                "vendor": one.vendor,
+                "device": one.device,
+                "type": one.kind.label(),
+                "default": default == Some(index),
+            })
+        })
+        .collect();
+    let mut info = serde_json::json!({ "adapters": adapters });
+    if let Some(spec) = spec {
+        let (chosen, refused) = match gpu_adapters::resolve(spec, &listed) {
+            Ok(index) => (serde_json::json!(index), serde_json::Value::Null),
+            Err(refusal) => (
+                serde_json::Value::Null,
+                serde_json::json!(refusal.to_string()),
+            ),
+        };
+        info["spec"] = serde_json::json!(spec.raw);
+        info["chosen"] = chosen;
+        info["refused"] = refused;
+    }
+    info
 }
 
 fn parse_args(argv: Vec<String>) -> Result<Args> {
@@ -4220,6 +4279,22 @@ fn main() {
         exit(0);
     }
 
+    // The adapters the process's device could be opened on. It opens none,
+    // so it answers whatever a spec says, naming a refused one.
+    if argv.first().map(String::as_str) == Some("--gpu-info") {
+        match take_gpu_adapter_args(argv[1..].to_vec()) {
+            Ok((flag, _)) => {
+                let spec = gpu_adapters::Spec::given(flag);
+                println!("{}", gpu_info(spec.as_ref()));
+                exit(0);
+            }
+            Err(e) => {
+                eprintln!("ffrwd-wasm: {e:#}");
+                exit(2);
+            }
+        }
+    }
+
     // The relay runs no module, so it reads none of the flags a module run
     // takes, and its edges arrive on stdin rather than argv.
     if argv.first().map(String::as_str) == Some("relay") {
@@ -4257,6 +4332,21 @@ fn main() {
     // device where a module is granted one.
     let raw_args = match take_grant_args(raw_args) {
         Ok(rest) => rest,
+        Err(e) => {
+            eprintln!("ffrwd-wasm: {e:#}");
+            exit(2);
+        }
+    };
+
+    // The adapter is named before anything opens the device; a spec naming
+    // no one adapter ends the run when the device is first wanted.
+    let raw_args = match take_gpu_adapter_args(raw_args) {
+        Ok((flag, rest)) => {
+            if let Some(spec) = gpu_adapters::Spec::given(flag) {
+                ffrwd_wasm_runtime::gpu::choose_adapter(spec);
+            }
+            rest
+        }
         Err(e) => {
             eprintln!("ffrwd-wasm: {e:#}");
             exit(2);
