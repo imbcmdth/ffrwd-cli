@@ -130,6 +130,13 @@ Subcommands:
   such block. It exists for the printed ``loudnorm2`` command line, which
   pipes pass 1 into it.
 
+``compile`` and ``run`` take ``--gpu-adapter SPEC``, the GPU adapter every
+sidecar opens its device on: an index into the list ``ffrwd setup gpu``
+prints, or a case-insensitive part of the adapter's name. Absent, it is
+`FFRWD_GPU_ADAPTER`'s, and with neither the sidecar opens the adapter it
+always has and the command is unchanged. ``setup gpu`` downloads nothing: it
+prints the adapters the sidecar lists, and which one a run opens.
+
 ``compile``/``explain``/``validate``/``run`` take the query as SQL TEXT on
 the command line. ``-f/--file PATH`` reads it from a file instead (``-f -``
 reads stdin, e.g. for the LLM repair loop's pipe). Exactly one of the two is
@@ -196,6 +203,7 @@ from . import (
     binaries,
     credentials,
     diagram,
+    gpu,
     loudnorm,
     nn,
     redact,
@@ -363,7 +371,8 @@ def main(argv: list[str] | None = None) -> int:
     # twice (the table-query fallback), and the reader wants each warning once.
     warnings = WarningLog()
     try:
-        return handler(args, warnings)
+        with gpu.chosen(getattr(args, "gpu_adapter", None)):
+            return handler(args, warnings)
     except FfrwdError as err:
         # A refusal raised outside a command's own handling -- FFRWD_OFFLINE
         # refusing the ffmpeg provider's download wherever ffmpeg is first
@@ -466,6 +475,35 @@ def _add_profile_argument(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("--profile", action="store_true", help=_PROFILE_HELP)
 
 
+_GPU_ADAPTER_HELP = (
+    f"the GPU adapter every sidecar opens its device on: its index in `{gpu.SETUP_COMMAND}`'s "
+    f"list, or part of its name (default: ${gpu.ADAPTER_VAR}, else the sidecar's own choice)"
+)
+
+
+def _add_gpu_adapter_argument(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument(
+        "--gpu-adapter",
+        default=None,
+        metavar="SPEC",
+        dest="gpu_adapter",
+        help=_GPU_ADAPTER_HELP,
+    )
+
+
+def _check_gpu_adapter(args: argparse.Namespace) -> int:
+    """0 unless an adapter was named for a remote run, which runs on the
+    runner's own; 2 with the usage error printed."""
+    if getattr(args, "gpu_adapter", None) is None or not args.remote:
+        return 0
+    print(
+        f"error: {args.command}: --gpu-adapter names an adapter on this machine",
+        file=sys.stderr,
+    )
+    print("hint: drop --gpu-adapter, or drop --remote", file=sys.stderr)
+    return 2
+
+
 def _check_jobs(args: argparse.Namespace) -> int:
     """0 for a usable ``--jobs``, or 2 with the usage error printed."""
     jobs: int | None = getattr(args, "jobs", None)
@@ -559,6 +597,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_jobs_argument(compile_p)
     _add_profile_argument(compile_p)
+    _add_gpu_adapter_argument(compile_p)
     explain_p = subparsers.add_parser("explain", help="dump the compiled IR graph as JSON")
     _add_query_arguments(explain_p)
     _add_quiet_argument(explain_p)
@@ -605,6 +644,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_jobs_argument(run_p)
     _add_profile_argument(run_p)
+    _add_gpu_adapter_argument(run_p)
     showing = run_p.add_mutually_exclusive_group()
     showing.add_argument(
         "--show",
@@ -796,9 +836,10 @@ def _build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument(
         "what",
         nargs="?",
-        choices=["nn"],
+        choices=["nn", "gpu"],
         help="nn: only the ONNX Runtime the modules that run models load; "
-        "omitted, ffmpeg and ffprobe too, where PATH does not have them",
+        "omitted, ffmpeg and ffprobe too, where PATH does not have them. gpu: "
+        "download nothing, and list the GPU adapters a run can name with --gpu-adapter",
     )
     setup_p.add_argument(
         "--cuda",
@@ -1663,6 +1704,9 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if code != 0:
         return code
     code = _check_target(args)
+    if code != 0:
+        return code
+    code = _check_gpu_adapter(args)
     if code != 0:
         return code
     try:
@@ -3706,6 +3750,15 @@ def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
     tier whatever detection said, either way.
     """
     console = _console(args)
+    if args.what == "gpu":
+        if args.cuda or args.full:
+            print(
+                "error: --cuda and --full choose ONNX Runtime libraries; "
+                "`ffrwd setup gpu` downloads nothing",
+                file=sys.stderr,
+            )
+            return 2
+        return _setup_gpu()
     if args.full and not args.cuda:
         print(
             "error: --full adds the libraries the CUDA provider needs; pass --cuda too",
@@ -3715,6 +3768,41 @@ def _cmd_setup(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if args.what == "nn":
         return _setup_nn(args, console)
     return _setup_all(args, console)
+
+
+def _setup_gpu() -> int:
+    """``ffrwd setup gpu``: the adapters the sidecar lists, and the one a run
+    opens, which `FFRWD_GPU_ADAPTER` decides where it is set."""
+    given = gpu.spec()
+    try:
+        found = gpu.info(given)
+    except FfrwdError as err:
+        _print_error(err)
+        return 1
+    if not found.adapters:
+        print("the sidecar finds no GPU adapter on this machine")
+        return 0
+    print(gpu.describe(found))
+    if given is None:
+        default = next((one for one in found.adapters if one.default), None)
+        if default is not None:
+            print(
+                f"a run opens {default.index}, {default.name} ({default.backend}); "
+                f"--gpu-adapter or {gpu.ADAPTER_VAR} names another"
+            )
+        return 0
+    try:
+        gpu.check()
+    except FfrwdError as err:
+        _print_error(err)
+        return 1
+    picked = found.adapters[found.chosen] if found.chosen is not None else None
+    if picked is not None:
+        print(
+            f"{gpu.ADAPTER_VAR}={given} names {picked.index}, "
+            f"{picked.name} ({picked.backend}): a run opens it"
+        )
+    return 0
 
 
 def _setup_command(args: argparse.Namespace) -> str:

@@ -34,8 +34,9 @@ class ErrorCode(str, Enum):
     OUTPUT_EXISTS = "OUTPUT_EXISTS"  # a destination file is already there, and no -y
     NOTHING_TO_SHOW = "NOTHING_TO_SHOW"  # --show/--show-only, no video-bearing output
     PLAYER_NOT_FOUND = "PLAYER_NOT_FOUND"  # --show asked for, ffplay not on PATH
-    # setup nn: no ONNX Runtime pinned for this platform; or FFRWD_OFFLINE
-    # refusing a download ffmpeg or the ONNX Runtime needs
+    # setup nn: no ONNX Runtime pinned for this platform; FFRWD_OFFLINE
+    # refusing a download ffmpeg or the ONNX Runtime needs; or a run naming a
+    # GPU adapter this machine does not have
     RUNTIME_NOT_FOUND = "RUNTIME_NOT_FOUND"
     UNBOUNDED_LIVE_INPUT = "UNBOUNDED_LIVE_INPUT"  # one-open input, uncountable paths
     LIVE_LEAD = "LIVE_LEAD"  # a live node fed later than the lead it needs

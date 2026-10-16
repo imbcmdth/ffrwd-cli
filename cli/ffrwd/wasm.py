@@ -55,7 +55,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
-from . import av, binaries, nn, probe
+from . import av, binaries, gpu, nn, probe
 from .emit import build_network_graph, build_node_network
 from .errors import ErrorCode, FfrwdError
 from .execute import STDIN, STDOUT
@@ -126,6 +126,7 @@ __all__ = [
     "model_binding",
     "model_path",
     "copy_argv",
+    "opens_device",
     "probe_source",
     "read_packet_rows",
     "rows_arms",
@@ -1047,11 +1048,14 @@ def describe(path: str) -> Described:
 def _grant_args(described: Described, path: str) -> list[str]:
     """The ``-http``/``-udp``/``-tcp``/``-gpu`` grants `described`'s own imports need
     for `path`, which :func:`invoke` and :func:`probe_source` both put ahead
-    of the flag that dispatches their call."""
+    of the flag that dispatches their call. A ``-gpu`` grant brings the
+    ``-gpu-adapter`` the run names, where it names one."""
     argv: list[str] = []
     for effect in EFFECTS:
         if getattr(described, effect):
             argv += [_GRANT_FLAGS[effect], path]
+    if described.gpu:
+        argv += gpu.spawn_args()
     return argv
 
 
@@ -1989,6 +1993,7 @@ def _argv(
     jobs: int | None = None,
     av_runtime: Sequence[str] = (),
     profile: bool = False,
+    adapter: Sequence[str] = (),
 ) -> list[str]:
     """One sidecar process as argv, run by `binary`.
 
@@ -2032,7 +2037,9 @@ def _argv(
 
     ``-http``, ``-udp``, ``-tcp`` and ``-gpu`` grant one module its effects,
     also ahead of the module table: the sidecar denies each to any module the
-    argv never names.
+    argv never names. `adapter` is the ``-gpu-adapter`` the run names, written
+    after them for a process that opens the sidecar's device
+    (:func:`opens_device`), and empty where the run names none.
 
     `reads` is one path per stream the process is handed, each written as its
     own ``-f nut -i <path>``: stdin for the ordinary one-input process, and a
@@ -2117,6 +2124,8 @@ def _argv(
     argv += list(av_runtime)
     for grant in process.grants:
         argv += [_GRANT_FLAGS[grant.effect], grant.module]
+    if opens_device(process):
+        argv += list(adapter)
     if process.codec:
         # A codec package's module may export both halves; the run says which.
         argv += [_CODEC_FLAG, process.codec]
@@ -2144,6 +2153,13 @@ def _argv(
     if process.writes_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_OUT]
     return argv
+
+
+def opens_device(process: SidecarProcess) -> bool:
+    """Whether `process` opens the sidecar's GPU device: a module granted
+    ``gpu``, or a ``decode``, ``encode`` or ``filter`` node, which work on
+    that device where the region holds its pictures there."""
+    return process.av or any(grant.effect == "gpu" for grant in process.grants)
 
 
 def _rows_in_args(process: SidecarProcess) -> list[str]:
@@ -2399,7 +2415,9 @@ def sidecar_argv(
     and what to run it on, which a printed command has no business spelling:
     the directory is under THIS machine's cache. A process decoding or
     encoding itself is told where the installed libav libraries are, by the
-    same rule.
+    same rule. A process opening the GPU device is told the adapter the run
+    names, where it names one, after the name is checked against what the
+    sidecar lists.
 
     `jobs` is the worker-thread cap the run asked for, passed to every
     sidecar; None is the default, the sidecar sizing itself to the machine.
@@ -2407,7 +2425,8 @@ def sidecar_argv(
     row when it ends.
 
     Raises ``FfrwdError`` when the sidecar is not installed -- the same
-    rejection, and the same hint, a describe gives.
+    rejection, and the same hint, a describe gives -- or when the adapter the
+    run names is not one this machine has.
     """
     binary = binaries.ffrwd_wasm_path()
     if binary is None:
@@ -2416,6 +2435,8 @@ def sidecar_argv(
             "needs it to run",
             hint=INSTALL_HINT,
         )
+    if opens_device(process):
+        gpu.check()
     return _argv(
         binary,
         process,
@@ -2425,6 +2446,7 @@ def sidecar_argv(
         jobs,
         av.spawn_args() if process.av else (),
         profile,
+        gpu.spawn_args(),
     )
 
 
@@ -2440,8 +2462,18 @@ def shown_argv(
     The same convention a printed ffmpeg command follows: what is shown is
     what a reader would type, resolved by PATH, not the absolute path this
     machine happens to have found -- and so with no runtime directory either.
+    The adapter a run names is shown, since it is the reader's choice.
     """
-    return _argv(binaries.SIDECAR_EXECUTABLE, process, reads, writes, (), jobs, profile=profile)
+    return _argv(
+        binaries.SIDECAR_EXECUTABLE,
+        process,
+        reads,
+        writes,
+        (),
+        jobs,
+        profile=profile,
+        adapter=gpu.spawn_args(),
+    )
 
 
 def model_path(module: str, export: str) -> str:

@@ -146,6 +146,15 @@ def _isolated_store(
 
 
 @pytest.fixture(autouse=True)
+def _default_gpu_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test sees the developer's `FFRWD_GPU_ADAPTER`, which would spell
+    ``-gpu-adapter`` into every pinned command holding frames on the GPU."""
+    from ffrwd import gpu
+
+    monkeypatch.delenv(gpu.ADAPTER_VAR, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _offline_registry(
     _store_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
