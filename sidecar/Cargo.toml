@@ -16,3 +16,8 @@ license = "Apache-2.0"
 # resolved.
 [patch.crates-io]
 wasmtime-wasi-nn = { path = "vendor/wasmtime-wasi-nn" }
+# mach-dxcompiler-rs, which links DXC on x86_64 MSVC, asks the GitHub API
+# whether its release is immutable. The vendored copy authenticates that
+# request with GITHUB_TOKEN when it is set, so a rate-limited runner does not
+# fail the build.
+mach-dxcompiler-rs = { path = "vendor/mach-dxcompiler-rs" }

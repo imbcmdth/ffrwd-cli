@@ -284,8 +284,13 @@ jobs:
       - name: Fetch the pinned libav libraries
         run: python sidecar/ffrwd-wasm/fetch_av.py --target ${{ matrix.target }} --os ${{ runner.os }}
 
+      # On x86_64 Windows the build links DXC, whose build script asks the
+      # GitHub API about the release it downloads; the token keeps that
+      # request off the runner's unauthenticated rate limit.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           working-directory: sidecar/ffrwd-wasm
           command: build
