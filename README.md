@@ -203,7 +203,7 @@ ffrwd [<command>] [-h] [-f FILE] [-v NAME=VALUE] [-q] [query | recipe]
 
 | command | what it does | flags |
 |---|---|---|
-| `run` | **the default**: a query with a media destination compiles and executes it; one without prints its result set as a table, psql-style, executing nothing | `--timeout SECS` (default: ten times the longest input's duration, at least 600, none when an input is live) · `-y` (overwrite) · `--jobs N` (cap the sidecar's threads) · `--profile` (each sidecar's bytes and time per stage, as a row) · `--show` / `--show-only` (below) · `--remote` (below) |
+| `run` | **the default**: a query with a media destination compiles and executes it; one without prints its result set as a table, psql-style, executing nothing | `--timeout SECS` (default: ten times the longest input's duration, at least 600, none when an input is live) · `-y` (overwrite) · `--jobs N` (cap the sidecar's threads) · `--profile` (each sidecar's bytes and time per stage, as a row) · `--gpu-adapter SPEC` (the GPU the sidecar works on, by its index in `setup gpu`'s list or part of its name; `FFRWD_GPU_ADAPTER` when absent) · `--show` / `--show-only` (below) · `--remote` (below) |
 | `compile` | print the full ffmpeg command | `--graph-only` (just the filtergraph string) |
 | `explain` | dump the compiled graph as JSON | `--mermaid` (as a flowchart) · `--diagram` (rendered in the terminal; needs `ffrwd[diagram]`) |
 | `validate` | exit 0 if the query compiles, else a line-anchored error | `--json` (machine-readable error object on stdout) |
@@ -217,6 +217,7 @@ ffrwd [<command>] [-h] [-f FILE] [-v NAME=VALUE] [-q] [query | recipe]
 | `publish` | run the package's tests, pack it, and publish it to the registry | |
 | `setup` | download everything detection wants on this machine: ffmpeg and ffprobe where PATH has none, and the ONNX Runtime tiers | `--cuda` · `--full` as below; `FFRWD_OFFLINE=1` refuses every fetch |
 | `setup nn` | download the ONNX Runtime the model-running modules need, the tiers chosen for this machine | `--cuda` · `--full` to take a tier detection did not |
+| `setup gpu` | list the GPU adapters the sidecar can work on, and the one a run uses; downloads nothing | |
 | `jobs` | list, watch, cancel or fetch your remote runs | `--watch` · `--cancel ID` · `--fetch ID` · `-y` · `--json` |
 | `prompt` | print the LLM system prompt | |
 | `mcp` | serve the compiler to an editor or agent over MCP (stdio) | `--allow-unsafe` (also expose the tools that do more than answer about a query) |

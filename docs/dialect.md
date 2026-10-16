@@ -330,7 +330,12 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   `-udp <module>`, `-tcp <module>`, `-gpu <module>`), which the compiler
   emits from the module's own describe; each is denied without it. Every
   worker of a sidecar process shares its one GPU device, so a GPU module
-  takes the same workers as any other. Secrets do not belong in the
+  takes the same workers as any other. The device is on the adapter
+  `--gpu-adapter` on `run` or `compile` names (an index in the list
+  `ffrwd setup gpu` prints, or part of the adapter's name), else
+  `FFRWD_GPU_ADAPTER`'s, else the sidecar's own choice; the compiler
+  spells `-gpu-adapter` on each sidecar that opens the device only when
+  one is named. Secrets do not belong in the
   value arguments - the query text is the command line. Recipes
   [98](examples.md#98-post-what-a-module-found-as-it-is-found),
   [99](corpus.md#99-watch-the-frames-go-by).
