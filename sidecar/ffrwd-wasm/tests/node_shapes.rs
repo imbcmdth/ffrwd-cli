@@ -327,6 +327,58 @@ fn every_instance_of_a_state_node_sees_every_row() {
 }
 
 #[test]
+fn every_instance_of_a_state_node_is_handed_each_earlier_row_at_the_time_it_arrived() {
+    // Cues every 0.25 s at 1/48000 from a producer clocked by the sound,
+    // read by a node clocked by pictures at 1/10: most cues fall between
+    // two of the reader's ticks, and none is on the reader's time base.
+    let dir = scratch("state-times");
+    let audio = Stream::audio("f32", 48000, 1).expect("f32 is carried");
+    let mut items: Vec<(usize, Write)> = Vec::new();
+    for k in 0..40i64 {
+        items.push((1, Write::Frame(k * 4800, vec![0u8; 4800 * 4])));
+        items.push((0, Write::Frame(k, vec![0u8; 16])));
+    }
+    write_nut(
+        &dir.join("in.nut"),
+        &[video(2, 2, TENTHS, (10, 1)), audio],
+        &items,
+    );
+    let input = dir.join("in.nut").display().to_string();
+    let out = at_every_jobs(
+        "state-times",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &input,
+            "-m",
+            &module("shape_window"),
+            "-m",
+            &module("shape_state"),
+            "-filter_complex",
+            "[a=0:a]shape_window=window=12000[cues=c];[v=0:v][words=c]shape_state[seen=s]",
+            "-map",
+            "[s]",
+            "-f",
+            "ndjson",
+            "{dir}/seen.ndjson",
+        ]),
+        &["seen.ndjson"],
+    );
+    let ticks = lines(&out[0]);
+    assert_eq!(ticks.len(), 40);
+    for (n, tick) in ticks.iter().enumerate() {
+        // Cue k starts at k * 0.25 s and lands on tick floor(2.5 k).
+        let cues = (2 * n + 1) / 5;
+        assert_eq!(
+            (tick["seen"].as_u64(), tick["newest"].as_f64()),
+            (Some(cues as u64 + 1), Some(cues as f64 * 0.25)),
+            "tick {n}"
+        );
+    }
+}
+
+#[test]
 fn an_output_sized_by_the_params_is_redrawn_at_that_size() {
     let dir = scratch("canvas");
     let picture = |k: i64| -> Vec<u8> {

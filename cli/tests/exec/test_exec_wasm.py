@@ -1825,6 +1825,31 @@ _COMPOSE = _built(_BLITZ, "compose")
 _EMIT_CHANGES = _built(_BLITZ, "emit_changes")
 
 
+def _composed_changes(
+    emit: str, html: str, out_path: Path, source: Path = _SOURCE
+) -> Compiled:
+    """blitz's `compose` over `source`'s picture, decoded in the region,
+    reading on `changes` the rows `emit_changes` writes from `emit`, clocked
+    by the same input's raw picture."""
+    for module in (_COMPOSE, _EMIT_CHANGES):
+        if not module.exists():
+            pytest.skip(f"module missing: {module}")
+    changes = 'STRUCT(at number, "select" text, change text, text text, html text)'
+    return compile_all(
+        f"CREATE FUNCTION emit_changes(v video_stream, emit text) RETURNS {changes}[]\n"
+        f"  AS '{_EMIT_CHANGES.as_posix()}', 'emit_changes' LANGUAGE wasm;\n"
+        f"CREATE FUNCTION compose(v video_stream, changes {changes}[][] DEFAULT NULL,\n"
+        "                        html text DEFAULT '') RETURNS video_stream\n"
+        f"  AS '{_COMPOSE.as_posix()}', 'compose' LANGUAGE wasm;\n"
+        "COPY (SELECT compose(f.video[1],\n"
+        "                     changes => emit_changes(ffmpeg.format(f.video[1], 'yuv420p'),\n"
+        f"                                             emit => '{emit}'),\n"
+        f"                     html => '{html}')\n"
+        f"      FROM input('{source.as_posix()}') f)\n"
+        f"TO '{out_path.as_posix()}' WITH (video_codec 'ffv1')"
+    )
+
+
 def test_a_reader_of_a_producers_rows_takes_every_frame_of_a_picture_decoded_beside_it(
     tmp_path: Path,
 ) -> None:
@@ -1833,24 +1858,8 @@ def test_a_reader_of_a_producers_rows_takes_every_frame_of_a_picture_decoded_bes
     input's raw picture. Both cross on one pipe, whose ffmpeg writes them
     ahead of its clock by the offset the sidecar takes off. A producer that
     writes no rows still lets every frame through."""
-    for module in (_COMPOSE, _EMIT_CHANGES):
-        if not module.exists():
-            pytest.skip(f"module missing: {module}")
     out_path = tmp_path / "composed.mkv"
-    changes = 'STRUCT(at number, "select" text, change text, text text, html text)'
-    compiled = compile_all(
-        f"CREATE FUNCTION emit_changes(v video_stream, emit text) RETURNS {changes}[]\n"
-        f"  AS '{_EMIT_CHANGES.as_posix()}', 'emit_changes' LANGUAGE wasm;\n"
-        f"CREATE FUNCTION compose(v video_stream, changes {changes}[][] DEFAULT NULL,\n"
-        "                        html text DEFAULT '') RETURNS video_stream\n"
-        f"  AS '{_COMPOSE.as_posix()}', 'compose' LANGUAGE wasm;\n"
-        "COPY (SELECT compose(f.video[1],\n"
-        "                     changes => emit_changes(ffmpeg.format(f.video[1], 'yuv420p'),\n"
-        "                                             emit => '[]'),\n"
-        "                     html => '<img src=\"ffrwd:0\">')\n"
-        f"      FROM input('{_SOURCE.as_posix()}') f)\n"
-        f"TO '{out_path.as_posix()}' WITH (video_codec 'ffv1')"
-    )
+    compiled = _composed_changes("[]", '<img src="ffrwd:0">', out_path)
     assert compiled.plan is not None
     result = execute_plan(
         compiled.plan, sidecar_argv=wasm.sidecar_argv, overwrite=True,
@@ -1862,3 +1871,57 @@ def test_a_reader_of_a_producers_rows_takes_every_frame_of_a_picture_decoded_bes
         for member in stage.members
     )
     assert _video_stream(out_path)["nb_read_frames"] == _video_stream(_SOURCE)["nb_read_frames"]
+
+
+def test_a_document_folding_a_producers_rows_is_the_same_at_any_worker_count(
+    tmp_path: Path,
+) -> None:
+    """Rows from `emit_changes`, clocked by the input's raw picture, drive
+    blitz's document over the picture the region decodes from MPEG-TS, a
+    clock on another time base. Spread over the default workers, every
+    frame is the one `--jobs 1` makes: an instance is handed the rows of the
+    ticks it did not render at the times they arrived."""
+    source = tmp_path / "in.ts"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30",
+            "-t", "4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+        ],
+        check=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    emit = json.dumps([
+        [0.3 * k, [{"select": "#n", "text": f"row {k}"},
+                   {"select": "#box", "change": f"~c{k % 3}"}]]
+        for k in range(1, 13)
+    ])
+    html = (
+        "<style>body{margin:0;font-family:sans-serif;color:#fff}"
+        "#v{position:absolute;width:100vw;height:100vh}"
+        "#n{position:absolute;left:8px;top:8px;font-size:40px;background:#123}"
+        "#box{position:absolute;right:8px;bottom:8px;width:60px;height:60px}"
+        "#box.c0{background:#a00}#box.c1{background:#0a0}#box.c2{background:#00a}</style>"
+        '<img id="v" src="ffrwd:0"><div id="n"></div><div id="box"></div>'
+    )
+    frames: dict[int | None, list[str]] = {}
+    for jobs in (1, None):
+        out_path = tmp_path / f"composed-{jobs}.mkv"
+        compiled = _composed_changes(emit, html, out_path, source)
+        assert compiled.plan is not None
+        result = execute_plan(
+            compiled.plan,
+            sidecar_argv=functools.partial(wasm.sidecar_argv, jobs=jobs),
+            overwrite=True,
+            timeout=_SUBPROCESS_TIMEOUT,
+        )
+        assert result.exit_code == 0, "\n".join(
+            f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+            for stage in result.stages
+            for member in stage.members
+        )
+        frames[jobs] = _stream_md5(out_path, 0)
+    assert len(frames[1]) == int(str(_video_stream(source)["nb_read_frames"]))
+    assert len(set(frames[1])) > 1, "the rows change the document"
+    differ = [n for n, (one, many) in enumerate(zip(frames[1], frames[None], strict=True))
+              if one != many]
+    assert not differ, f"frames {differ} differ from --jobs 1's"

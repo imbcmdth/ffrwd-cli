@@ -1,7 +1,9 @@
 //! A picture clock and words read by interval and kept as state: every tick
 //! says how many words this instance has seen, its own and those of the
-//! ticks it did not process, so a count that matches the serial run's at
-//! every worker count is the host handing each instance its earlier rows.
+//! ticks it did not process, and when the newest of them arrived, read in
+//! the words' time base. A count and a time that match the serial run's at
+//! every worker count are the host handing each instance its earlier rows,
+//! each at the time it arrived.
 
 // Every shape module carries the same few helpers, and not every one uses
 // each of them.
@@ -143,11 +145,17 @@ const SCHEMA: &str = r#"{"type":"object","properties":{"latency":{"type":"number
 
 struct State {
     words: Option<u32>,
+    /// The words' time base.
+    base: (i32, i32),
     seen: u64,
+    /// When the newest word arrived, in the words' time base.
+    newest: Option<i64>,
 }
 
 thread_local! {
-    static STATE: RefCell<State> = const { RefCell::new(State { words: None, seen: 0 }) };
+    static STATE: RefCell<State> = const {
+        RefCell::new(State { words: None, base: (1, 1), seen: 0, newest: None })
+    };
 }
 
 struct Node;
@@ -184,8 +192,14 @@ impl Guest for Node {
     }
 
     fn init(bound: Vec<BoundStream>, _latched: Vec<String>, _params: String) -> Result<(), String> {
-        let words = bound_ids(&bound, "words").first().copied();
-        STATE.with(|s| *s.borrow_mut() = State { words, seen: 0 });
+        let words = bound.iter().find(|b| b.port == "words");
+        let state = State {
+            words: words.map(|b| b.id),
+            base: words.map_or((1, 1), |b| (b.info.time_base.num, b.info.time_base.den)),
+            seen: 0,
+            newest: None,
+        };
+        STATE.with(|s| *s.borrow_mut() = state);
         Ok(())
     }
 
@@ -196,21 +210,27 @@ impl Guest for Node {
     fn process(tick: &Tick) -> Result<Emitted, String> {
         STATE.with(|s| {
             let mut state = s.borrow_mut();
-            let (earlier, now) = match state.words {
-                Some(id) => (
-                    tick.earlier_rows(id)
-                        .iter()
-                        .map(|r| r.rows.len() as u64)
-                        .sum::<u64>(),
-                    tick.messages(id).len() as u64,
-                ),
-                None => (0, 0),
-            };
-            state.seen += earlier + now;
+            let mut now = 0;
+            if let Some(id) = state.words {
+                for rows in tick.earlier_rows(id) {
+                    state.seen += rows.rows.len() as u64;
+                    state.newest = Some(rows.pts);
+                }
+                for m in tick.messages(id) {
+                    now += 1;
+                    state.seen += 1;
+                    state.newest = Some(m.pts);
+                }
+            }
+            let (num, den) = state.base;
+            let newest = state
+                .newest
+                .map(|pts| pts as f64 * f64::from(num) / f64::from(den));
             let item = message(
                 "seen",
                 tick.pts(),
-                json!({"pts": tick.pts(), "seen": state.seen, "now": now, "last": tick.last()}),
+                json!({"pts": tick.pts(), "seen": state.seen, "now": now, "newest": newest,
+                       "last": tick.last()}),
             );
             Ok(emitted(vec![item], false))
         })

@@ -660,7 +660,8 @@ interface node-tick {
 
     /// For an input whose `rows` is `state`: the rows of every tick this
     /// instance did not process since its previous call, oldest first,
-    /// each beside the pts it arrived at, all earlier than this call's. An
+    /// each beside the pts it arrived at in its stream's time base (a
+    /// message's, or the frame's it rode), all earlier than this call's. An
     /// instance's first call is handed every one before it. A data input's
     /// rows are its messages. Empty on every other input.
     earlier-rows: func(id: u32) -> list<timed-rows>;

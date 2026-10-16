@@ -415,7 +415,8 @@ tick that held them.
 - **Lanes.** A pure node runs on as many workers as `-jobs` allows, its
   results put back in tick order before they leave. A pure node with a
   state input opens every instance before its first tick, and each
-  instance is handed the rows of the ticks it did not process. Any other
+  instance is handed the rows of the ticks it did not process, each at
+  the pts it arrived at in its stream's time base. Any other
   node runs one tick at a time.
 - **Finishing.** A node that says it is finished gets its last call on the
   instance that said so, and its outputs end; a rate clock with inputs

@@ -291,8 +291,10 @@ impl DataDrive {
 }
 
 /// The rows a state input's instance is owed: those of every tick it did
-/// not process since its previous call, oldest first. A frame-parallel
-/// node's instances each see every row, whichever ticks they were handed.
+/// not process since its previous call, oldest first, each at the pts it
+/// arrived at in its stream's time base, as the instance that processed the
+/// tick was handed it. A frame-parallel node's instances each see every row
+/// at the same time, whichever ticks they were handed.
 #[derive(Default)]
 pub struct EarlierRows {
     /// Per stream id, every tick's rows, by tick number.
@@ -302,15 +304,14 @@ pub struct EarlierRows {
 }
 
 impl EarlierRows {
-    /// The rows stream `id` brought at tick `number`, at `pts`.
-    pub fn record(&mut self, id: u32, number: u64, pts: i64, rows: Vec<String>) {
-        if rows.is_empty() {
-            return;
-        }
-        self.ticks
-            .entry(id)
-            .or_default()
-            .push((number, TimedRows { pts, rows }));
+    /// The rows stream `id` brought at tick `number`.
+    pub fn record(&mut self, id: u32, number: u64, rows: Vec<TimedRows>) {
+        let ticks = self.ticks.entry(id).or_default();
+        ticks.extend(
+            rows.into_iter()
+                .filter(|r| !r.rows.is_empty())
+                .map(|r| (number, r)),
+        );
     }
 
     /// What `instance`, about to process tick `number`, is owed on stream
@@ -1126,18 +1127,21 @@ impl Assembler {
             if !state {
                 continue;
             }
-            let rows: Vec<String> = stream
-                .frames
+            // Each row at its own pts in the stream's time base, in the
+            // order the node reads them: messages, then the rows on frames.
+            let rows: Vec<TimedRows> = stream
+                .messages
                 .iter()
-                .flat_map(|f| f.rows.iter().cloned())
-                .chain(
-                    stream
-                        .messages
-                        .iter()
-                        .map(|m| String::from_utf8_lossy(&m.data).into_owned()),
-                )
+                .map(|m| TimedRows {
+                    pts: m.pts,
+                    rows: vec![String::from_utf8_lossy(&m.data).into_owned()],
+                })
+                .chain(stream.frames.iter().map(|f| TimedRows {
+                    pts: f.pts,
+                    rows: f.rows.clone(),
+                }))
                 .collect();
-            self.earlier.record(stream.id, number, pts, rows);
+            self.earlier.record(stream.id, number, rows);
         }
         Tick {
             pts,
@@ -2124,7 +2128,11 @@ mod tests {
     fn earlier_rows_are_what_an_instance_missed() {
         let mut earlier = EarlierRows::default();
         for n in 0..4u64 {
-            earlier.record(1, n, n as i64 * 10, vec![format!("r{n}")]);
+            let rows = TimedRows {
+                pts: n as i64 * 10,
+                rows: vec![format!("r{n}")],
+            };
+            earlier.record(1, n, vec![rows]);
         }
         assert!(earlier.owed(0, 1, 0).is_empty());
         earlier.processed(0, 0);
