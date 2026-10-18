@@ -291,7 +291,8 @@ def test_nothing_changes_without_a_hardware_encoder_or_a_hwaccel_or_the_filters(
 def test_the_vulkan_family_sends_a_picture_up_again_before_its_encoder() -> None:
     """The flips have Vulkan variants and ride the card; `pad` has none, so
     the picture comes down for it and, the encoder reading only the card's
-    frames, goes up again ahead of the file."""
+    frames, goes up again ahead of the file. `hwupload` makes no device of
+    its own, so the command names one for the filtergraph."""
     g = _graph(
         [
             _node("n1", "hflip", {}, ["src:f:v:0"]),
@@ -302,7 +303,14 @@ def test_the_vulkan_family_sends_a_picture_up_again_before_its_encoder() -> None
         options={"f": {"hwaccel": "vulkan"}},
     )
     kept = keep_on_the_card(g, _reference(), _FILM)
-    assert kept.input_options == {"f": {"hwaccel": "vulkan", "hwaccel_output_format": "vulkan"}}
+    assert kept.input_options == {
+        "f": {
+            "init_hw_device": "vulkan=up",
+            "filter_hw_device": "up",
+            "hwaccel": "vulkan",
+            "hwaccel_output_format": "vulkan",
+        }
+    }
     assert _filters(kept) == [
         ("n1", "hflip_vulkan", {}, ["src:f:v:0"]),
         ("n2", "scale_vulkan", {"w": 1280, "h": -2}, ["n1"]),

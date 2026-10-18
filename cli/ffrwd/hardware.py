@@ -124,6 +124,9 @@ _FAMILIES: tuple[_Family, ...] = (
         # encoder refuses.
         codec_sw_formats={"hevc": {"yuv444p": "yuv444p", "yuvj444p": "yuv444p"}},
     ),
+    # Vulkan. `hwupload` makes no device of its own here either: ffmpeg
+    # refuses it ("A hardware device reference is required to upload frames
+    # to") unless the command names one.
     _Family(
         hwaccels=frozenset({"vulkan"}),
         output_format="vulkan",
@@ -131,7 +134,7 @@ _FAMILIES: tuple[_Family, ...] = (
         filter_suffix="_vulkan",
         upload="hwupload",
         encoder_needs_device=True,
-        upload_device="",
+        upload_device="vulkan",
         variants={
             "scale": {"width": "w", "height": "h", "w": "w", "h": "h"},
             "overlay": _same("x", "y"),
