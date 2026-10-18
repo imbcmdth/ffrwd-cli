@@ -385,11 +385,23 @@ fn open_every_instance(spec: &mut LaneSpec, width: usize) -> Result<()> {
 }
 
 impl State {
-    fn room(&self, consumers: &[Consumer]) -> bool {
+    /// Whether everything in `consumers`, the readers of `stream`, takes
+    /// more of it. A self-clocked reader is cut a task at a time, each
+    /// taking one arrival an input, so what waits for it is the arrivals
+    /// queued on its input, which count against the same bound as a task
+    /// queue: without that, a decoder ahead of a slower encoder would queue
+    /// every picture it made.
+    fn room(&self, stream: u32, consumers: &[Consumer]) -> bool {
         consumers.iter().all(|c| match c {
             Consumer::Lane(j) => {
                 let lane = &self.lanes[*j];
-                lane.stopped || lane.queue.len() < self.cap
+                let queued = match (&lane.clock, &lane.intake) {
+                    (ClockKind::SelfClocked, LaneIntake::Assembled(a)) => {
+                        a.queued(stream).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                lane.stopped || (lane.queue.len() < self.cap && queued < self.cap)
             }
             Consumer::Writer(w, _) => self.writers[*w].len() < self.cap,
         })
@@ -798,7 +810,7 @@ impl State {
                 let room = if lane.unbuffered {
                     self.drained(consumers)
                 } else {
-                    self.room(consumers)
+                    self.room(stream, consumers)
                 };
                 if !room {
                     return false;
@@ -1264,11 +1276,10 @@ impl Scheduler {
             if state.error.is_some() || state.finished {
                 return false;
             }
-            let mut consumers = state.consumers(stream);
-            for mirror in state.mirrors(stream) {
-                consumers.extend(state.consumers(mirror));
-            }
-            if state.room(&consumers) {
+            let room = std::iter::once(stream)
+                .chain(state.mirrors(stream))
+                .all(|s| state.room(s, &state.consumers(s)));
+            if room {
                 break;
             }
             state = self

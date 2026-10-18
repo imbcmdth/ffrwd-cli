@@ -903,6 +903,12 @@ impl Assembler {
         group.port_fed().then(|| group.room())
     }
 
+    /// How many arrivals on the input bound to stream `id` wait to be
+    /// handed over; None where no input is bound to it.
+    pub fn queued(&self, id: u32) -> Option<usize> {
+        Some(self.inputs.iter().find(|i| i.id == id)?.queue.len())
+    }
+
     /// How many more frames the hold input bound to stream `id` takes before
     /// its buffer is full, whoever feeds it; None where `id` is not held.
     pub fn held_room(&self, id: u32) -> Option<usize> {
