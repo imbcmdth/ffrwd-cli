@@ -1947,44 +1947,44 @@ playout cards are not measured: there is no card here.
 
 ## What needs the L4
 
-Everything below is Linux on an NVIDIA card, which this work could not
-run; each item names what it takes, and the notes above have the detail.
+Everything below is Linux on an NVIDIA card. Items 1, 2 and 7 have run on
+foundmeat's GTX 1050 (2026-10-18), and the "Linux" section at the end has
+what was found; each item still names what it takes on the L4 itself.
 
-1. **The Vulkan decoder into the pool** (wave 3 items 3 and 5): the shared
-   Vulkan device opened with the video-decode extensions and a decode
-   queue family through wgpu-hal's raw open; `AVVulkanDeviceContext` filled
-   from it; `AVVkFrame`'s image, layout and timeline semaphore read; a wait
-   on the semaphore through a raw submit, since wgpu-core's submit takes
-   none; the `VkImage` wrapped as `G8_B8R8_2PLANE_420`. A `gpu/vulkan.rs`
-   beside `gpu/d3d12.rs` and an `av::Shared::Vulkan` beside the D3D12 one.
-   What this means today was seen on foundmeat's GTX 1050 box (Ubuntu
-   26.04, driver 580, 2026-10-18): a held 1080p60 H.264 feed decodes on
-   the CPU, NVDEC idle, the compose sidecar at 2.6 to 3.5 cores against
-   about 0.4 on Windows, where the decoder writes into the pool.
-2. **The encoder from the pool**: NVENC reads CUDA or D3D11 frames, not
-   Vulkan, so on Linux it needs the pool slot exported
-   (`VK_KHR_external_memory_fd`) and imported into CUDA, or libavcodec's
-   Vulkan encoders where the driver has Vulkan video encode.
+1. **The Vulkan decoder into the pool** (wave 3 items 3 and 5): done on the
+   GTX 1050. The shared Vulkan device is opened by the sidecar with the
+   video extensions and libav's queues and handed to wgpu-hal
+   (`gpu/vulkan.rs`); `av::Shared::Vulkan` fills `AVVulkanDeviceContext`
+   from it; each picture is copied once on the device into the pool rather
+   than wrapped, since wgpu-core takes a raw image as uninitialised. Before
+   this a held 1080p60 H.264 feed decoded on the CPU, NVDEC idle, the
+   compose sidecar at 2.6 to 3.5 cores. Not run on the L4.
+2. **The encoder from the pool**: done on the GTX 1050. NVENC reads CUDA,
+   not Vulkan, frames; the pool's frame is written into a Vulkan picture
+   libavutil hands to CUDA (`VK_KHR_external_memory_fd` and the timeline
+   semaphore), on a CUDA device found by UUID. libavcodec's Vulkan encoders
+   segfault on this card and driver; on the L4 they are worth trying.
 3. **Inference from the pool on CUDA** (wave 4): buffers on dedicated
    memory exported as `OPAQUE_FD` and handed to wgpu as hal buffers, a
    timeline semaphore exported as an fd, `cudaImportExternalMemory` and
    `cudaImportExternalSemaphore` from `libcudart.so.12`, and the CUDA
-   device matched by UUID, since Linux has no LUID.
-4. **The `filter` node's Linux routes** (wave 3 item 6a): the `_cuda`
-   filters are in the v1.2.0 build and need the same Vulkan-to-CUDA import
-   as item 3; the `_vulkan` filters need a GLSL compiler in the build
-   image (they were dropped from v1.2.0) and an `AVVulkanDeviceContext`
-   over the shared device as in item 1.
-5. **The card pass's Vulkan family** (wave 0 item 7): compiled and pinned,
-   never run on a card.
+   device matched by UUID, since Linux has no LUID (libavutil's derive does
+   that match for the encoder now).
+4. **The `filter` node's Linux routes** (wave 3 item 6a): not done. The
+   `_cuda` filters are in the v1.2.0 build and need the same Vulkan-to-CUDA
+   import as item 3; the `_vulkan` filters need a GLSL compiler in the
+   build image (they were dropped from v1.2.0, and the wheel's `CONFIGURE`
+   still lists them as disabled) and can run on the `AVVulkanDeviceContext`
+   item 1 made.
+5. **The card pass's Vulkan family** (wave 0 item 7): run on the GTX 1050:
+   the decode and the `_vulkan` filters run, the encoders do not (item 2).
 6. **The acceptance lines that name the L4**: the benchmark recipe (160)
    at real time there, and section 3's harness run there for its GPU and
    readback columns.
-7. **The card pass's Vulkan upload**: `hwupload` makes no device of its
-   own. The VideoToolbox family's commands make one for it
-   (`init_hw_device`, `filter_hw_device`); the Vulkan family's do not and
-   have never run, and are left as they are until a card shows whether
-   they need the same.
+7. **The card pass's Vulkan upload**: done. `hwupload` with no device named
+   is refused in a Vulkan filtergraph ("A hardware device reference is
+   required to upload frames to"), so the Vulkan family's commands now make
+   one and name it, as the VideoToolbox family's do.
 
 ## Packets inside the region, and sidecar to sidecar
 
@@ -2715,3 +2715,210 @@ classroom clip faceage was measured on is not here; on Big Buck Bunny, with
 few faces, the GPU chain runs at 7.1 frames a second at 720p against 2.9
 before, and 6.1 at 4K, its time in the detector and the picture read back
 for libx264.
+
+## Linux
+
+What follows was run on foundmeat's box (2026-10-18): a GeForce GTX 1050
+(Pascal, 3 GB) on driver 580.178.04, Ubuntu 26.04, Vulkan 1.4.312, in a
+Debian bookworm container with the NVIDIA Container Toolkit, and the libav
+of the ffrwd-wasm 0.31.0 wheel (FFmpeg 9.0.1, `--enable-vulkan`,
+`--enable-cuda-llvm`, nv-codec-headers n12.1.14.0). The card exposes
+`VK_KHR_video_queue`, H.264 and HEVC decode and encode, the fd exports and
+timeline semaphores. Its queue families are graphics, compute and transfer
+(16 queues), transfer (2), compute and transfer (8), video decode (1) and
+video encode (1). Nothing of the GPU codec work had run on Linux before.
+
+### The first run
+
+Opening the device and decoding onto it built and ran first time. The
+pictures that reached a module were all zero: wgpu-core counts a texture
+it allocated itself as unwritten until one of its own commands writes it,
+and clears it before the first read, so it cleared what the decoder's copy
+had written. The copy's textures are now made by wgpu-hal and handed to
+wgpu-core, which counts a texture made that way as written.
+
+The second thing found was the card running out of memory, 2.78 of its
+3 GB within two seconds of a 1080p decode into nvenc, which also made
+another process's device open fail. It was not a leak: libav's decoder pool
+stayed at 15 images and the encoder's feeding pool at one. The scheduler
+let a decoder run as far ahead of a slower encoder as it liked. A
+self-clocked node (`decode`, `encode`, `filter`) is cut one task at a time,
+so its task queue never filled, while the pictures waiting on its input
+were not counted at all. The room a writer waits for now counts a
+self-clocked reader's queued arrivals against the same bound as its tasks
+(`lanes.rs`). That holds on every platform; on the 4090's 24 GB it went
+unseen. The same chains on main's binary pass 2 GB of the card's memory in
+under two seconds.
+
+### The device
+
+On Linux the sidecar opens the Vulkan device itself (`gpu/vulkan.rs`), on
+the physical device wgpu's adapter is, so `-gpu-adapter` still chooses it:
+wgpu-hal's required extensions and features for the features wanted, and
+beside them the video queue, decode and encode extensions, the memory and
+semaphore fd exports, push descriptors and synchronization2, each where the
+card has it, with synchronization2, sampler YCbCr conversion and video
+maintenance 1 turned on. wgpu-hal takes the device (`device_from_raw`) and
+wgpu-core takes wgpu-hal's (`create_device_from_hal`). wgpu submits to the
+first queue of the graphics family. libav is given one queue each of the
+transfer, compute, video decode and video encode families, which wgpu never
+touches, and libav's own locks guard them. The graphics family is listed to
+libav too, as graphics only, which libav looks for nothing by: libav shares
+the images it makes among exactly the families it is given, so that is what
+lets wgpu's queue use them without a transfer of ownership. One
+`AVVulkanDeviceContext` is made for the process from the raw handles and
+shared by every decoder and encoder, so the locks are one set.
+`AVVulkanDeviceContext`, `AVVulkanFramesContext` and `AVVkFrame` are
+transcribed in `av/sys.rs` with compile-time offsets, and the offsets were
+checked against gcc over the n9.0.1 headers on the box. A card without the
+video extensions, or a software adapter, gets the same device with no
+decoder on it and says so once; lavapipe runs the GPU tests as before.
+
+### Decoding into the pool
+
+`decode` with `hw=auto` or `hw=vulkan`, read by an input held on the GPU,
+opens libav's `h264_vulkan` (or `hevc_vulkan`, `av1_vulkan`) on the shared
+device (`av::Shared::Vulkan`). Its pictures are not wrapped as they are,
+for two reasons. wgpu-core takes a texture made from a raw image as
+uninitialised and its first barrier starts from
+`VK_IMAGE_LAYOUT_UNDEFINED`, which lets the driver discard the picture; no
+`TextureUses` declares another starting layout. And on this card a
+decoder's output pictures are its reference pictures too (DPB and output
+coincide), so the decoder reads a picture it has handed out, in its own
+layout and on its own queue, while the frame would be read and transitioned
+on wgpu's. So each picture is copied once on the device into two textures,
+luma and chroma, by commands recorded into a wgpu command encoder of its
+own and submitted after a wgpu transition of the targets, on the queue the
+modules use. The copy reads the picture in the layout libav left it in,
+under libav's lock on the picture, leaves it in the copy's layout and tells
+libav so, and moves the picture's timeline semaphore on by one once it has
+run. wgpu's submit waits on no semaphore, so the host waits for the
+decoder's write before submitting; and since wgpu-hal's
+`add_signal_semaphore` attaches to whichever submit comes next, which may be
+another thread's, the semaphore is signalled from the host by a thread that
+waits for the copy's submission. The decoder waits for that value before it
+writes the picture again, so the picture is let go as soon as it is copied.
+A 1080p NV12 copy is about 3 MB read and written. The decoded pictures are
+byte for byte the software decode (the 64x48 fixture and a 320x240 one), and
+a coded port feed into an input held on the GPU decodes the same way.
+
+### Encoding from the pool
+
+NVENC in FFmpeg 9.0.1 takes `cuda` and `d3d11` frames, not `vulkan` ones,
+and libavcodec's `h264_vulkan` encoder segfaults on this card and driver
+with both ffmpeg 8.0.1 and 9.0.2, so the route is CUDA. `h264_nvenc` and
+`hevc_nvenc` whose frames are on the Vulkan device are opened on a pool of
+CUDA pictures on the same card: the CUDA device is derived from the Vulkan
+one by its UUID, on the card's primary context. They are fed through a pool
+of Vulkan pictures on the shared device, one image per plane (libavutil's
+transfer to CUDA refuses a multi-planar image). Each frame is made NV12 on
+the device where it is not, its planes are copied by wgpu into a picture's
+two images (wrapped as textures; they are overwritten whole, so starting
+from an undefined layout loses nothing), libav is told the images' layout
+and their semaphore value, which the same host thread signals once the copy
+has run, and `av_hwframe_transfer_data` copies the picture into a CUDA one
+on the card, the two APIs sharing the image's memory and timeline
+semaphore. The CUDA picture goes to NVENC. A frame in host memory reaching
+such an encoder is uploaded to the CUDA picture; no test reaches that yet.
+A `decode` read only by
+such an encoder decodes onto the device too. NVENC on driver 580 needs the
+nv-codec-headers the wheel's libav pins (12.1, driver 530 and up);
+BtbN's 9.0.2 static build, on 13.1, refuses it.
+
+### The card pass
+
+The Vulkan family's commands had never run. On this card the decode and the
+`_vulkan` filters run; `hwupload` with no device named is refused ("A
+hardware device reference is required to upload frames to"), as on
+VideoToolbox, so the family now names one (`init_hw_device vulkan=up
+-filter_hw_device up`) and the segment back up runs. The family's encoders
+(`h264_vulkan`) segfault here as above, so a command the pass writes for an
+`_vulkan` destination does not finish on this card.
+
+### Measured
+
+The sidecar alone, release build, over testsrc2 at 1080p60 (h264 Main, no
+B-frames) looped to 3600 frames, `gpu_box` drawing a box, `h264_nvenc` at
+8 Mb/s; one run at a time with the box otherwise idle. Unpaced, frames a
+second over the whole run and the sidecar's CPU over the run's wall time;
+at real time, the clip fed by `ffmpeg -re` for 30 s and the sidecar's CPU
+from `top -d 8`; NVDEC and NVENC from `nvidia-smi dmon -s u`; the card's
+memory from `nvidia-smi`, the card otherwise idle at 4 MiB.
+
+| path | unpaced fps | cores unpaced | CPU a frame | cores at 60 fps | dec, enc at 60 fps | card memory | up, down a frame |
+|---|---|---|---|---|---|---|---|
+| Vulkan decode into the pool, `gpu_box` on the GPU, NVENC from the pool | 268, 274 | 1.21, 1.28 | 4.4, 4.8 ms | 0.53, 0.55 | 9%, 19 to 22% | 423 to 487 MiB unpaced, 359 at real time | 0, 0 |
+| software decode, `gpu_box` on the GPU, NVENC from the pool | 269, 275 | 2.45 | 9.1 ms | 1.11, 1.20 | 0, 23% | 360 to 682 MiB | 8.3 MB, 0 |
+| software decode, `gpu_box` on the CPU, NVENC from host memory | 104 | 2.63 | 25.2 ms | 0.91 to 0.98 | 0, 24 to 28% | 182 to 718 MiB | 0, 0 |
+| main's binary, the first two chains | stopped at 2 GB of card memory in under 2 s | | | | | | |
+
+Recipe 157 through `ffrwd run --profile` (the 600-frame clip, `h264_nvenc`
+at 6 Mb/s): main 6.87 s and 11.4 CPU seconds, with 600 uploads and 600
+downloads of 8.3 MB; the branch 3.05 s and 4.6 CPU seconds, no upload or
+download, and 1200 conversions on the device (NV12 to rgba for the module,
+rgba to NV12 for the encoder).
+
+The GPU path's CPU is mostly system time (9.8 of 15.9 s), the host's waits
+on semaphores and on wgpu's submissions, and it does not fall in proportion
+at real time. The figure of 2.6 to 3.5 cores from foundmeat was for blitz
+composing a held feed, which this does not measure.
+
+### Memory
+
+The 1080p chain first held 738 MiB of the card, some 240 pictures' worth.
+Accounted with a build that logged the card's memory at each piece's
+opening and every few hundred pictures, and with each piece run alone under
+ffmpeg (MiB):
+
+| piece | as first run | now | how measured |
+|---|---|---|---|
+| the Vulkan device wgpu opens (libav's context over it adds nothing) | 198 | 18 | at the open; wgpu's default hint puts its first allocations in a 128 MiB device block and a 64 MiB host block |
+| the CUDA primary context | 48 | 48 | at the derive; alone under ffmpeg 48 with the primary context or one of its own |
+| NVENC's session | 48 | 48 | at `avcodec_open2`; ffmpeg's `-surfaces 4` changes nothing |
+| the Vulkan video session, bitstream buffer and first picture | 107 | 71 | at the first picture, with wgpu's first block for the copy |
+| the decoder's pictures | 15 to 18 of 3 MiB | 4 of 3 MiB | distinct images seen; at `threads=auto` the twelve frame threads each keep a picture in flight; the stream has one reference frame |
+| the encoder's feeding pool | 1 picture, 3.3 | 3.3 | distinct images seen |
+| CUDA pictures for NVENC | 15 of 3 MiB | the same | distinct pictures seen: NVENC's surfaces in flight |
+| frames in flight between the nodes | | 0 to 22, 66 to 119 of planes | live frames and their planes: a decoded NV12 (3 MiB), its rgba (7.9), the module's rgba (7.9) and its NV12 (3); the scheduler holds at most 10 arrivals a reader |
+| wgpu's allocator slack and the module's pipelines | | about 60 to 110 | the rest |
+| total | 738 to 741 | 423 to 487 unpaced, 359 at real time | |
+
+Two of those were cheap to cut. The Linux device now asks wgpu for its
+memory-usage hint, blocks of 8 to 64 MiB, and a decoder on the shared Vulkan
+device decodes on one thread, which holds 4 pictures and runs faster (268
+to 274 frames a second against 247 to 256), with the sidecar's CPU at real
+time 53 to 54% of a core against 57 to 60% before. Decode into ffv1, at 129
+MiB, opens no wgpu device: libav's own Vulkan device (13 MiB alone) and its
+decoder at `threads=auto` (about 66 for the session and bitstream, 48 for 16
+pictures); the same decode on one thread under ffmpeg is 94 MiB in all.
+
+### What is left
+
+- The host waits for the decoder's write before each copy is submitted,
+  and the decode thread waits with it. A wait on the queue would need a
+  submit with wait semaphores, which wgpu-core does not have; a raw submit
+  on a queue of our own in wgpu's family, ordered against wgpu's by a
+  timeline semaphore of our own, is the way if the wait shows in a
+  profile.
+- The copy into the pool, 3 MB a 1080p picture. Wrapping the decoder's
+  picture needs wgpu-core to take an image in a layout it is told, and a
+  decoder whose output pictures are not its references.
+- The `filter` node on Linux. The `_vulkan` filters are not in the wheel's
+  libav (its `CONFIGURE` lists them as disabled, for want of a GLSL
+  compiler in the build); once they are, they can run on the shared
+  device's `AVVulkanDeviceContext`, with the node's frames context and feed
+  written for Vulkan as they are for D3D12. The `_cuda` filters need the
+  CUDA import the encoder uses.
+- Inference from the pool on CUDA (the L4 list's item 3) can take the CUDA
+  device found by UUID here; it needs the buffer export and import of its
+  own.
+- Only h264 was run. HEVC and AV1 decode on the device are untried (this
+  card decodes no AV1), and 10-bit pictures are not held on the GPU, since
+  the wire has no 10-bit format.
+- Memory: the scheduler's bound of 10 arrivals a reader is up to 80 MiB of
+  1080p rgba between two nodes, and could count bytes for frames on the
+  GPU; NVENC keeps 15 CUDA pictures; the copy's targets are allocated a
+  picture at a time rather than recycled; a decoder on a Vulkan device of
+  its own (`hw=auto` into host memory) still decodes on `threads=auto`,
+  33 MiB more than one thread under ffmpeg.
+- The L4 itself, and the acceptance lines that name it.
