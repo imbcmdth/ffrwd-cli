@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -1567,3 +1569,30 @@ def test_real_options_lazy_does_not_call_help_for_unreferenced_filters(
     help_calls = [c for c in calls if any(a.startswith("filter=") for a in c)]
     assert len(help_calls) == 2  # exactly gblur + overlay, never all ~460+
     assert sum(1 for c in calls if "-filters" in c) == 1
+
+
+def test_a_registry_read_on_two_threads_at_once_is_loaded_once_and_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two lateral instances compiling at once: the second waits for the
+    first's load rather than finding no filters."""
+    _fake_ffmpeg_present(monkeypatch)
+    calls = _fake_run(monkeypatch)
+    parse = registry_mod._parse_filters_list
+    started = threading.Event()
+
+    def slow_parse(ffmpeg: str) -> object:
+        started.set()
+        time.sleep(0.2)
+        return parse(ffmpeg)
+
+    monkeypatch.setattr(registry_mod, "_parse_filters_list", slow_parse)
+    reg = load()
+    found: list[object] = []
+    first = threading.Thread(target=lambda: found.append(reg.get("gblur")))
+    first.start()
+    assert started.wait(5)
+    found.append(reg.get("gblur"))
+    first.join()
+    assert found[0] is not None and found[0] == found[1]
+    assert sum("-filters" in argv for argv in calls) == 1

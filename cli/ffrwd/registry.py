@@ -154,12 +154,12 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
 from ffrwd import binaries
-from ffrwd.errors import FfrwdError
 from ffrwd.ir import StreamType
 
 _TIMEOUT_SECONDS = 10.0
@@ -743,6 +743,9 @@ class Registry:
         self._ffmpeg: str | None = None
         self._version_line: str | None = None
         self._loaded = False
+        # Run-time lateral instances compile on threads of their own, and
+        # the first to read the registry loads it while the others wait.
+        self._loading = threading.Lock()
         self._filters: dict[str, DynamicFilter] = {}
         self._sources: dict[str, SourceFilter] = {}
         self._options: dict[str, dict[str, FilterOption]] = {}
@@ -753,15 +756,16 @@ class Registry:
     def _ensure_loaded(self) -> None:
         if self._loaded:
             return
-        self._loaded = True
+        with self._loading:
+            if self._loaded:
+                return
+            # FFRWD_OFFLINE refusing the provider's download raises, and
+            # leaves it unloaded: asked again, it says so again.
+            self._load()
+            self._loaded = True
 
-        try:
-            ffmpeg = binaries.ffmpeg_path()
-        except FfrwdError:
-            # FFRWD_OFFLINE refused the provider's download: asked again,
-            # it says so again.
-            self._loaded = False
-            raise
+    def _load(self) -> None:
+        ffmpeg = binaries.ffmpeg_path()
         if ffmpeg is None:
             return
         version_line = _get_version_line(ffmpeg)
@@ -893,14 +897,16 @@ class Registry:
 
 
 _registry: Registry | None = None
+_making = threading.Lock()
 
 
 def load() -> Registry:
     """Return the process-wide Registry singleton (memoized)."""
     global _registry
-    if _registry is None:
-        _registry = Registry()
-    return _registry
+    with _making:
+        if _registry is None:
+            _registry = Registry()
+        return _registry
 
 
 def load_reference(path: str | Path) -> Registry:
