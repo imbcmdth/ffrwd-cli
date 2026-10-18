@@ -90,13 +90,39 @@ with picture and sound into two test-fleet modules of the sidecar, so
 the test runs in CI with no package. And `compile` listing one
 connection for the two calls.
 
+## Settled under `compose-audio`
+
+blitz's `compose_av` (branch `compose-audio`, 2026-10-17) carries each
+held input's sound on the picture's group, mixes it at per-element
+levels (`--ffrwd-volume`, `--ffrwd-volume-duck`, `--ffrwd-squelch`,
+`--ffrwd-squelch-release`) and writes one audio output. Measured with
+the flash-and-beep feed over four connections and three drops: sound
+minus picture between -1.4 and 0 ms on every connection, bare and with
+foundmeat's stage template, with a picture-only cam lateral and with a
+cam carrying sound. The further 200 to 350 ms foundmeat measured in its
+full query was not the template: it was the second term of the same
+anchoring, the picture anchored after the sound by 0.20 to 0.31 s in the
+bare runs too, and it went with the one anchor per connection. The
+general fix above stays the plan for any other pair of modules fed by
+one lateral.
+
+Two things in ffrwd would let that module do without workarounds:
+
+- **Port-fed sound with no `like`.** The host refuses a held audio
+  input that follows no bound audio input, since `conformed()` cannot
+  say what a feed is conformed to. So `compose_av` requires `a`, `v`'s
+  own sound, and a query with none binds a silent source. `conformed()`
+  taking the rate, channels and format from the input's `accepts` would
+  make `a` optional.
+- **Per-tick state handed across instances**, as `earlier_rows` hands
+  rows. The squelch releases and the gain ramps carry from one tick to
+  the next, so a `compose_av` call that binds sound is declared not pure
+  and runs on one worker. compose would hand the last time each element
+  passed its squelch (an f64) and each input's previous gain (an f32),
+  tens of bytes a tick, and sound could spread across workers as the
+  picture does.
+
 ## Not this plan
 
-- The further 200 to 350 ms of sound lag foundmeat measured in its full
-  query and not in the bare one. That is not the anchoring; it grows
-  with the template, the cam laterals and presence. It is measured first
-  under `compose-audio`, where the sound rides compose's own offset, and
-  fixed where it is found: the clock held for compose's render while the
-  sound is not, or a hold's `lead`.
-- Mixing several inputs' sound and a per-input volume: `compose`'s, on
-  its own audio output, later.
+- Mixing several inputs' sound and a per-input volume: done in
+  `compose_av`, on its own audio output, above.
