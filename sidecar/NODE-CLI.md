@@ -270,7 +270,7 @@ name and the pictures are kept). The picture of an input held on the GPU
 device, where a BT.709 or BT.601 picture is concerned, and the line saying
 it is conformed ends `on the GPU`. A coded picture for such an input is
 decoded on the process's device where its decoder shares it (`d3d12va` on
-Windows), as `decode` does for a reader on the GPU, so it never crosses
+Windows, `videotoolbox` on macOS, `vulkan` on Linux), as `decode` does for a reader on the GPU, so it never crosses
 host memory; elsewhere it is decoded in software and uploaded once. A
 group of hold inputs (`hold.group`) is one per connection: the inputs of a
 group share each port's listener and connection, its picture to the video

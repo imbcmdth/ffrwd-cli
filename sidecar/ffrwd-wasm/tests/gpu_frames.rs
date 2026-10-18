@@ -1931,6 +1931,10 @@ fn a_coded_feed_held_on_the_gpu_is_decoded_on_the_device() {
         eprintln!("skipped: this machine has no GPU adapter");
         return;
     }
+    if let Some(line) = stderr.lines().find(|l| l.starts_with(NO_DEVICE_DECODER)) {
+        eprintln!("SKIPPED: {test}. {line}");
+        return;
+    }
     assert!(
         output.status.success(),
         "exited {:?}:\n{stderr}",

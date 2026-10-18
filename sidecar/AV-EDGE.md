@@ -175,8 +175,8 @@ macOS: videotoolbox), skipping a device type the build does not have, and
 falls back to software. The frames come back to host memory, with one
 exception: when the node reading them holds its frames on the GPU
 (`NODE-SHAPE.md`) and the device is the sidecar's own, `d3d12va` on
-Windows or `videotoolbox` on macOS, the decoder writes straight into the
-sidecar's frame pool and nothing comes back. A coded port feed into an input held on the GPU is
+Windows, `videotoolbox` on macOS or `vulkan` on Linux, the decoder writes
+straight into the sidecar's frame pool and nothing comes back. A coded port feed into an input held on the GPU is
 decoded the same way, where the device allows. One line on stderr says
 what engaged, and a second says whether the decoder's own images were
 taken as they are or copied once on the device:
@@ -187,6 +187,8 @@ taken as they are or copied once on the device:
     [gpu] decode h264: d3d12va, frames wrapped
     [av] decode h264: videotoolbox, on the host's device
     [gpu] decode h264: videotoolbox, frames wrapped
+    [av] decode h264: vulkan, on the host's device
+    [gpu] decode h264: vulkan, frames copied (wgpu takes a raw image as uninitialised)
 
 On macOS VideoToolbox writes each picture into an IOSurface, and CoreVideo's
 texture cache makes its two planes Metal textures over that surface, so a
@@ -194,6 +196,20 @@ picture is always wrapped. A picture is kept until the device has run
 everything queued while it was read, then handed back. VideoToolbox in the
 bundled libav decodes h264, hevc and prores, and refuses a picture as small
 as 64x48, which then decodes in software.
+
+On Linux the sidecar opens its Vulkan device itself, with the video
+extensions and a queue of each of the card's transfer, compute, video
+decode and video encode families for libav, and hands it to wgpu; libav's
+`h264_vulkan`, `hevc_vulkan` and `av1_vulkan` decoders run on it. Each
+picture is copied once on the device into two textures of the pool, luma
+and chroma, on the queue the modules use: wgpu takes an image made
+elsewhere as uninitialised, so its first barrier could discard a picture
+wrapped as it is. The copy waits for the decoder's write and signals the
+picture's timeline semaphore when it has run, so the decoder never writes a
+picture still being read. A card without the video extensions, or a
+software adapter, gets the device with no decoder on it, and says so once:
+
+    [gpu] no decoder or encoder on the process's Vulkan device: the device has no video extensions
 
 That holds for `format=yuv420p` and `format=rgba`. The decoder writes
 NV12 either way; a reader of yuv420p is handed its planes split on the
@@ -226,13 +242,23 @@ IOSurface-backed NV12 pictures: each frame is made NV12 on the device (an
 rgba frame first, as above), its two planes are copied into one of the
 pool's pictures through CoreVideo's texture cache, and the copy is waited
 for before the picture is sent, since VideoToolbox reads it with nothing to
-wait on. Frames in host memory reach them as NV12 made by libswscale. Every
-other encoder reads a GPU frame back once.
+wait on. Frames in host memory reach them as NV12 made by libswscale. On
+Linux, `h264_nvenc`, `hevc_nvenc` and `av1_nvenc` whose frames are on the
+sidecar's Vulkan device are opened on a pool of CUDA pictures on the same
+card (the CUDA device found by the card's UUID, on its primary context) and
+fed through a pool of Vulkan pictures, one image per plane: each frame is
+made NV12 on the device, its planes are copied into one of those, and
+libavutil copies it into a CUDA picture on the card, the two APIs sharing
+the image's memory and timeline semaphore. Frames in host memory are
+uploaded to the CUDA picture. Every other encoder reads a GPU frame back
+once.
 
     [av] encode h264_d3d12va: 1920x1080 nv12, from the device
     [gpu] encode h264_d3d12va: from the device, each frame one copy
     [av] encode h264_videotoolbox: 1920x1080 nv12, from the device
     [gpu] encode h264_videotoolbox: from the device, each frame a copy per plane, waited for
+    [av] encode h264_nvenc: 1920x1080 nv12, from the device
+    [gpu] encode h264_nvenc: from the device, each frame a copy per plane, then to CUDA on the card
 
 `filter` runs its graph on a `d3d12va` device: the D3D12 filters read and
 write D3D12 textures, so the graph's source is a frames context of NV12
