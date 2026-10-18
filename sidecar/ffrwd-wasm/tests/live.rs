@@ -124,6 +124,11 @@ struct Program {
     /// Programme seconds the picture and sound skip over: a hole in the
     /// clock, the timestamps after it left where they were.
     holes: Vec<(f64, f64)>,
+    /// A programme that starts behind: for this many seconds of the wall
+    /// clock it is written at this fraction of real time, then what it is
+    /// behind by is written at once, and from there it is paced, as a
+    /// source does that waited while the run started.
+    slow_start: Option<(f64, f64)>,
 }
 
 impl Program {
@@ -135,6 +140,17 @@ impl Program {
             seconds,
             sound: true,
             holes: Vec::new(),
+            slow_start: None,
+        }
+    }
+
+    /// When the frame at programme time `at` is written, in seconds from
+    /// the start.
+    fn due(&self, at: f64) -> f64 {
+        match self.slow_start {
+            Some((until, rate)) if at / rate < until => at / rate,
+            Some((until, _)) => at.max(until),
+            None => at,
         }
     }
 
@@ -185,7 +201,7 @@ impl Program {
             if self.in_hole(at) {
                 continue;
             }
-            let due = started + Duration::from_secs_f64(at);
+            let due = started + Duration::from_secs_f64(self.due(at));
             let now = Instant::now();
             if due > now {
                 thread::sleep(due - now);
@@ -934,6 +950,72 @@ fn a_stall_repeats_the_last_frame_and_the_mapping_holds_through_it() {
         "after the stall the sound is back on its mapping"
     );
     assert!(out.stderr.contains("repeated"), "{}", out.stderr);
+}
+
+#[test]
+fn a_feed_that_comes_up_while_the_programme_is_behind_is_laid_later_once_and_its_sound_keeps_flowing(
+) {
+    // The programme comes at half speed for its first 1.2 s and then
+    // catches up at once, as a source does that waited while the run
+    // started; the feeder connects a second in, while the programme is
+    // half a second behind, at lead 0.1s. Fixed then and never again,
+    // every tick once the programme has caught up asks for sound that
+    // arrives later, and the feed's sound is silent.
+    let _serial = serial();
+    let mut program = Program::new(30, 7.0);
+    program.slow_start = Some((1.2, 0.5));
+    let chain = switch_chain("lead=0.1");
+    let (mut run, port) = start("behind", &program, "1", &["shape_switch"], &chain);
+    wait_for_port(&mut run, port);
+    let fed = feed(port, Feeder::new(25, 4.0), Duration::from_secs(1));
+    let out = finish(run);
+    fed.join().expect("the feeder");
+
+    let later: Vec<&str> = out
+        .stderr
+        .lines()
+        .filter(|l| l.contains("the feed is laid"))
+        .collect();
+    assert_eq!(later.len(), 1, "laid later once:\n{}", out.stderr);
+    let (at, _, _) = first_start(&out);
+    let insertions = out.insertions();
+    assert_eq!(insertions.len(), 1, "{insertions:?}\n{}", out.stderr);
+    let (_, last) = insertions[0];
+    // A second in, well past the move, to half a second before the end:
+    // every sample is the feeder's own, one after another, and the
+    // picture each tick shows is the one its sound is from, to within a
+    // frame of the feeder's.
+    let from = at + 30;
+    let to = last - 15;
+    assert!(to > from + 30, "the feed showed from {at} to {last}");
+    for tick in from..=to {
+        let first = out.sample(tick * 1600);
+        assert!(
+            first > 0.0,
+            "tick {tick}: the feeder's sound, not silence ({first})\n{}",
+            out.stderr
+        );
+        for k in 1..1600 {
+            assert_eq!(
+                out.sample(tick * 1600 + k),
+                first + k as f32,
+                "tick {tick}: the sound runs on"
+            );
+        }
+        let shown = out
+            .frames
+            .iter()
+            .find(|(pts, _)| *pts == tick)
+            .map(|(_, shown)| *shown);
+        let Some(Shown::Feed(j)) = shown else {
+            panic!("tick {tick} shows the feed ({shown:?})");
+        };
+        let heard = first as f64 / 1920.0;
+        assert!(
+            (heard - j as f64).abs() < 1.0,
+            "tick {tick}: picture {j}, sound from frame {heard:.2}"
+        );
+    }
 }
 
 #[test]

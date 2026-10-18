@@ -20,6 +20,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
 use ffrwd_wasm_runtime::node::{
@@ -587,8 +588,65 @@ pub struct Assembler {
     grid: Grid,
     /// The last tick's time, for a jump in the clock.
     last_pts: Option<i64>,
+    /// When an input clock's recent ticks were cut, for whether the node
+    /// keeps up with it.
+    pace: Pace,
     name: String,
     report: Report,
+}
+
+/// When an input clock's ticks were cut over the last [`Pace::SPAN`] of
+/// clock time, for whether the node keeps up with its clock: a node that
+/// started behind (its clock's source queued while it started, say) cuts
+/// ticks faster than real time until it has caught up, and one falling
+/// behind cuts them slower.
+#[derive(Default)]
+struct Pace {
+    cut: VecDeque<(Instant, i64)>,
+}
+
+impl Pace {
+    /// How much clock time the pace is measured over, in seconds.
+    const SPAN: f64 = 0.25;
+    /// How far the clock may run from the wall between any two ticks of that
+    /// span, in seconds, and still be kept up with: a frame or two of jitter
+    /// in the arrivals, and a timer's on some systems.
+    const SLACK: f64 = 0.05;
+
+    /// Notes the tick at `pts` in `base`, cut now, and says whether the
+    /// ticks over the last `SPAN` of clock time were cut at the clock's
+    /// own pace: from every one of them to this one, the clock moved as far
+    /// as the wall did, give or take `SLACK`. A span that only averages
+    /// out, slow and then a burst, is not kept up with.
+    fn keeps_up(&mut self, pts: i64, base: TimeBase) -> bool {
+        let now = Instant::now();
+        let seconds = |t: i64| t as f64 * base.num as f64 / base.den.max(1) as f64;
+        if self
+            .cut
+            .back()
+            .is_some_and(|(_, last)| pts < *last || seconds(pts - last) > hold::MAX_STEP_SECONDS)
+        {
+            self.cut.clear();
+        }
+        self.cut.push_back((now, pts));
+        while self
+            .cut
+            .get(1)
+            .is_some_and(|(_, t)| seconds(pts - t) >= Self::SPAN)
+        {
+            self.cut.pop_front();
+        }
+        let Some((_, from)) = self.cut.front() else {
+            return false;
+        };
+        if seconds(pts - from) < Self::SPAN {
+            return false;
+        }
+        self.cut.iter().all(|(then, t)| {
+            let wall = now.duration_since(*then).as_secs_f64();
+            (seconds(pts - t) - wall).abs() <= Self::SLACK
+        })
+    }
 }
 
 /// A hold group's name and connection; none for a hold input of no group,
@@ -805,6 +863,7 @@ impl Assembler {
             holds,
             grid,
             last_pts: None,
+            pace: Pace::default(),
             name: name.to_string(),
             report: Box::new(|line| eprintln!("{line}")),
         })
@@ -956,9 +1015,10 @@ impl Assembler {
             }
         }
         let clock_stream = self.take_clock(clock, &next)?;
+        let caught_up = !next.last && self.pace.keeps_up(next.pts, base);
         let mut streams = Vec::with_capacity(self.inputs.len());
         streams.push(clock_stream);
-        let mut held = self.hold_ticks(next.pts, end, base);
+        let mut held = self.hold_ticks(next.pts, end, base, caught_up);
         for index in 0..self.inputs.len() {
             if index == clock {
                 continue;
@@ -989,7 +1049,7 @@ impl Assembler {
             }
         }
         let mut streams = Vec::with_capacity(self.inputs.len());
-        let mut held = self.hold_ticks(pts, end, base);
+        let mut held = self.hold_ticks(pts, end, base, true);
         for index in 0..self.inputs.len() {
             streams.push(self.hand(index, pts, end, base, &mut held)?);
         }
@@ -1034,8 +1094,15 @@ impl Assembler {
     }
 
     /// Every hold group's share of the tick from `pts` to `end`: a jump in
-    /// the clock ends every feed first.
-    fn hold_ticks(&mut self, pts: i64, end: Option<i64>, base: TimeBase) -> Vec<Vec<Handed>> {
+    /// the clock ends every feed first. `caught_up` says the node keeps up
+    /// with its clock (always, on a rate clock).
+    fn hold_ticks(
+        &mut self,
+        pts: i64,
+        end: Option<i64>,
+        base: TimeBase,
+        caught_up: bool,
+    ) -> Vec<Vec<Handed>> {
         if let Some(last) = self.last_pts {
             let step = pts.saturating_sub(last);
             if step < 0 || step > hold::ticks_of(hold::MAX_STEP_SECONDS, base) {
@@ -1049,7 +1116,7 @@ impl Assembler {
         let handed: Vec<Vec<Handed>> = self
             .holds
             .iter_mut()
-            .map(|group| group.tick(pts, end, base, &grid))
+            .map(|group| group.tick(pts, end, base, &grid, caught_up))
             .collect();
         for (index, group) in self.holds.iter_mut().enumerate() {
             for (member, feed) in group.take_ended() {

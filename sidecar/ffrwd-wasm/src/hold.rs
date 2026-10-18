@@ -24,11 +24,31 @@
 //! is held `lead` ahead of the clock, as its priming was, and its end is
 //! told once it is within `lead` of the tick: on the same tick on every run.
 //!
+//! A port feed's frames arrive at the feeder's pace, which is real time for
+//! a live feeder, while the ticks come at the clock's: a clock that starts
+//! behind real time (its source queued while the run started, say) is cut
+//! late at first and then faster than real time until it has caught up. An
+//! offset fixed while it is behind lays the feed early by however far
+//! behind it was, so once it has caught up every tick asks for frames that
+//! have not arrived yet: the pictures show late and the sound is silent. A
+//! port feed that comes up while the clock is not kept up with is therefore
+//! fixed only for the time being, and fixed again once, on the first tick
+//! that is: the feed moves later by as many whole ticks as lay the newest
+//! frame of its lead member `lead` ahead of that tick, as a feed coming up
+//! then would be, and by no more than the clock gained on the wall since.
+//! The picture and the sound move together, by at most the backlog the
+//! clock had, so they stay in sync with each other: the picture repeats
+//! and the sound is silent for that long, once, near the feed's start. A
+//! feed is only ever moved later. One that comes up while the clock is kept
+//! up with is fixed once as before, and where it never is (a run slower
+//! than real time) the first offset stands.
+//!
 //! What each feed did is said on stderr, as a line and as a row behind
 //! [`crate::leaky::ROW_PREFIX`].
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ffrwd_wasm_runtime::node::{Anchor, Feed, FeedStart, Hold, PortKind, TickFrame};
 use ffrwd_wasm_runtime::runtime::{AudioFormat, Message, StreamInfo, TimeBase};
@@ -235,6 +255,18 @@ impl Offset {
         }
     }
 
+    /// This offset `ticks` of `clock_base` later.
+    fn later(self, ticks: i64, clock_base: TimeBase) -> Offset {
+        let num =
+            self.num * clock_base.den as i128 + ticks as i128 * clock_base.num as i128 * self.den;
+        let den = self.den * clock_base.den as i128;
+        let g = gcd(num, den);
+        Offset {
+            num: num / g,
+            den: den / g,
+        }
+    }
+
     /// Source time `t` in `base` on the clock, in `clock_base`, rounded down.
     fn to_clock(self, t: i64, base: TimeBase, clock_base: TimeBase) -> i64 {
         let num = (t as i128 * base.num as i128 * self.den + self.num * base.den as i128)
@@ -338,6 +370,10 @@ struct FeedState {
     /// The clock time of the tick the offset was fixed on, or `at` where
     /// that is earlier: a source the clock has passed shows at once.
     known: i64,
+    /// A port feed fixed while its clock was behind real time, to be fixed
+    /// again on the first tick cut at the clock's own pace: when, and the
+    /// tick it was fixed on.
+    provisional: Option<(Instant, i64)>,
     shown: Vec<Option<TickFrame>>,
     /// The clock time the lead member last moved on, for the timeout.
     advanced: i64,
@@ -727,7 +763,7 @@ impl Group {
         self.end_feed(pts, clock_base, Why::Jumped);
     }
 
-    fn start_feed(&mut self, pts: i64, clock_base: TimeBase, grid: &Grid) {
+    fn start_feed(&mut self, pts: i64, clock_base: TimeBase, grid: &Grid, caught_up: bool) {
         let Some(source) = self.sources.front() else {
             return;
         };
@@ -796,6 +832,8 @@ impl Group {
             first_pts,
             at,
             known: pts.min(at),
+            provisional: (self.port_fed && !caught_up && anchor != Anchor::SharedClock)
+                .then(|| (Instant::now(), pts)),
             shown: vec![None; self.members.len()],
             advanced: pts.max(at),
             drained: None,
@@ -806,6 +844,67 @@ impl Group {
             handed: vec![None; self.members.len()],
             last_tick: None,
         });
+    }
+
+    /// Fixes a provisional feed's offset again on the first tick the clock
+    /// is kept up with, `pts`, the feed having been fixed on the tick and
+    /// at the time `fixed` says: the feed moves later by whole ticks of the
+    /// clock's grid, as few as lay its lead member's newest frame `lead`
+    /// ahead of the tick, so its frames keep the phase against the ticks
+    /// that its first frame gave them, and by no more than the clock gained
+    /// on the wall since, which a feeder that sends faster than real time
+    /// would otherwise take for a backlog. Nothing moves where the first
+    /// offset already lays that frame there. The start stays at `at` on the
+    /// clock and its first pts moves with the offset, so `(at, first-pts)`
+    /// still maps the feed's pts onto the clock.
+    fn refix(
+        &mut self,
+        feed: &mut FeedState,
+        fixed: (Instant, i64),
+        pts: i64,
+        clock_base: TimeBase,
+        grid: &Grid,
+    ) {
+        let Some(source) = self.sources.front() else {
+            return;
+        };
+        let lead = &source.members[source.lead];
+        let Some(newest) = lead.last else {
+            return;
+        };
+        let scheduled = pts.saturating_add(ticks_of(self.hold.lead, clock_base));
+        let shows = feed.offset.to_clock_up(newest, lead.base, clock_base);
+        if shows >= scheduled {
+            return;
+        }
+        let seconds = |t: i64| t as f64 * clock_base.num as f64 / clock_base.den as f64;
+        let (when, from) = fixed;
+        let gained = seconds(pts - from) - when.elapsed().as_secs_f64();
+        let by = (scheduled - shows).min(ticks_of(gained.max(0.0), clock_base));
+        let wanted = feed.at.saturating_add(by);
+        let by = grid.at_or_after(wanted).unwrap_or(wanted) - feed.at;
+        if by <= 0 {
+            return;
+        }
+        feed.offset = feed.offset.later(by, clock_base);
+        feed.first_pts = feed.offset.to_source(feed.at, clock_base, lead.base);
+        let by = seconds(by);
+        let line = format!(
+            "hold: {}: the feed is laid {:.3}s later at {:.3}s: it came up while its clock was behind real time",
+            self.name(),
+            by,
+            seconds(pts),
+        );
+        let row = json!({
+            "kind": "feed",
+            "node": self.node,
+            "input": self.members[source.lead].name,
+            "event": "later",
+            "at": millis(seconds(pts)),
+            "by": millis(by),
+        });
+        (self.report)(line);
+        (self.report)(format!("{ROW_PREFIX}{row}"));
     }
 
     /// The feeds that ended since this was last asked, oldest first, each
@@ -867,21 +966,27 @@ impl Group {
     }
 
     /// The tick from `pts` to `end` in `clock_base`: what every member hands,
-    /// in member order.
+    /// in member order. `caught_up` says the ticks are being cut at the
+    /// clock's own pace, so the tick is where real time is.
     pub fn tick(
         &mut self,
         pts: i64,
         end: Option<i64>,
         clock_base: TimeBase,
         grid: &Grid,
+        caught_up: bool,
     ) -> Vec<Handed> {
         self.now = Some((pts, clock_base));
         if self.feed.is_none() {
-            self.start_feed(pts, clock_base, grid);
+            self.start_feed(pts, clock_base, grid, caught_up);
         }
         let Some(mut feed) = self.feed.take() else {
             return vec![Handed::default(); self.members.len()];
         };
+        if let Some(fixed) = feed.provisional.filter(|_| caught_up) {
+            feed.provisional = None;
+            self.refix(&mut feed, fixed, pts, clock_base, grid);
+        }
         let source = self.sources.front_mut().expect("a feed has a source");
         let lead = source.lead;
         let live = pts >= feed.at;
@@ -1275,6 +1380,92 @@ mod tests {
         handed.frames.first().map(|f| f.data.host()[0])
     }
 
+    /// A tick cut: the tick, whether its sound window came whole, and the
+    /// picture shown.
+    type Cut = (i64, bool, Option<u8>);
+
+    /// A port feed arriving at real time into a node that starts 40 ticks
+    /// behind its clock and catches up two ticks a step: per tick cut, the
+    /// tick, whether its sound window came whole, and the picture shown; and
+    /// what the hold said. `says_caught_up` is whether the node tells the
+    /// hold when it has caught up.
+    fn behind_then_caught_up(says_caught_up: bool) -> (Vec<Cut>, Vec<String>) {
+        let (mut g, lines) = group(
+            hold(Anchor::FirstFrame, 0.5, None, None),
+            vec![video_member(1, THIRTIETHS), audio_member(2)],
+            true,
+        );
+        let grid = Grid::exact();
+        let mut cut = Vec::new();
+        let mut c = 0;
+        for r in 0..200i64 {
+            // The feeder connects at step 20 and sends one tick a step.
+            if r >= 20 {
+                let s = r - 20;
+                g.arrive(0, frame(s, (s % 256) as u8));
+                g.arrive(1, samples(s * 1600, 1600));
+            }
+            // The node cuts its first tick at step 40, at most two a step.
+            if r < 40 {
+                continue;
+            }
+            for _ in 0..2 {
+                if c > r {
+                    break;
+                }
+                let caught_up = says_caught_up && c == r;
+                let handed = g.tick(c, Some(c + 1), THIRTIETHS, &grid, caught_up);
+                let whole = handed[1]
+                    .frames
+                    .first()
+                    .is_some_and(|run| run.duration == Some(1600));
+                cut.push((c, whole, mark(&handed[0])));
+                c += 1;
+            }
+        }
+        let said = lines.lock().unwrap().clone();
+        (cut, said)
+    }
+
+    #[test]
+    fn a_port_feed_fixed_while_the_node_is_behind_is_fixed_again_once_it_has_caught_up() {
+        // Fixed on the first tick, 40 behind: the first picture is laid at
+        // 15 (lead 0.5s), so once the node has caught up, at tick 79, each
+        // tick asks for what arrives five ticks later.
+        let (cut, said) = behind_then_caught_up(false);
+        assert!(
+            said.iter().any(|l| l.contains("comes up at 0.500s")),
+            "{said:?}"
+        );
+        let late: Vec<i64> = cut
+            .iter()
+            .filter(|(c, whole, _)| *c >= 100 && !whole)
+            .map(|(c, ..)| *c)
+            .collect();
+        assert!(
+            !late.is_empty(),
+            "without being told, the sound is asked for before it arrives"
+        );
+        // Told: on tick 79 the newest picture, 59, is laid lead ahead, at
+        // 94, 20 ticks later than the first offset laid it.
+        let (cut, said) = behind_then_caught_up(true);
+        let later: Vec<&String> = said.iter().filter(|l| l.contains("laid")).collect();
+        assert_eq!(later.len(), 1, "fixed again once: {said:?}");
+        assert!(
+            later[0].contains("laid 0.667s later at 2.633s"),
+            "{}",
+            later[0]
+        );
+        // The pictures already shown repeat and the sound already handed is
+        // not handed again, for lead; from tick 96 on every tick's picture
+        // is on time and its sound whole.
+        for (c, whole, shown) in cut.iter().filter(|(c, ..)| *c >= 96) {
+            assert!(whole, "tick {c}: the sound arrived before it was asked for");
+            assert_eq!(*shown, Some(((c - 35) % 256) as u8), "tick {c}");
+        }
+        assert!(cut.iter().filter(|(c, ..)| *c >= 96).count() > 50);
+    }
+
     #[test]
     fn a_first_frame_feed_is_primed_by_lead_and_scheduled_lead_ahead() {
         let (mut g, lines) = group(
@@ -1288,22 +1479,22 @@ mod tests {
         assert!(!g.ready(100, Some(101), THIRTIETHS, Some(101)), "priming");
         g.arrive(0, frame(300, 12));
         assert!(g.ready(100, Some(101), THIRTIETHS, Some(101)));
-        let handed = g.tick(100, Some(101), THIRTIETHS, &grid);
+        let handed = g.tick(100, Some(101), THIRTIETHS, &grid, true);
         let feed = handed[0].feed.clone().expect("scheduled");
         assert_eq!((feed.start.first_pts, feed.start.at), (0, 109));
         assert!(handed[0].frames.is_empty(), "nothing shows before `at`");
         assert!(lines.lock().unwrap()[0].contains("comes up at 3.633s, mapped from 0.000s"));
-        let handed = g.tick(108, Some(109), THIRTIETHS, &grid);
+        let handed = g.tick(108, Some(109), THIRTIETHS, &grid, true);
         assert!(handed[0].frames.is_empty());
-        let handed = g.tick(109, Some(110), THIRTIETHS, &grid);
+        let handed = g.tick(109, Some(110), THIRTIETHS, &grid, true);
         assert_eq!(mark(&handed[0]), Some(10));
-        let handed = g.tick(110, Some(111), THIRTIETHS, &grid);
+        let handed = g.tick(110, Some(111), THIRTIETHS, &grid, true);
         assert_eq!(
             mark(&handed[0]),
             Some(10),
             "33 ms in: the frame at 40 ms is ahead"
         );
-        let handed = g.tick(111, Some(112), THIRTIETHS, &grid);
+        let handed = g.tick(111, Some(112), THIRTIETHS, &grid, true);
         assert_eq!(mark(&handed[0]), Some(11));
     }
 
@@ -1318,24 +1509,24 @@ mod tests {
         for k in 0..10 {
             g.arrive(0, frame(5000 + k * 40, k as u8));
         }
-        let handed = g.tick(100, Some(101), THIRTIETHS, &grid);
+        let handed = g.tick(100, Some(101), THIRTIETHS, &grid, true);
         let feed = handed[0].feed.clone().expect("held");
         assert_eq!(feed.start.at, 150);
         assert!(handed[0].frames.is_empty());
-        let handed = g.tick(150, Some(151), THIRTIETHS, &grid);
+        let handed = g.tick(150, Some(151), THIRTIETHS, &grid, true);
         assert_eq!(mark(&handed[0]), Some(0));
-        let handed = g.tick(156, Some(157), THIRTIETHS, &grid);
+        let handed = g.tick(156, Some(157), THIRTIETHS, &grid, true);
         assert_eq!(
             mark(&handed[0]),
             Some(5),
             "0.2 s in: frames 1 to 4 are skipped"
         );
         g.source_close(0);
-        let handed = g.tick(157, Some(158), THIRTIETHS, &grid);
+        let handed = g.tick(157, Some(158), THIRTIETHS, &grid, true);
         assert_eq!(mark(&handed[0]), Some(5));
         let foretold: Vec<Option<i64>> = (158..=161)
             .map(|k| {
-                g.tick(k, Some(k + 1), THIRTIETHS, &grid)[0]
+                g.tick(k, Some(k + 1), THIRTIETHS, &grid, true)[0]
                     .feed
                     .as_ref()
                     .and_then(|f| f.ends)
@@ -1361,7 +1552,7 @@ mod tests {
             g.arrive(0, frame(2, 2));
             g.source_close(0);
             let shown: Vec<Option<u8>> = (0..8)
-                .map(|k| mark(&g.tick(k, Some(k + 1), THIRTIETHS, &grid)[0]))
+                .map(|k| mark(&g.tick(k, Some(k + 1), THIRTIETHS, &grid, true)[0]))
                 .collect();
             let wanted: Vec<Option<u8>> = (0..8)
                 .map(|k| match k {
@@ -1389,7 +1580,7 @@ mod tests {
         let grid = Grid::exact();
         g.arrive(0, frame(0, 1));
         let shown: Vec<Option<u8>> = (0..5)
-            .map(|k| mark(&g.tick(k, Some(k + 1), THIRTIETHS, &grid)[0]))
+            .map(|k| mark(&g.tick(k, Some(k + 1), THIRTIETHS, &grid, true)[0]))
             .collect();
         assert_eq!(shown, vec![Some(1), Some(1), Some(1), None, None]);
         assert!(lines
@@ -1398,7 +1589,7 @@ mod tests {
             .iter()
             .any(|l| l.contains("stopped sending")));
         g.arrive(0, frame(7, 2));
-        let handed = g.tick(7, Some(8), THIRTIETHS, &grid);
+        let handed = g.tick(7, Some(8), THIRTIETHS, &grid, true);
         assert_eq!(mark(&handed[0]), Some(2));
         assert_eq!(handed[0].feed.as_ref().unwrap().start.first_pts, 7);
     }
@@ -1413,7 +1604,7 @@ mod tests {
                 true,
             );
             g.arrive(0, frame(first_pts, 1));
-            let feed = g.tick(now, Some(now + 1), THIRTIETHS, &grid)[0]
+            let feed = g.tick(now, Some(now + 1), THIRTIETHS, &grid, true)[0]
                 .feed
                 .clone()
                 .expect("fixed");
@@ -1438,7 +1629,7 @@ mod tests {
             g.arrive(0, frame(0, 1));
             g.arrive(0, frame(400, 2));
             g.source_close(0);
-            let feed = g.tick(100, Some(101), THIRTIETHS, &grid)[0]
+            let feed = g.tick(100, Some(101), THIRTIETHS, &grid, true)[0]
                 .feed
                 .clone()
                 .expect("fixed");
@@ -1462,7 +1653,7 @@ mod tests {
         );
         g.arrive(0, frame(0, 1));
         for k in 0..5 {
-            g.tick(k, Some(k + 1), THIRTIETHS, &grid);
+            g.tick(k, Some(k + 1), THIRTIETHS, &grid, true);
         }
         let ended = g.take_ended();
         assert_eq!(ended.len(), 1, "a timeout");
@@ -1471,8 +1662,8 @@ mod tests {
         assert!(g.take_ended().is_empty(), "taken once");
 
         g.arrive(0, frame(5, 2));
-        g.tick(5, Some(6), THIRTIETHS, &grid);
-        g.tick(6, Some(7), THIRTIETHS, &grid);
+        g.tick(5, Some(6), THIRTIETHS, &grid, true);
+        g.tick(6, Some(7), THIRTIETHS, &grid, true);
         g.clock_jumped(90, THIRTIETHS);
         let ended = g.take_ended();
         assert_eq!(ended.len(), 1, "a jump in the clock");
@@ -1488,7 +1679,7 @@ mod tests {
         g.source_close(0);
         let foretold: Vec<Option<i64>> = (0..4)
             .map(|k| {
-                g.tick(k, Some(k + 1), THIRTIETHS, &grid)[0]
+                g.tick(k, Some(k + 1), THIRTIETHS, &grid, true)[0]
                     .feed
                     .as_ref()
                     .and_then(|f| f.ends)
@@ -1515,7 +1706,7 @@ mod tests {
             g.source_close(0);
             let foretold: Vec<Option<i64>> = (0..4)
                 .map(|k| {
-                    g.tick(k * 1024, Some((k + 1) * 1024), KHZ48, &grid)[0]
+                    g.tick(k * 1024, Some((k + 1) * 1024), KHZ48, &grid, true)[0]
                         .feed
                         .as_ref()
                         .and_then(|f| f.ends)
@@ -1546,16 +1737,19 @@ mod tests {
         g.arrive(0, frame(100, 3));
         g.arrive(0, frame(101, 4));
         assert!(g.ready(0, Some(1), THIRTIETHS, None));
-        assert_eq!(mark(&g.tick(0, Some(1), THIRTIETHS, &grid)[0]), Some(1));
-        let handed = g.tick(1, Some(2), THIRTIETHS, &grid);
+        assert_eq!(
+            mark(&g.tick(0, Some(1), THIRTIETHS, &grid, true)[0]),
+            Some(1)
+        );
+        let handed = g.tick(1, Some(2), THIRTIETHS, &grid, true);
         assert_eq!(mark(&handed[0]), Some(2));
         assert_eq!(handed[0].feed.as_ref().unwrap().ends, Some(1));
         assert_eq!(
-            mark(&g.tick(2, Some(3), THIRTIETHS, &grid)[0]),
+            mark(&g.tick(2, Some(3), THIRTIETHS, &grid, true)[0]),
             None,
             "ended"
         );
-        let handed = g.tick(3, Some(4), THIRTIETHS, &grid);
+        let handed = g.tick(3, Some(4), THIRTIETHS, &grid, true);
         assert_eq!(handed[0].feed.as_ref().unwrap().start.first_pts, 100);
         assert!(
             handed[0].frames.is_empty(),
@@ -1573,7 +1767,7 @@ mod tests {
         g.arrive(0, frame(1000, 1));
         g.arrive(1, samples(48480, 1000));
         g.arrive(0, frame(1040, 2));
-        let handed = g.tick(300, Some(301), THIRTIETHS, &Grid::exact());
+        let handed = g.tick(300, Some(301), THIRTIETHS, &Grid::exact(), true);
         let sound = handed[1].feed.clone().unwrap();
         assert_eq!((sound.start.first_pts, sound.start.at), (48000, 300));
     }
@@ -1596,7 +1790,7 @@ mod tests {
         );
         g.arrive(0, frame(1000, 1));
         g.arrive(0, frame(1040, 2));
-        let handed = g.tick(300, Some(301), THIRTIETHS, &Grid::exact());
+        let handed = g.tick(300, Some(301), THIRTIETHS, &Grid::exact(), true);
         assert!(handed[0].feed.is_some());
         assert!(handed[1].feed.is_none() && handed[1].frames.is_empty());
         let said = lines.lock().unwrap().join("\n");
@@ -1621,7 +1815,7 @@ mod tests {
         );
         g.arrive(1, samples(48000, 1600));
         g.arrive(1, samples(49600, 1600));
-        let handed = g.tick(300, Some(301), THIRTIETHS, &Grid::exact());
+        let handed = g.tick(300, Some(301), THIRTIETHS, &Grid::exact(), true);
         assert!(handed[0].feed.is_none() && handed[0].frames.is_empty());
         let sound = handed[1].feed.clone().expect("the sound has a feed");
         assert_eq!((sound.start.first_pts, sound.start.at), (48000, 300));
@@ -1630,7 +1824,7 @@ mod tests {
         assert!(said.contains(r#""input":"in2""#), "{said}");
         assert!(said.contains(r#""absent":["in1"]"#), "{said}");
         g.source_close(1);
-        let handed = g.tick(301, Some(302), THIRTIETHS, &Grid::exact());
+        let handed = g.tick(301, Some(302), THIRTIETHS, &Grid::exact(), true);
         assert_eq!(handed[1].frames[0].pts, 49600);
     }
 
@@ -1647,7 +1841,7 @@ mod tests {
         g.arrive(1, samples(49000, 1000));
         g.arrive(1, samples(50000, 1000));
         g.arrive(0, frame(1040, 2));
-        let handed = g.tick(300, Some(301), THIRTIETHS, &grid);
+        let handed = g.tick(300, Some(301), THIRTIETHS, &grid, true);
         let picture = handed[0].feed.clone().unwrap();
         let sound = handed[1].feed.clone().unwrap();
         assert_eq!((picture.start.first_pts, picture.start.at), (1000, 300));
@@ -1659,17 +1853,17 @@ mod tests {
             |k: usize| f32::from_le_bytes(run.data.host()[k * 4..k * 4 + 4].try_into().unwrap());
         assert_eq!(value(0), 48000.0);
         assert_eq!(value(1599), 49599.0);
-        let handed = g.tick(301, Some(302), THIRTIETHS, &grid);
+        let handed = g.tick(301, Some(302), THIRTIETHS, &grid, true);
         let run = &handed[1].frames[0];
         assert_eq!(
             (run.pts, run.duration),
             (49600, Some(1400)),
             "behind: a short run"
         );
-        let handed = g.tick(302, Some(303), THIRTIETHS, &grid);
+        let handed = g.tick(302, Some(303), THIRTIETHS, &grid, true);
         assert!(handed[1].frames.is_empty(), "nothing in the window: none");
         g.arrive(1, samples(53000, 1000));
-        let handed = g.tick(303, Some(304), THIRTIETHS, &grid);
+        let handed = g.tick(303, Some(304), THIRTIETHS, &grid, true);
         let run = &handed[1].frames[0];
         assert_eq!(
             (run.pts, run.duration),
@@ -1688,7 +1882,7 @@ mod tests {
         let grid = Grid::exact();
         g.arrive(0, samples(0, 800));
         g.arrive(0, samples(1000, 800));
-        let handed = g.tick(0, Some(1), THIRTIETHS, &grid);
+        let handed = g.tick(0, Some(1), THIRTIETHS, &grid, true);
         let run = &handed[0].frames[0];
         assert_eq!((run.pts, run.duration), (0, Some(1600)));
         let value =
@@ -1697,7 +1891,7 @@ mod tests {
         assert_eq!(value(800), 0.0, "the hole is silence");
         assert_eq!(value(1000), 1000.0);
         g.arrive(0, samples(1800, 10000));
-        let handed = g.tick(3, Some(4), THIRTIETHS, &grid);
+        let handed = g.tick(3, Some(4), THIRTIETHS, &grid, true);
         let run = &handed[0].frames[0];
         assert_eq!((run.pts, run.duration), (4800, Some(1600)));
     }
@@ -1720,7 +1914,7 @@ mod tests {
             },
         );
         g.arrive(0, frame(50, 1));
-        let handed = g.tick(10, Some(11), THIRTIETHS, &grid);
+        let handed = g.tick(10, Some(11), THIRTIETHS, &grid, true);
         assert_eq!(handed[0].feed.as_ref().unwrap().start.at, 50);
         assert_eq!(handed[0].info.as_ref().unwrap().0.tags[0].0, "smart_timed");
         assert_eq!(g.room(), 0, "held: the source waits on its socket");
@@ -1735,11 +1929,11 @@ mod tests {
             },
         );
         g.arrive(0, frame(0, 2));
-        let handed = g.tick(50, Some(51), THIRTIETHS, &grid);
+        let handed = g.tick(50, Some(51), THIRTIETHS, &grid, true);
         assert_eq!(mark(&handed[0]), Some(1));
-        let handed = g.tick(51, Some(52), THIRTIETHS, &grid);
+        let handed = g.tick(51, Some(52), THIRTIETHS, &grid, true);
         assert!(handed[0].frames.is_empty(), "the first feed ended");
-        let handed = g.tick(52, Some(53), THIRTIETHS, &grid);
+        let handed = g.tick(52, Some(53), THIRTIETHS, &grid, true);
         assert_eq!(
             handed[0].feed.as_ref().unwrap().start.at,
             52,
@@ -1753,7 +1947,7 @@ mod tests {
         let grid = Grid::exact();
         let hold = || hold(Anchor::FirstFrame, 0.5, None, None);
         let ends = |g: &mut Group, k: i64| {
-            g.tick(k, Some(k + 1), THIRTIETHS, &grid)[0]
+            g.tick(k, Some(k + 1), THIRTIETHS, &grid, true)[0]
                 .feed
                 .as_ref()
                 .and_then(|f| f.ends)

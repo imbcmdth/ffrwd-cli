@@ -363,12 +363,27 @@ tick that held them.
   `lead` seconds of it are held, or its end, and scheduled `lead` ahead of
   the clock, on the clock's grid; a `shared-clock` source's first frame
   waits for the clock to reach its pts, and one the clock has passed shows
-  at once from where the clock is. The last frame shows on its own turn
-  and the feed ends after it, unless `linger` keeps it; a clock that jumps
-  (backwards, or more than a second forwards) ends every feed. The host
-  foretells the last tick a feed shows on (`feed.ends`), counted on the
-  clock's grid (exact for a rate clock, learned from the frames of an
-  input clock), from the first tick it can:
+  at once from where the clock is. A port feed arrives in real time, so a
+  `first-frame` port feed that comes up while the node is not keeping up
+  with its clock (an input clock whose ticks over the last quarter second
+  were not cut at its own pace, as when its source queued while the run
+  started and is being caught up on) is fixed for the time being only.
+  Fixed for good then, it would be early by however far behind the clock
+  was, and once the clock had caught up its sound would be asked for
+  before it arrived, and be silent, and its pictures shown late. On the
+  first tick the clock is kept up with, the feed moves later, once, by as
+  many whole ticks as lay its newest frame `lead` ahead of that tick, and
+  by no more than the clock gained on the wall since it was fixed. The
+  picture and the sound move together, so they stay in sync: the picture
+  repeats and the sound is silent for that long, once, near the feed's
+  start, and the line `the feed is laid ... later` (a `later` row) says by
+  how much. A feed that comes up while the clock is kept up with is fixed
+  once, as is one on a node that never keeps up. The last frame shows on
+  its own turn and the feed ends after it, unless `linger` keeps it; a
+  clock that jumps (backwards, or more than a second forwards) ends every
+  feed. The host foretells the last tick a feed shows on (`feed.ends`),
+  counted on the clock's grid (exact for a rate clock, learned from the
+  frames of an input clock), from the first tick it can:
   - a feed bound to a stream: the first tick its last frame's turn is
     within `lead` of, the same tick on every run and at every `-jobs`,
     since the tick waited for the source that far; at `lead` 0, the tick
