@@ -923,6 +923,33 @@ def test_enrichment_fields_present_are_parsed_with_correct_types(
     assert v.channel_layout is None
 
 
+@pytest.mark.parametrize(
+    ("rates", "fps"),
+    [
+        ({"avg_frame_rate": "30000/1001", "r_frame_rate": "60000/1001"}, "30000/1001"),
+        ({"avg_frame_rate": "0/0", "r_frame_rate": "60/1"}, "60/1"),
+        ({"r_frame_rate": "60/1"}, "60/1"),
+        ({}, None),
+        ({"avg_frame_rate": "0/0", "r_frame_rate": "0/0"}, None),
+    ],
+    ids=["average", "unknown-average", "no-average", "neither", "both-unknown"],
+)
+def test_a_video_rate_is_the_average_else_r_frame_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rates: dict[str, str], fps: str | None
+) -> None:
+    """The average when it is a rate, else r_frame_rate when that is: older
+    ffprobe writes 0/0 for a lavfi source's average and the right rate in
+    r_frame_rate."""
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=json.dumps({"streams": [{"codec_type": "video", **rates}]}))
+
+    result = probe(str(f))
+    assert result is not None
+    assert result.streams[0].fps == fps
+
+
 def test_container_duration_absent_when_format_key_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

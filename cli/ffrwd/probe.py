@@ -46,6 +46,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 
 from ffrwd import binaries
 from ffrwd.ir import StreamType
@@ -110,7 +111,7 @@ class StreamMeta:
     metadata: dict[str, str]  # the stream's tags in full, keys lowercased
     width: int | None
     height: int | None
-    fps: str | None  # e.g. "30000/1001", verbatim from ffprobe avg_frame_rate
+    fps: str | None  # e.g. "30000/1001", verbatim from ffprobe (see `_frame_rate`)
     sample_rate: int | None
     codec: str | None = None  # ffprobe codec_name, verbatim
     channels: int | None = None  # audio only
@@ -1250,7 +1251,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         metadata=metadata,
                         width=int(raw["width"]) if "width" in raw else None,
                         height=int(raw["height"]) if "height" in raw else None,
-                        fps=str(raw["avg_frame_rate"]) if "avg_frame_rate" in raw else None,
+                        fps=_frame_rate(raw),
                         sample_rate=None,
                         codec=codec,
                         channels=None,
@@ -1518,6 +1519,28 @@ def _str_opt(raw: dict[str, object], key: str) -> str | None:
     if key not in raw or raw[key] is None:
         return None
     return str(raw[key])
+
+
+def _frame_rate(raw: dict[str, object]) -> str | None:
+    """A video stream's frame rate as ffprobe writes it, e.g. ``30000/1001``.
+
+    ``avg_frame_rate`` when it is a rate above zero, else ``r_frame_rate``
+    when that is, else None. ffprobe writes ``0/0`` for a rate it does not
+    know, and some builds write it for the average of a lavfi source whose
+    ``r_frame_rate`` is still right. The average is taken first because for
+    a file it is the rate the stream plays at, where ``r_frame_rate`` is the
+    lowest rate every timestamp fits.
+    """
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        text = _str_opt(raw, key)
+        if text is None:
+            continue
+        try:
+            if Fraction(text) > 0:
+                return text
+        except (ValueError, ZeroDivisionError):
+            continue
+    return None
 
 
 def _dispositions(raw: dict[str, object]) -> dict[str, bool]:
