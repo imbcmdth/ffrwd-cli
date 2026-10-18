@@ -59,7 +59,7 @@ use wgpu_core::id::{AdapterId, DeviceId, QueueId, TextureId};
 use wgpu_hal::api::Vulkan;
 use wgpu_types::{Extent3d, TextureAspect, TextureFormat};
 
-use super::frames::{create_plane, GpuFrame, Layout, Plane, Target, Yuv};
+use super::frames::{GpuFrame, Layout, Plane, Target, Yuv};
 use super::{shared, shared_device};
 use crate::av::{self, DeviceFrame};
 
@@ -622,6 +622,88 @@ fn raw_image(global: &Global, texture: TextureId) -> Result<vk::Image> {
 /// `VK_FORMAT_G8_B8R8_2PLANE_420_UNORM`: NV12 in one multi-planar image.
 const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 
+/// The usage of a plane a decoder's picture is copied into: a frame's.
+const PLANE_USAGE: wgpu_types::TextureUsages = wgpu_types::TextureUsages::TEXTURE_BINDING
+    .union(wgpu_types::TextureUsages::COPY_SRC)
+    .union(wgpu_types::TextureUsages::COPY_DST)
+    .union(wgpu_types::TextureUsages::RENDER_ATTACHMENT);
+
+/// A texture of the device for one plane of a decoder's picture, made by
+/// wgpu-hal and handed to wgpu-core, which counts a texture made that way
+/// as written. One made by wgpu-core is counted as unwritten until a
+/// command of its own writes it, and is cleared before it is first read,
+/// which would clear what the copy wrote there.
+fn copy_target(
+    global: &Global,
+    device: &SharedDevice,
+    width: u32,
+    height: u32,
+    format: TextureFormat,
+    bytes_per_pixel: u32,
+) -> Result<Plane> {
+    use wgpu_hal::Device as _;
+    let size = Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
+    let uses = wgpu_types::TextureUses::RESOURCE
+        | wgpu_types::TextureUses::COPY_SRC
+        | wgpu_types::TextureUses::COPY_DST
+        | wgpu_types::TextureUses::COLOR_TARGET;
+    let hal = {
+        // SAFETY: the device is only referenced here.
+        let hal_device = unsafe { global.device_as_hal::<Vulkan>(device.device) }
+            .ok_or_else(|| anyhow!("the process's device is not a Vulkan one"))?;
+        // SAFETY: a valid description of a 2D, single-level texture.
+        unsafe {
+            hal_device.create_texture(&wgpu_hal::TextureDescriptor {
+                label: Some("ffrwd decoded plane"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu_types::TextureDimension::D2,
+                format,
+                usage: uses,
+                memory_flags: wgpu_hal::MemoryFlags::empty(),
+                view_formats: Vec::new(),
+            })
+        }
+        .map_err(|e| anyhow!("a {width}x{height} {format:?} texture: {e}"))?
+    };
+    // SAFETY: made just above on this device from the same description;
+    // it is written by the copy before anything reads it.
+    let (texture, err) = unsafe {
+        global.create_texture_from_hal(
+            Box::new(hal),
+            device.device,
+            &wgpu_types::TextureDescriptor {
+                label: Some(std::borrow::Cow::Borrowed("ffrwd decoded plane")),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu_types::TextureDimension::D2,
+                format,
+                usage: PLANE_USAGE,
+                view_formats: Vec::new(),
+            },
+            None,
+        )
+    };
+    if let Some(e) = err {
+        global.texture_drop(texture);
+        bail!("a {width}x{height} {format:?} texture: {e}");
+    }
+    Ok(Plane {
+        texture,
+        aspect: TextureAspect::All,
+        width,
+        height,
+        format,
+        bytes_per_pixel,
+    })
+}
+
 /// What a decoder's picture taken here is.
 pub(super) struct Taken {
     pub planes: Vec<Plane>,
@@ -662,8 +744,8 @@ impl Taker {
         let opened = opened()?;
         let (width, height) = (picture.width, picture.height);
         let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
-        let y = create_plane(global, device, width, height, TextureFormat::R8Unorm, 1)?;
-        let uv = match create_plane(global, device, cw, ch, TextureFormat::Rg8Unorm, 2) {
+        let y = copy_target(global, device, width, height, TextureFormat::R8Unorm, 1)?;
+        let uv = match copy_target(global, device, cw, ch, TextureFormat::Rg8Unorm, 2) {
             Ok(uv) => uv,
             Err(e) => {
                 global.texture_drop(y.texture);
