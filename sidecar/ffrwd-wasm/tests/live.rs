@@ -32,6 +32,7 @@ const MODULES: &[&str] = &[
     "shape-window",
     "shape-hold",
     "shape-probe",
+    "shape-group",
 ];
 
 const RATE: u32 = 48_000;
@@ -676,7 +677,8 @@ fn start_padded(
     if chain.contains("[feeds=f]") || chain.contains("[spots=f]") {
         command.args(["-map", "[f]", "-f", "ndjson", &feeds]);
     }
-    if chain.contains("[clock=c]") {
+    // A second rows output of the node rides the same file as `clock`.
+    if chain.contains("[clock=c]") || chain.contains("[cues=c]") {
         command.args(["-map", "[c]", "-f", "ndjson", &clock]);
     }
     command.stdin(Stdio::piped());
@@ -1634,6 +1636,140 @@ fn rows_a_feeder_writes_beside_its_picture_and_sound_land_with_the_groups_offset
         ],
         "each row at the clock time its feeder's picture of that moment shows, on that tick:
 {}",
+        out.stderr
+    );
+}
+
+/// The feeds `shape_group` said one stream of `input` had, in order: each
+/// start as (at, first_pts), or None where its feed went off.
+fn group_feeds(out: &Output, input: &str, k: u64) -> Vec<(i64, Option<(i64, i64)>)> {
+    out.feeds
+        .iter()
+        .filter(|r| r["member"] == input && r["k"].as_u64() == Some(k))
+        .map(|r| {
+            let start = (
+                r["at_pts"].as_i64().unwrap(),
+                r["first_pts"].as_i64().unwrap(),
+            );
+            (
+                r["pts"].as_i64().unwrap(),
+                r["live"].as_bool().unwrap().then_some(start),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn each_connection_of_a_many_hold_group_is_a_feed_of_its_own_with_its_sound_beside_its_picture() {
+    let _serial = serial();
+    let program = Program::new(30, 9.0);
+    let (first, second) = (free_port(), free_port());
+    let dir = scratch("group-many-params");
+    let params = dir.join("params.json");
+    fs::write(&params, format!(r#"{{"ports":[{first},{second}]}}"#)).expect("write the params");
+    let from = format!("shape_group={}", params.display());
+    let (mut run, _) = start_padded(
+        "group-many",
+        &program,
+        "1",
+        &["shape_group"],
+        "[c=0:v][a=0:a]shape_group[c=o][feeds=f][cues=c]",
+        &["-params-from", &from],
+    );
+    wait_for_port(&mut run, first);
+    wait_for_port(&mut run, second);
+    // The first connection stays on throughout; the second comes, goes and
+    // comes back on another origin while it is.
+    let mut main = Feeder::new(30, 6.0);
+    main.start = 10.0;
+    main.rows = vec![
+        (10_200, r#"{"text":"a"}"#.to_string()),
+        (12_000, r#"{"text":"b"}"#.to_string()),
+    ];
+    let mut again = Feeder::new(30, 1.5);
+    again.start = 20.0;
+    let fed = [
+        feed(first, main, Duration::from_millis(500)),
+        feed(second, Feeder::new(30, 1.5), Duration::from_millis(1500)),
+        feed(second, again, Duration::from_millis(4500)),
+    ];
+    let out = finish(run);
+    for one in fed {
+        one.join().expect("a feeder");
+    }
+    let _ = fs::remove_dir_all(&dir);
+
+    let main_feeds = group_feeds(&out, "v", 0);
+    let second_feeds = group_feeds(&out, "v", 1);
+    assert!(
+        matches!(
+            main_feeds.as_slice(),
+            [(_, Some(_)), (_, None)] | [(_, Some(_))]
+        ),
+        "the first connection is one feed, on until it ends: {main_feeds:?}\n{}",
+        out.stderr
+    );
+    let (main_at, main_first) = main_feeds[0].1.unwrap();
+    assert_eq!(main_first, 300, "its own origin, ten seconds in");
+    let starts: Vec<i64> = second_feeds
+        .iter()
+        .filter_map(|(_, start)| start.map(|s| s.1))
+        .collect();
+    assert_eq!(
+        starts,
+        vec![0, 600],
+        "the second connection is anchored again when it rejoins: {second_feeds:?}\n{}",
+        out.stderr
+    );
+    let rejoined = second_feeds
+        .iter()
+        .find(|(_, start)| start.is_some_and(|s| s.1 == 600))
+        .unwrap()
+        .0;
+    assert!(
+        main_feeds.get(1).is_none_or(|(off, _)| *off > rejoined),
+        "the first is still on when the second rejoins: {main_feeds:?} {second_feeds:?}"
+    );
+    for k in 0..2 {
+        let picture = group_feeds(&out, "v", k);
+        let sound = group_feeds(&out, "s", k);
+        let on = |feeds: &[(i64, Option<(i64, i64)>)]| -> Vec<(i64, i64)> {
+            feeds.iter().filter_map(|(_, start)| *start).collect()
+        };
+        let (picture, sound) = (on(&picture), on(&sound));
+        assert_eq!(
+            picture.iter().map(|s| s.0).collect::<Vec<_>>(),
+            sound.iter().map(|s| s.0).collect::<Vec<_>>(),
+            "connection {k}'s picture and sound share each feed's offset\n{}",
+            out.stderr
+        );
+        for (p, s) in picture.iter().zip(&sound) {
+            let apart = p.1 as f64 / 30.0 - s.1 as f64 / f64::from(RATE);
+            assert!(
+                apart.abs() <= 1.0 / 30.0,
+                "connection {k}'s sound starts where its picture does: {p:?} {s:?}"
+            );
+        }
+    }
+    let cues: Vec<(i64, i64, String)> = out
+        .clock
+        .iter()
+        .map(|r| {
+            let text: Value = serde_json::from_str(r["text"].as_str().unwrap()).unwrap();
+            (
+                r["pts"].as_i64().unwrap(),
+                r["cue_pts"].as_i64().unwrap(),
+                text["text"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        cues,
+        vec![
+            (main_at + 6, main_at + 6, "a".to_string()),
+            (main_at + 60, main_at + 60, "b".to_string()),
+        ],
+        "the first connection's rows land with its own offset, the second on or not:\n{}",
         out.stderr
     );
 }

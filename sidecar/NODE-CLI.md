@@ -272,9 +272,13 @@ it is conformed ends `on the GPU`. A coded picture for such an input is
 decoded on the process's device where its decoder shares it (`d3d12va` on
 Windows), as `decode` does for a reader on the GPU, so it never crosses
 host memory; elsewhere it is decoded in software and uploaded once. A
-group of
-hold inputs (`hold.group`) shares one listener and one connection, its
-picture to the video port and its sound to the audio port.
+group of hold inputs (`hold.group`) is one per connection: the inputs of a
+group share each port's listener and connection, its picture to the video
+input and its sound to the audio input. Many inputs (`many`) given a list
+of ports take a stream each per port, in the list's order, so the k-th
+stream of each input arrives on the k-th port. Each connection has its
+own source, feed and offset: a second port's feeder connecting, dropping
+or rejoining leaves the first's feed as it was.
 
 One connection at a time: a second while one is on is accepted and closed
 at once, and a connection that has sent nothing is dropped for one that
@@ -285,7 +289,7 @@ tags and time base from its start on; a source whose pts jump backwards or
 more than a second forwards is a new feed on the same connection. A
 connection may carry any of a group's members, and streams beyond them are
 left on the wire: a feeder of sound alone feeds the sound. Every member of
-a group is told the lead's offset, the picture's where the connection
+a connection is told its lead's offset, the picture's where the connection
 brings one and otherwise its first member's: its `feed-start.at` is the
 lead's, and its `first-pts` the point of its own stream that offset puts
 there, so `(at, first-pts)` maps any member's pts onto the clock. A member
@@ -293,7 +297,8 @@ the connection does not bring (not sent, or its sound refused) gets no feed
 at all on any tick, where one not arrived yet gets a feed and no frames.
 
 A data input whose `interval` names the group (`interval.group`) arrives
-on the same connection, unbound by any pad, as the hold inputs do. What a
+on the group's first port, unbound by any pad, and is placed with that
+connection's offset. What a
 feeder writes so its rows land there, in one NUT:
 
 - the picture (raw video, rgba or yuv420p) and the sound (PCM) as above,
@@ -317,6 +322,8 @@ it. A connection's messages never outlive its feed: those queued when it
 ends are dropped with it. A group data input bound by a pad is refused;
 with its group's hold inputs bound to streams rather than a port, it is
 bound to a stream like any data input and placed with that group's offset.
+A group bound to streams pairs its inputs' streams by position: the first
+stream of each input is one group with one offset, the second another.
 
 The host says what it did on stderr, as lines and as rows behind
 `ffrwd:row `: `{"kind":"listen",...}` once the port is bound,

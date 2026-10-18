@@ -1,7 +1,7 @@
 //! Hold pairing: a source's frames paired by time onto a node's clock.
 //!
-//! One [`Group`] serves one hold input, or every hold input of one `group`
-//! (a feeder's picture and sound on one connection). Frames arrive as the
+//! One [`Group`] serves one hold input, or the hold inputs of one `group`
+//! on one connection (a feeder's picture and sound). Frames arrive as the
 //! source delivers them and queue per member; each tick, a video member
 //! hands the newest frame at or before the tick, repeating the last one
 //! while the source is behind and skipping forward when it catches up, and

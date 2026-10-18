@@ -1956,6 +1956,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shape-group"
+version = "0.1.0"
+dependencies = [
+ "ffrwd-node",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "shape-hold"
 version = "0.1.0"
 dependencies = [

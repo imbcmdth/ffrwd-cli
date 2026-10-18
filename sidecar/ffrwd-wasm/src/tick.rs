@@ -591,14 +591,28 @@ pub struct Assembler {
     report: Report,
 }
 
+/// A hold group's name and connection; none for a hold input of no group,
+/// which is a group of its own.
+type GroupKey = Option<(String, Connection)>;
+
+/// The connection a stream of a hold group arrives on: the port of a port
+/// feed, or for a stream bound in the plan its place among its input's
+/// streams. A group is one per name and connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Connection {
+    Port(u16),
+    Bound(usize),
+}
+
 impl Assembler {
     /// The ticks of `name`, a node of `shape` bound to `bound`. `port_fed`
-    /// names the hold inputs a port feed serves, which never hold a tick.
+    /// names the streams a port feed serves, each with its port; their hold
+    /// inputs never hold a tick.
     pub fn new(
         shape: &NodeShape,
         bound: &[BoundStream],
         name: &str,
-        port_fed: &[u32],
+        port_fed: &[(u32, u16)],
     ) -> Result<Assembler> {
         let clock_base = match &shape.clock {
             Clock::Input(name) => bound.iter().find(|b| &b.port == name).map(|b| b.time_base),
@@ -610,9 +624,23 @@ impl Assembler {
         };
         let mut inputs = Vec::with_capacity(bound.len());
         let mut holds: Vec<Group> = Vec::new();
-        let mut on_groups: Vec<(usize, String, Member, bool)> = Vec::new();
-        let mut grouped: Vec<(Option<String>, Hold, Vec<Member>, bool)> = Vec::new();
-        for stream in bound {
+        let mut on_groups: Vec<(usize, String, Connection, Member, bool)> = Vec::new();
+        let mut grouped: Vec<(GroupKey, Hold, Vec<Member>, bool)> = Vec::new();
+        for (index, stream) in bound.iter().enumerate() {
+            let fed_on = port_fed
+                .iter()
+                .find(|(id, _)| *id == stream.id)
+                .map(|(_, port)| *port);
+            let connection = match fed_on {
+                Some(port) => Connection::Port(port),
+                None => Connection::Bound(
+                    bound[..index]
+                        .iter()
+                        .filter(|b| b.port == stream.port)
+                        .count(),
+                ),
+            };
+            let fed = fed_on.is_some();
             let port = shape
                 .input(&stream.port)
                 .ok_or_else(|| anyhow!("no input port '{}'", stream.port))?;
@@ -637,8 +665,7 @@ impl Assembler {
                         audio,
                         ahead: 0.0,
                     };
-                    let fed = port_fed.contains(&stream.id);
-                    let key = hold.group.clone();
+                    let key = hold.group.clone().map(|g| (g, connection));
                     let group = match key
                         .as_ref()
                         .and_then(|k| grouped.iter().position(|(g, ..)| g.as_ref() == Some(k)))
@@ -661,6 +688,7 @@ impl Assembler {
                     on_groups.push((
                         inputs.len(),
                         group.clone(),
+                        connection,
                         Member {
                             name: port.name.clone(),
                             kind: port.kind,
@@ -669,7 +697,7 @@ impl Assembler {
                             audio: None,
                             ahead: *ahead,
                         },
-                        port_fed.contains(&stream.id),
+                        fed,
                     ));
                     None
                 }
@@ -700,11 +728,19 @@ impl Assembler {
                 restamp,
             });
         }
-        for (index, key, member, fed) in on_groups {
-            let Some(group) = grouped
-                .iter()
-                .position(|(g, ..)| g.as_deref() == Some(key.as_str()))
-            else {
+        for (index, key, connection, member, fed) in on_groups {
+            let named = |g: &GroupKey| g.as_ref().is_some_and(|(g, _)| *g == key);
+            let Some(group) = grouped.iter().position(|(g, ..)| {
+                g.as_ref()
+                    .is_some_and(|(g, c)| *g == key && *c == connection)
+            }) else {
+                if grouped.iter().any(|(g, ..)| named(g)) {
+                    bail!(
+                        "input '{}' arrives on group '{key}', and none of that group's hold \
+                         inputs arrives on its connection",
+                        member.name
+                    );
+                }
                 bail!(
                     "input '{}' arrives on group '{key}', and this call binds none of that \
                      group's hold inputs",
@@ -1961,7 +1997,7 @@ mod tests {
                 bound("feed_audio", 2, KHZ48, audio()),
             ],
             "m",
-            &[1, 2],
+            &[(1, 9000), (2, 9000)],
         )
         .expect("assembler");
         let source = |base| crate::hold::SourceInfo {
@@ -1993,6 +2029,64 @@ mod tests {
         assert_eq!(sound.frames.len(), 1, "{:?}", sound.frames);
         assert_eq!(sound.frames[0].data.len(), 1600 * 4);
         assert_eq!(sound.info.as_ref().map(|(_, base)| *base), Some(KHZ48));
+    }
+
+    #[test]
+    fn a_group_bound_in_the_plan_pairs_its_many_inputs_stream_by_stream() {
+        let hold = Pairing::Hold(ffrwd_wasm_runtime::node::Hold {
+            anchor: ffrwd_wasm_runtime::node::Anchor::FirstFrame,
+            lead: 0.0,
+            linger: None,
+            timeout: None,
+            group: Some("g".to_string()),
+            port_param: None,
+        });
+        let many = |name: &str, kind: PortKind| InputPort {
+            many: true,
+            ..port(name, kind, hold.clone(), RowsUse::Ignore)
+        };
+        let s = shape(
+            vec![
+                port("v", PortKind::Video, Pairing::Lockstep, RowsUse::Ignore),
+                many("feed", PortKind::Video),
+                many("feed_audio", PortKind::Audio),
+            ],
+            Clock::Input("v".into()),
+        );
+        let tb = TimeBase { num: 1, den: 30 };
+        let mut a = Assembler::new(
+            &s,
+            &[
+                bound("v", 0, tb, video()),
+                bound("feed", 1, tb, video()),
+                bound("feed", 2, tb, video()),
+                bound("feed_audio", 3, KHZ48, audio()),
+                bound("feed_audio", 4, KHZ48, audio()),
+            ],
+            "m",
+            &[],
+        )
+        .expect("assembler");
+        for k in 0..3 {
+            a.arrive(0, frame(k, &[])).expect("video");
+            a.arrive(1, frame(k, &[])).expect("feed");
+            a.arrive(2, frame(100 + k, &[])).expect("feed");
+            a.arrive(3, samples(k * 1600, 1600)).expect("sound");
+            a.arrive(4, samples((100 + k) * 1600, 1600)).expect("sound");
+        }
+        let ticks = drain(&mut a);
+        let start = |id: usize| {
+            let feed = ticks[0].streams[id].feed.as_ref().expect("a feed");
+            (feed.start.at, feed.start.first_pts)
+        };
+        assert_eq!(start(1), (0, 0));
+        assert_eq!(
+            start(2),
+            (0, 100),
+            "the second picture is a feed of its own, anchored on its own first frame"
+        );
+        assert_eq!(start(3), (0, 0), "the first sound beside the first picture");
+        assert_eq!(start(4), (0, 160_000), "the second sound beside the second");
     }
 
     #[test]
@@ -2162,8 +2256,8 @@ mod tests {
             Clock::Rate(Rational { num: 30, den: 1 }),
         );
         let tb = TimeBase { num: 1, den: 30 };
-        let mut a =
-            Assembler::new(&s, &[bound("feed", 4, tb, video())], "m", &[4]).expect("assembler");
+        let mut a = Assembler::new(&s, &[bound("feed", 4, tb, video())], "m", &[(4, 9000)])
+            .expect("assembler");
         a.arrive(4, frame(0, &[])).expect("a frame");
         let mut heard: Vec<Vec<(u64, usize, i64)>> = vec![Vec::new(); 3];
         for _ in 0..10 {

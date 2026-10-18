@@ -1619,9 +1619,9 @@ fn open_module(
         &schema,
         defs,
     )?;
-    let port_fed: Vec<u32> = feeds
+    let port_fed: Vec<(u32, u16)> = feeds
         .iter()
-        .flat_map(|f| f.members.iter().map(|m| m.id))
+        .flat_map(|f| f.members.iter().map(|m| (m.id, f.port)))
         .collect();
     let latched: Vec<String> = call
         .outputs

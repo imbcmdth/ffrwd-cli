@@ -100,6 +100,8 @@ members = [
     # What the live switch did, as a node: the host's hold pairing, feeds by
     # port and both anchors, with none of the switch's own code.
     "shape-switch",
+    # Many pictures and many sounds on one hold group, a connection each.
+    "shape-group",
 ]
 resolver = "2"
 
