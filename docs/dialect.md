@@ -634,6 +634,12 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     `port_param`) is given a stream, or a port number: written in its
     place, or by the param's name, `inset(v, port => 9100)`. Given a
     number it binds nothing, and whatever connects to that port is shown.
+  - A `[]` input held on a port and given run-time laterals takes one
+    connection per lateral, every port in one list in its param. Inputs
+    of one group share that list, so a lateral's picture and sound arrive
+    on one connection with one offset, and a lateral may bring some of a
+    group's inputs and not others:
+    `compose(k.v, ARRAY[m.video, c.video], audio => ARRAY[m.audio])`.
   - `RETURNS` a stream; rows alone (`STRUCT(...)[]`, `cue[]`), a data
     stream the query reads while it runs; `STRUCT(<name> <type>, ...)`,
     one field per output the module makes, read off the call

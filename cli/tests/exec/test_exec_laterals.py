@@ -48,6 +48,7 @@ _RELEASE = _CLI_ROOT.parent / "sidecar" / "modules" / "target" / "wasm32-wasip2"
 _PROBE = _RELEASE / "feed_probe.wasm"
 _HEAR = _RELEASE / "feed_probe_audio.wasm"
 _STAMP = _RELEASE / "data_stamp.wasm"
+_GROUP = _RELEASE / "shape_group.wasm"
 _LAUNCH = _CLI_ROOT / "tests" / "data" / "launch.nut"
 _TIMEOUT = 120.0
 
@@ -70,6 +71,24 @@ RETURNS TABLE(audio audio_stream) AS $$
                                 channel_layouts => channels::text || 'c'),
                  'PTS+' || start_pts::text || '/TB') AS audio,
          STRUCT('1' AS smart_timed) AS tags
+  FROM input(url) m
+$$ LANGUAGE sql;
+"""
+
+
+# play with both columns; an instance whose sound no feeder reads binds its
+# sound's values by DEFAULT.
+_BOTH_PLAY = """CREATE FUNCTION play(launch data_stream, url text, start_pts number,
+                     duration number, width number, height number, fps number,
+                     pix_fmt text, rate number DEFAULT 48000,
+                     channels number DEFAULT 2, sample_fmt text DEFAULT 'f32')
+RETURNS TABLE(video video_stream, audio audio_stream) AS $$
+  SELECT setpts(ffmpeg.format(fps(scale(m.video[1], width, height), fps),
+                              pix_fmts => pix_fmt),
+                'PTS+' || start_pts::text || '/TB') AS video,
+         asetpts(ffmpeg.aformat(aresample(m.audio[1], rate), sample_fmts => sample_fmt,
+                                channel_layouts => channels::text || 'c'),
+                 'PTS+' || start_pts::text || '/TB') AS audio
   FROM input(url) m
 $$ LANGUAGE sql;
 """
@@ -242,3 +261,57 @@ def test_a_data_filters_output_reaches_the_lateral_and_the_file_both(
     written = _data_messages(out)
     assert [at for at, _ in written] == [0.1, 0.2, 0.3, 0.5]
     assert {message["node"] for _, message in written} == {"leaf"}
+
+
+def test_two_laterals_on_one_many_hold_group_are_a_connection_and_an_offset_each(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fleet's ``shape-group`` takes many pictures and many sounds on one
+    hold group. `m` brings its picture and its sound, `c` its picture alone,
+    stamped a second later: each is a connection of its own, live beside the
+    other on its own origin, and `m`'s picture and sound share each
+    instance's offset."""
+    if not _GROUP.exists():
+        pytest.skip(f"module missing: {_GROUP}")
+    programme = _media(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    fed = tmp_path / "fed.ndjson"
+    late = _BOTH_PLAY.replace("play(", "late(", 1).replace(
+        "'PTS+' || start_pts::text", "'PTS+' || (start_pts + 1)::text"
+    )
+    sql = (
+        "CREATE FUNCTION grp(c video_stream, a audio_stream, v video_stream[] DEFAULT NULL, "
+        "s audio_stream[] DEFAULT NULL, ports number DEFAULT NULL)\nRETURNS STRUCT("
+        "c video_stream, feeds STRUCT(pts number, member text, k number, live boolean, "
+        "at_pts number, first_pts number)[])\n"
+        f"AS '{_GROUP.as_posix()}', 'shape_group' LANGUAGE wasm;\n" + _BOTH_PLAY + late
+        + "COPY (SELECT grp(p.video[1], p.audio[1], ARRAY[m.video, c.video], "
+        "ARRAY[m.audio]).feeds FROM "
+        f"input('{programme.as_posix()}', realtime => true) p, "
+        f"input('{_LAUNCH.as_posix()}') f, LATERAL play(f.data[1]) m, "
+        f"LATERAL late(f.data[1]) c) TO '{fed.as_posix()}'"
+    )
+    rows = _run(sql, capsys)
+    feeders = [row for row in rows if row.get("event") == "feeder"]
+    assert len([row for row in feeders if row.get("exit") == 0]) == 4, feeders
+    said = [json.loads(line) for line in fed.read_text().splitlines() if line]
+
+    def starts(member: str, k: int, field: str = "at_pts") -> list[int]:
+        return [
+            int(row[field]) for row in said
+            if (row["member"], row["k"], row["live"]) == (member, k, True)
+        ]
+
+    # Two instances of each lateral, each anchored as it connects.
+    assert len(starts("v", 0)) == 2, said
+    assert len(starts("v", 1)) == 2, said
+    assert starts("s", 0) == starts("v", 0), "m's sound shares its picture's offset"
+    assert starts("s", 1) == [], "c brings no sound"
+    firsts = list(zip(starts("v", 0, "first_pts"), starts("v", 1, "first_pts"), strict=True))
+    assert all(mine < its for mine, its in firsts), f"c's feeds start on c's pts: {firsts}"
+    live: dict[tuple[str, int], bool] = {}
+    both = False
+    for row in said:
+        live[(str(row["member"]), int(row["k"]))] = bool(row["live"])
+        both = both or (live.get(("v", 0), False) and live.get(("v", 1), False))
+    assert both, f"each connection is live while the other is: {said}"

@@ -16629,7 +16629,15 @@ class _Lowerer:
                 if number not in numbers_given:
                     numbers_given.append(number)
                 feeds.append((number, one, conformed))
-            ports[hold.port_param] = numbers_given if listed else numbers_given[0]
+            if listed:
+                # Every many input of a group lists the group's connections
+                # in one param, in the order they were first written.
+                given = ports.get(hold.port_param)
+                listing = list(given) if isinstance(given, list) else []
+                listing += [number for number in numbers_given if number not in listing]
+                ports[hold.port_param] = listing
+            else:
+                ports[hold.port_param] = numbers_given[0]
         if ports:
             # The port is one of the call's params, and the shape is asked
             # for the params the call ends up with.
@@ -17236,7 +17244,10 @@ class _Lowerer:
         group split across sources is one whole set of calls per source. A
         source that feeds only some of them, such as the picture from one
         lateral and the sound from another, would leave each call without
-        its partner, and is refused.
+        its partner, and is refused. A group whose every connection reaches
+        one and the same call is that call's many inputs, a stream of each
+        per connection, and a connection may bring some of them and not
+        others.
         """
         by_group: dict[str, list[tuple[frozenset[str], int, exp.Expr]]] = {}
         for (group, sources), (port, argument) in self._feeder_groups.items():
@@ -17250,9 +17261,15 @@ class _Lowerer:
                     {f"{call.function}({call.param})" for call in self._feeds[port].calls}
                 )
 
+            def nodes(port: int) -> set[str]:
+                return {call.node for call in self._feeds[port].calls}
+
             first_sources, first_port, _ = connections[0]
+            one_call = len(nodes(first_port)) == 1
             for sources, port, argument in connections[1:]:
                 if reached(port) == reached(first_port):
+                    continue
+                if one_call and nodes(port) == nodes(first_port):
                     continue
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,

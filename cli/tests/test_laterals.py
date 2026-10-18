@@ -1025,6 +1025,86 @@ def test_a_port_written_by_hand_stays_one_integer_where_a_list_also_fits() -> No
     assert port == 9100 and isinstance(port, int)
 
 
+# compose taking each lateral's sound beside its picture, on the same group.
+_COMPOSE_AUDIO = (
+    "CREATE FUNCTION compose(v video_stream, inputs video_stream[] DEFAULT NULL, "
+    "audio audio_stream[] DEFAULT NULL, port number DEFAULT NULL) RETURNS video_stream "
+    f"AS '{COMPOSE}', 'compose' LANGUAGE wasm;"
+)
+
+
+def _compose_audio_shape(
+    module: str, params: str, bound: Sequence[shapes.Binding], grants: Sequence[str] = ()
+) -> shapes.NodeShape:
+    """compose with `audio`, many sounds held on the pictures' port."""
+    held = {
+        "kind": "hold",
+        "anchor": {"kind": "tagged", "tag": "smart_timed"},
+        "lead": 0.3,
+        "port_param": "port",
+    }
+
+    def port(
+        name: str, kind: str, pairing: dict[str, object], many: bool
+    ) -> dict[str, object]:
+        return {
+            "name": name, "kind": kind, "required": name == "v", "many": many,
+            "pairing": pairing, "rows": "ignore", "window": 1, "stride": 1, "accepts": {},
+        }
+
+    return shapes.node_shape(module, {
+        "inputs": [
+            port("v", "video", {"kind": "lockstep"}, False),
+            port("inputs", "video", held, True),
+            port("audio", "audio", held, True),
+        ],
+        "outputs": [{"name": "v", "kind": "video", "latency": 0,
+                     "format": {"kind": "like", "port": "v"}}],
+        "clock": {"kind": "input", "port": "v"},
+        "pure": True, "one_to_one": True, "bounded": True, "relation": [],
+    })
+
+
+def test_a_lateral_bringing_a_picture_alone_to_a_call_taking_sound_too_is_its_connection() -> None:
+    """ad brings compose its picture and its sound and lbar its picture alone:
+    both connections reach the one call, so the group is not split, and the
+    port list names each connection once, in the order first written."""
+    query = _TWO_ADS.replace(
+        "ARRAY[ad.video, lbar.video])", "ARRAY[ad.video, lbar.video], audio => ARRAY[ad.audio])"
+    )
+    plan = compile_all(
+        _declared(query).replace("COPY (", _COMPOSE_AUDIO + "\nCOPY (", 1),
+        describe=lambda path: _compose_modules({"type": "array", "items": {"type": "integer"}})[
+            path
+        ],
+        shape=_compose_audio_shape,
+    ).plan
+    assert plan is not None
+    assert [len(lateral.connections) for lateral in plan.laterals] == [1, 1]
+    ports = [lateral.connections[0].port for lateral in plan.laterals]
+    assert len(set(ports)) == 2
+    assert _compose_node(plan).args["port"] == ports
+
+
+def test_a_group_whose_connections_reach_different_calls_is_still_refused() -> None:
+    """The picture from one lateral into the picture switch and the sound from
+    another into the sound switch: neither switch finds its partner."""
+    error = _refused(
+        """COPY (
+  WITH prog AS (SELECT s.video[1] AS v, s.audio[1] AS a, s.data[1] AS d
+                FROM input('leaf.nut') s)
+  SELECT video(prog.v, ad.video), audio(prog.a, lbar.audio)
+  FROM prog, LATERAL play(prog.d) ad, LATERAL play(prog.d) lbar
+) TO 'out.nut'"""
+    )
+    assert error.code == ErrorCode.UNSUPPORTED_SQL
+    assert error.message.startswith("the group 'switch' reads ")
+    assert error.message.endswith(
+        "each source a group reads is a connection of its own, and each has to reach "
+        "the same calls"
+    )
+
+
 # -- a node's data, read by several and by a lateral, with no copying ffmpeg ---
 
 SELL = "modules/sell_node.wasm"
