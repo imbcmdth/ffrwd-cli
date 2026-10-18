@@ -350,6 +350,13 @@ pub fn open(
         unsafe { instance.create_device(physical, &info, None) }.context("vkCreateDevice")?;
 
     let limits = desc.required_limits.clone();
+    // wgpu's default hint suballocates from blocks of 128 to 256 MiB, which
+    // on a 3 GB card was a quarter of what a decode, a module and an encoder
+    // held; this one uses blocks of 8 to 64 MiB.
+    let desc = &wgpu_core::device::DeviceDescriptor {
+        memory_hints: wgpu_types::MemoryHints::MemoryUsage,
+        ..desc.clone()
+    };
     // SAFETY: the device was created from this adapter with its required
     // extensions and features, and its queue (graphics, 0); wgpu-hal takes
     // ownership of it.

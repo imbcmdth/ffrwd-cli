@@ -503,7 +503,11 @@ impl Decoder {
                 .attach_shared_device(device.device())
                 .map_err(|e| refused(format!("the host's device: {}", e.why)))?,
         }
-        ctx.set_option("threads", "auto")
+        // libavcodec's Vulkan decoder keeps a picture in flight for every
+        // frame thread: one thread holds four 1080p pictures where twelve
+        // cores' worth held sixteen to eighteen, and it decoded faster.
+        let threads = if device_name == "vulkan" { "1" } else { "auto" };
+        ctx.set_option("threads", threads)
             .map_err(|e| refused(e.why))?;
         ctx.open().map_err(|e| refused(e.why))?;
         eprintln!("[av] decode {codec}: {device_name}, on the host's device");
