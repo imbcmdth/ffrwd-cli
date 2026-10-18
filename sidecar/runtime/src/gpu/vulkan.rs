@@ -519,7 +519,7 @@ fn signaller() -> &'static Signaller {
     MADE.get_or_init(|| {
         let (sender, receiver) = mpsc::channel::<Job>();
         std::thread::Builder::new()
-            .name("ffrwd-vk-signal".to_string())
+            .name("vk signal".to_string())
             .spawn(move || signal_loop(receiver))
             .expect("spawn the semaphore signaller");
         Signaller {

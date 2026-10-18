@@ -10,7 +10,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use std::thread;
 
 use anyhow::{bail, Context, Result};
 use ffrwd_wasm_runtime::node::{
@@ -364,7 +363,7 @@ pub fn run(
     for (input, mut reader) in readers.into_iter().enumerate() {
         let scheduler = Arc::clone(&scheduler);
         let format = formats[input];
-        feeding.push(thread::spawn(move || {
+        feeding.push(crate::named(format!("read {input}"), move || {
             if let Err(e) = feed(&mut reader, input, &format, &scheduler) {
                 scheduler.fail(e);
             }

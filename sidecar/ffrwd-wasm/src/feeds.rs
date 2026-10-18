@@ -31,6 +31,7 @@ use crate::lanes::{Room, Scheduler};
 use crate::leaky::ROW_PREFIX;
 use crate::node_graph::Carried;
 use crate::tick::Item;
+use crate::trace::trace_feed;
 use std::sync::atomic::Ordering;
 
 /// The receive buffer every connection asks for: about a dozen 1080p
@@ -719,7 +720,12 @@ pub fn serve(
         })?,
     };
     listener.set_nonblocking(true)?;
-    let mut report = |line: String| eprintln!("{line}");
+    let mut report = |line: String| {
+        if !line.starts_with(ROW_PREFIX) {
+            trace_feed!("{line}");
+        }
+        eprintln!("{line}")
+    };
     report(format!(
         "feed: {} listens on 127.0.0.1:{}",
         spec.names(),
@@ -856,6 +862,13 @@ fn drain(
                 match_streams(spec, conn, report)?;
                 conn.opened = true;
                 for (id, source) in sources(spec, conn) {
+                    trace_feed!(
+                        "feed {}: stream {id} opens on connection {}, time base {}/{}",
+                        spec.port,
+                        source.connection,
+                        source.base.num,
+                        source.base.den
+                    );
                     if !scheduler.source_open(id, source) {
                         return Ok(false);
                     }
@@ -877,6 +890,15 @@ fn drain(
                     carried
                         .bytes
                         .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    trace_feed!(
+                        "feed {}: coded picture for stream {}: pts {} dts {:?} key {} {} bytes",
+                        spec.port,
+                        spec.members[*member].id,
+                        packet.pts,
+                        packet.dts,
+                        packet.keyframe,
+                        payload.len()
+                    );
                     decoder
                         .decoder
                         .send(packet.pts, packet.dts, *duration, packet.keyframe, payload)
@@ -918,15 +940,29 @@ fn drain(
                         data: Arc::new(Vec::new()).into(),
                         rows: Vec::new(),
                     },
-                    Convert::Picture(picture) => TickFrame {
-                        pts: packet.pts,
-                        duration: None,
-                        data: picture.frame(Arc::new(payload.to_vec()))?,
-                        rows: Vec::new(),
-                    },
+                    Convert::Picture(picture) => {
+                        trace_feed!(
+                            "feed {}: picture for stream {}: pts {}",
+                            spec.port,
+                            member.id,
+                            packet.pts
+                        );
+                        TickFrame {
+                            pts: packet.pts,
+                            duration: None,
+                            data: picture.frame(Arc::new(payload.to_vec()))?,
+                            rows: Vec::new(),
+                        }
+                    }
                     Convert::Sound(sound) => {
                         let data = sound.convert(payload);
                         let samples = data.len() / sound.to.sample_len().max(1);
+                        trace_feed!(
+                            "feed {}: sound for stream {}: pts {} {samples} samples",
+                            spec.port,
+                            member.id,
+                            packet.pts
+                        );
                         TickFrame {
                             pts: packet.pts,
                             duration: Some(samples as i64),
@@ -963,6 +999,13 @@ fn hand_decoded(
             Received::Host(f) => (f.pts, (f.width, f.height)),
             Received::Device(f) => (f.pts, (f.width, f.height)),
         };
+        trace_feed!(
+            "feed: decoded picture for stream {id}: pts {pts}, {}",
+            match &received {
+                Received::Host(_) => "in host memory",
+                Received::Device(_) => "on the device",
+            }
+        );
         if size != (picture.width, picture.height) {
             anyhow::bail!(
                 "the feeder's header says {}x{}, and its picture at pts {pts} decoded {}x{}",

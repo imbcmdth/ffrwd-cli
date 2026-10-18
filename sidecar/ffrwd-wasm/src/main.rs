@@ -36,6 +36,7 @@ mod rows_chain;
 mod shape_json;
 mod subtitles;
 mod tick;
+mod trace;
 mod windows;
 
 use std::collections::HashMap;
@@ -56,6 +57,19 @@ use ffrwd_wasm_runtime::{av, nn};
 use serde::{Deserialize, Serialize};
 
 use network::{Binding, Network};
+
+/// Starts `body` on a thread called `name`, which is what `top -H` and a
+/// debugger show for it: `worker 2`, `feed 8771`, `read 0`, `write out0`.
+/// Linux keeps the first 15 bytes.
+pub(crate) fn named<T: Send + 'static>(
+    name: String,
+    body: impl FnOnce() -> T + Send + 'static,
+) -> thread::JoinHandle<T> {
+    thread::Builder::new()
+        .name(name)
+        .spawn(body)
+        .expect("starting a thread")
+}
 
 const EDGE_FORMAT: &str = "nut";
 const ROWS_FORMAT: &str = "ndjson";
@@ -1561,7 +1575,7 @@ impl RowOutput {
         let pipe = output_is_pipe(path);
         let queue = Arc::new((Mutex::new(RowQueue::default()), Condvar::new()));
         let shared = Arc::clone(&queue);
-        let thread = thread::spawn(move || {
+        let thread = named("rows out".to_string(), move || {
             let (lock, ready) = &*shared;
             loop {
                 let work = {
@@ -2945,7 +2959,7 @@ fn spawn_pad_readers(
         let queues = Arc::clone(queues);
         let told = told.clone();
         let path = path.clone();
-        thread::spawn(move || {
+        named(format!("read {pad}"), move || {
             let (header, replayed) = match open_input(&path).and_then(peek_stream) {
                 Ok(peeked) => peeked,
                 Err(err) => {

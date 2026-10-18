@@ -3506,7 +3506,11 @@ class _Log:
     def append(self, chunk: bytes) -> None:
         with self._turn:
             if self._file is not None:
+                # Flushed as it comes: a member killed with the run, or a
+                # host killed before it closes the file, leaves what it
+                # wrote rather than an empty `.part`.
                 self._file.write(chunk)
+                self._file.flush()
             self._chunks.append(chunk)
             self._held += len(chunk)
             while self._held - len(self._chunks[0]) >= self._keep:

@@ -12,7 +12,6 @@
 //! one batch, and a pipe output is flushed after every batch.
 
 use std::sync::mpsc;
-use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
@@ -216,7 +215,7 @@ pub(crate) fn run_codec(args: &Args, module: &str, params: &str) -> Result<()> {
 /// has arrived rather than waiting on the wire item by item.
 fn spawn_reader(mut demuxer: Input) -> mpsc::Receiver<Read> {
     let (tx, rx) = mpsc::sync_channel::<Read>(QUEUE);
-    thread::spawn(move || loop {
+    crate::named("demux".to_string(), move || loop {
         let mut data = Vec::new();
         let read = demuxer
             .read_packet(&mut data)

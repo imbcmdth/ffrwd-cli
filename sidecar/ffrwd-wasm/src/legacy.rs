@@ -230,9 +230,11 @@ pub fn run_packet_filter(args: &Args, module: &str, params: &str) -> Result<()> 
     for read in &args.rows_in {
         let read = read.clone();
         let queue = Arc::clone(&rows);
-        std::thread::spawn(move || match open_input(&read.path) {
-            Ok(reader) => read_rows(reader, &queue, read.arg.as_deref()),
-            Err(error) => queue.fail(error.context("opening -rows-in")),
+        crate::named("rows in".to_string(), move || {
+            match open_input(&read.path) {
+                Ok(reader) => read_rows(reader, &queue, read.arg.as_deref()),
+                Err(error) => queue.fail(error.context("opening -rows-in")),
+            }
         });
     }
 

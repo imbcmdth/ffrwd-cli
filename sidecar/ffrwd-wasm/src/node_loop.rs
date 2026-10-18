@@ -138,17 +138,19 @@ impl Outputs {
         let spelling = spelling.to_string();
         let sender = if bounded {
             let (sender, batches) = mpsc::sync_channel::<Vec<Packet>>(1);
-            self.writers.push(thread::spawn(move || {
-                crate::write_track(muxer, &batches)
-                    .with_context(|| format!("writing output {spelling}"))
-            }));
+            self.writers
+                .push(crate::named(format!("write {port}"), move || {
+                    crate::write_track(muxer, &batches)
+                        .with_context(|| format!("writing output {spelling}"))
+                }));
             Sender::Bounded(sender)
         } else {
             let (sender, batches) = mpsc::channel::<Vec<Packet>>();
-            self.writers.push(thread::spawn(move || {
-                crate::write_track(muxer, &batches)
-                    .with_context(|| format!("writing output {spelling}"))
-            }));
+            self.writers
+                .push(crate::named(format!("write {port}"), move || {
+                    crate::write_track(muxer, &batches)
+                        .with_context(|| format!("writing output {spelling}"))
+                }));
             Sender::Unbounded(sender)
         };
         self.tracks[port] = Some(Track {

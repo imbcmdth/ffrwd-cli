@@ -11,7 +11,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::thread;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ffrwd_wasm::nut;
@@ -343,7 +342,7 @@ pub fn run_carrying(args: &Args, bindings: &[Binding], wiring: &str) -> Result<A
         let scheduler = Arc::clone(&scheduler);
         let bound = early.remove(&spec.port);
         let carried = Arc::clone(&carried);
-        listeners.push(thread::spawn(move || {
+        listeners.push(crate::named(format!("feed {}", spec.port), move || {
             if let Err(e) = feeds::serve(spec, bound, Arc::clone(&scheduler), &carried) {
                 scheduler.fail(e);
             }
@@ -363,7 +362,7 @@ pub fn run_carrying(args: &Args, bindings: &[Binding], wiring: &str) -> Result<A
             .and_then(Option::as_ref)
             .and_then(|pad| pad.offset)
             .unwrap_or(0);
-        readers.push(thread::spawn(move || {
+        readers.push(crate::named(format!("read {index}"), move || {
             let read = pump(input, &ids, &defs, &timed, offset, &scheduler, &carried);
             match read {
                 Ok(true) => {

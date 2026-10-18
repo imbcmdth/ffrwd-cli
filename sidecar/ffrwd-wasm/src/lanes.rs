@@ -1233,9 +1233,9 @@ impl Scheduler {
             space: Condvar::new(),
         });
         let handles = (0..workers)
-            .map(|_| {
+            .map(|k| {
                 let shared = Arc::clone(&shared);
-                thread::spawn(move || worker(&shared))
+                crate::named(format!("worker {k}"), move || worker(&shared))
             })
             .collect();
         Ok(Scheduler {

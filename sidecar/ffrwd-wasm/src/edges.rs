@@ -318,8 +318,11 @@ pub fn spawn_writer(
         ready: Condvar::new(),
     });
     let shared = Arc::clone(&queue);
-    ending.writing.fetch_add(1, Ordering::SeqCst);
-    let handle = thread::spawn(move || {
+    let name = format!(
+        "write {}",
+        ending.writing.fetch_add(1, Ordering::SeqCst) + 1
+    );
+    let handle = crate::named(name, move || {
         let result = write_all(&path, target, &shared, &*wake);
         let last = ending.writing.fetch_sub(1, Ordering::SeqCst) == 1;
         let result = result.map(|out| {
@@ -513,6 +516,12 @@ fn write_nut<W: Write>(
                 .held
                 .pop_front()
                 .expect("writable has one held");
+            crate::trace::trace_feed!(
+                "write: stream {index} at {:?} (base {}/{})",
+                time_of(&out),
+                tracks[index].base.num,
+                tracks[index].base.den
+            );
             write_one(&mut muxer, index, &mut tracks[index], out, live)?;
         }
     }
@@ -627,7 +636,7 @@ pub fn spawn_sink(
         ready: Condvar::new(),
     });
     let shared = Arc::clone(&queue);
-    let handle = thread::spawn(move || {
+    let handle = crate::named(format!("sink {module}"), move || {
         let mut batch: Vec<runtime::Frame> = Vec::new();
         let result = (|| -> Result<()> {
             while let Some((_, out)) = next(&shared, &*wake) {

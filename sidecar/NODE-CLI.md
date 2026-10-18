@@ -280,6 +280,11 @@ stream of each input arrives on the k-th port. Each connection has its
 own source, feed and offset: a second port's feeder connecting, dropping
 or rejoining leaves the first's feed as it was.
 
+`FFRWD_TRACE_FEED=<file>` appends a line to that file, flushed as it is
+written, for each packet, picture and sound a port feed brings, each
+offset its hold fixes, what each tick hands its node, and each frame
+written out, with the wall time and the thread; unset, nothing is traced.
+
 One connection at a time: a second while one is on is accepted and closed
 at once, and a connection that has sent nothing is dropped for one that
 knocks. Every connection asks for a 16 MiB receive buffer, and is read

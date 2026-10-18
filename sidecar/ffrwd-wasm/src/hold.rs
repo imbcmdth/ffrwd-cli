@@ -56,6 +56,7 @@ use serde_json::json;
 
 use crate::leaky::ROW_PREFIX;
 use crate::tick::sample_count;
+use crate::trace::trace_feed;
 
 /// How many frames of a source are held ahead of the clock, and how many
 /// bytes: a port feed that outruns the clock waits on its socket past
@@ -253,6 +254,11 @@ impl Offset {
             num: num / g,
             den: den / g,
         }
+    }
+
+    /// The offset in seconds, for the trace.
+    fn seconds(self) -> f64 {
+        self.num as f64 / self.den as f64
     }
 
     /// This offset `ticks` of `clock_base` later.
@@ -825,6 +831,13 @@ impl Group {
         if !absent.is_empty() {
             row["absent"] = json!(absent);
         }
+        trace_feed!(
+            "hold {}: {line}; tick {pts}, offset {:.6}s, lead member {}, provisional {}",
+            self.name(),
+            offset.seconds(),
+            source.lead,
+            self.port_fed && !caught_up && anchor != Anchor::SharedClock
+        );
         (self.report)(line);
         (self.report)(format!("{ROW_PREFIX}{row}"));
         self.feed = Some(FeedState {
@@ -903,6 +916,11 @@ impl Group {
             "at": millis(seconds(pts)),
             "by": millis(by),
         });
+        trace_feed!(
+            "hold {}: {line}; offset now {:.6}s",
+            self.name(),
+            feed.offset.seconds()
+        );
         (self.report)(line);
         (self.report)(format!("{ROW_PREFIX}{row}"));
     }
@@ -1124,6 +1142,38 @@ impl Group {
             if let Some(record) = &mut hand.feed {
                 record.ends = feed.ends;
             }
+        }
+        if self.port_fed && crate::trace::on() {
+            let each: Vec<String> = handed
+                .iter()
+                .enumerate()
+                .map(|(index, hand)| {
+                    // In seconds of the source's own time, so a picture and
+                    // the sound handed with it can be read against each other.
+                    let base = self
+                        .sources
+                        .front()
+                        .map_or(self.members[index].base, |s| s.members[index].base);
+                    let seconds = |t: i64| t as f64 * base.num as f64 / base.den.max(1) as f64;
+                    match hand.frames.first() {
+                        Some(f) if self.members[index].kind == PortKind::Audio => format!(
+                            "{index} sound {} ({:.4}s)+{}",
+                            f.pts,
+                            seconds(f.pts),
+                            f.duration.unwrap_or(0)
+                        ),
+                        Some(f) => format!("{index} picture {} ({:.4}s)", f.pts, seconds(f.pts)),
+                        None => format!("{index} nothing"),
+                    }
+                })
+                .collect();
+            crate::trace::line(format_args!(
+                "hold {}: tick {pts}..{end:?} (base {}/{}), caught up {caught_up}: {}",
+                self.name(),
+                clock_base.num,
+                clock_base.den,
+                each.join(", ")
+            ));
         }
         feed.handed = handed.iter().map(|hand| hand.feed.clone()).collect();
         feed.last_tick = Some(pts);
