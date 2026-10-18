@@ -1033,6 +1033,100 @@ fn an_encoder_on_the_device_takes_the_decoders_pictures_with_nothing_read_back()
 }
 
 #[test]
+fn an_encoder_on_the_device_asked_for_yuv420p_codes_nv12_and_refuses_yuv444p() {
+    let test = "an_encoder_on_the_device_asked_for_yuv420p_codes_nv12_and_refuses_yuv444p";
+    let Some((device, encoder, dir)) = shared_encoder(test) else {
+        return;
+    };
+    let Some(()) = ffmpeg(test) else {
+        return;
+    };
+    let source = scratch("pix_fmt_source.nut");
+    let made = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=320x240:r=25",
+        ])
+        .args([
+            "-frames:v",
+            "30",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "nut",
+        ])
+        .arg(&source)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn ffmpeg");
+    if !made.status.success() {
+        eprintln!(
+            "SKIPPED: {test}. The ffmpeg on PATH cannot make an h264 stream with libx264: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        return;
+    }
+    let out = scratch("pix_fmt_out.nut");
+    let chain = |pix_fmt: &str| {
+        format!(
+            "[0:v]decode=format=yuv420p:hw={device}[d];\
+             [d]encode=codec={encoder}:b=2M:pix_fmt={pix_fmt}[out0]"
+        )
+    };
+    let output = run_chain(&dir, &source, &chain("yuv420p"), &out, None);
+    if no_gpu(&output) {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    if no_device_decoder(test, &output) {
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    assert!(
+        stderr.contains(&format!(
+            "[av] encode {encoder}: 320x240 nv12 (yuv420p asked, nv12 on the device), from the \
+             device"
+        )),
+        "{stderr}"
+    );
+    let wire = std::fs::read(&out).expect("read the output");
+    let _ = std::fs::remove_file(&out);
+    let mut demuxer = Demuxer::open(wire.as_slice()).expect("read NUT headers");
+    let mut packets = 0;
+    let mut buf = Vec::new();
+    while demuxer
+        .read_packet(&mut buf)
+        .expect("read a packet")
+        .is_some()
+    {
+        packets += 1;
+    }
+    assert_eq!(packets, 30, "one packet a picture");
+
+    let output = run_chain(&dir, &source, &chain("yuv444p"), &out, None);
+    let _ = (std::fs::remove_file(&out), std::fs::remove_file(&source));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!output.status.success(), "yuv444p is refused:\n{stderr}");
+    assert!(
+        stderr.contains("refused the option pix_fmt=yuv444p")
+            && stderr.contains("takes yuv420p (coded as nv12) or nv12"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn an_encoder_on_the_device_takes_a_modules_rgba_as_nv12_made_there() {
     let test = "an_encoder_on_the_device_takes_a_modules_rgba_as_nv12_made_there";
     let Some((_, encoder, dir)) = shared_encoder(test) else {

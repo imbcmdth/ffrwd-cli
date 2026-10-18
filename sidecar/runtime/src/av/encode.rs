@@ -49,6 +49,9 @@ pub struct Encoder {
     /// Set for an encoder that reads D3D12 pictures from a pool of its own:
     /// the picture of the pool a host picture is uploaded into.
     pool: Option<Frame>,
+    /// What the encoder codes in place of the `pix_fmt` asked, where it
+    /// does: an encoder on the device asked for yuv420p codes nv12.
+    substituted: Option<&'static str>,
     /// Set for an encoder that reads CUDA pictures and is fed from a Vulkan
     /// device: the pool of Vulkan pictures a frame on that device is written
     /// into, each copied into one of the encoder's on the card.
@@ -167,6 +170,21 @@ fn sent(status: Status, name: &str) -> Result<()> {
             why: "the encoder was already flushed".to_string(),
         }),
         Status::Failed(e) => Err(call("avcodec_send_frame", name)(e)),
+    }
+}
+
+/// What an encoder reading NV12 pictures of a pool on a device codes for
+/// the `pix_fmt` asked: nv12 as asked, or for yuv420p, the same 4:2:0
+/// sampling at 8 bits and the same coded stream, nv12 with the note saying
+/// so. Anything else is refused, naming what it takes.
+fn pool_pix_fmt(asked: &str) -> std::result::Result<Option<&'static str>, String> {
+    match asked {
+        "nv12" => Ok(None),
+        "yuv420p" => Ok(Some("yuv420p asked, nv12 on the device")),
+        _ => Err(
+            "it reads NV12 pictures on the device, so it takes yuv420p (coded as nv12) or nv12"
+                .to_string(),
+        ),
     }
 }
 
@@ -414,7 +432,25 @@ impl Encoder {
             .rev()
             .find(|(k, _)| k == "pix_fmt")
             .map(|(_, v)| v.as_str());
+        let mut substituted = None;
         let pix_fmt = match asked {
+            Some(asked) if on_device.is_some() => {
+                let (_, nv12) = on_device.expect("matched as some");
+                match pool_pix_fmt(asked) {
+                    Ok(note) => {
+                        substituted = note;
+                        nv12
+                    }
+                    Err(why) => {
+                        return Err(Error::Option {
+                            encoder: name,
+                            key: "pix_fmt".to_string(),
+                            value: asked.to_string(),
+                            why,
+                        })
+                    }
+                }
+            }
             Some(asked) => {
                 let refuse = |why: String| Error::Option {
                     encoder: name.clone(),
@@ -581,6 +617,7 @@ impl Encoder {
                 None => None,
             },
             staging,
+            substituted,
             name,
         })
     }
@@ -695,6 +732,12 @@ impl Encoder {
     /// The pixel format the encoder codes in.
     pub fn pix_fmt(&self) -> &str {
         &self.pix_fmt_name
+    }
+
+    /// What the encoder says of a `pix_fmt` it codes as another, where it
+    /// was given one: `yuv420p asked, nv12 on the device`.
+    pub fn pix_fmt_note(&self) -> Option<&'static str> {
+        self.substituted
     }
 
     /// The tag to carry the stream under on the NUT wire: the one the
@@ -840,6 +883,22 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_encoder_on_the_device_codes_yuv420p_as_nv12_and_refuses_the_rest() {
+        assert_eq!(pool_pix_fmt("nv12"), Ok(None));
+        assert_eq!(
+            pool_pix_fmt("yuv420p"),
+            Ok(Some("yuv420p asked, nv12 on the device"))
+        );
+        for other in ["yuv444p", "yuv420p10le", "p010le", "rgba", "bgr0"] {
+            let why = pool_pix_fmt(other).unwrap_err();
+            assert!(
+                why.contains("yuv420p") && why.contains("nv12"),
+                "{other}: {why}"
+            );
+        }
+    }
 
     #[test]
     fn the_parameter_sets_are_read_out_of_an_annex_b_packet() {

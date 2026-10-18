@@ -926,11 +926,15 @@ impl Encode {
             .to_string()
         });
         eprintln!(
-            "[av] encode {}: {}x{} {}{}",
+            "[av] encode {}: {}x{} {}{}{}",
             encoder.name(),
             video.width,
             video.height,
             encoder.pix_fmt(),
+            encoder
+                .pix_fmt_note()
+                .map(|note| format!(" ({note})"))
+                .unwrap_or_default(),
             said.as_deref()
                 .map(|how| format!(", {how}"))
                 .unwrap_or_default()
