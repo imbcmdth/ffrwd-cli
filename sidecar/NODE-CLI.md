@@ -479,6 +479,16 @@ the adapter, the PCI ids on D3D12 and Vulkan. Given a spec, or with
 names, or null) and `refused` (the line a run would end with, or null).
 `WGPU_BACKEND` narrows the list as it narrows what a run opens.
 
+On Linux the list is what the Vulkan loader finds. NVIDIA's ICD (driver
+580) loads `libEGL.so.1` when an instance is created, and without it the
+loader reports "Could not get 'vkCreateInstance' via
+'vk_icdGetInstanceProcAddr'", leaves only llvmpipe where that is
+installed, and `--gpu-info` lists no card. That library is the
+distribution's glvnd, not a driver file, so the NVIDIA Container
+Toolkit does not mount it into a container: an image needs `libegl1`
+beside `libvulkan1`, `libx11-6` and `libxext6` (Debian's names) for the
+card to be found.
+
 ## `-profile`
 
     ffrwd-wasm ... -profile

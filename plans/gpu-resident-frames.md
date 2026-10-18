@@ -1957,6 +1957,10 @@ run; each item names what it takes, and the notes above have the detail.
    on the semaphore through a raw submit, since wgpu-core's submit takes
    none; the `VkImage` wrapped as `G8_B8R8_2PLANE_420`. A `gpu/vulkan.rs`
    beside `gpu/d3d12.rs` and an `av::Shared::Vulkan` beside the D3D12 one.
+   What this means today was seen on foundmeat's GTX 1050 box (Ubuntu
+   26.04, driver 580, 2026-10-18): a held 1080p60 H.264 feed decodes on
+   the CPU, NVDEC idle, the compose sidecar at 2.6 to 3.5 cores against
+   about 0.4 on Windows, where the decoder writes into the pool.
 2. **The encoder from the pool**: NVENC reads CUDA or D3D11 frames, not
    Vulkan, so on Linux it needs the pool slot exported
    (`VK_KHR_external_memory_fd`) and imported into CUDA, or libavcodec's
