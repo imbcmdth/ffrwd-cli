@@ -530,6 +530,18 @@ fn signaller() -> &'static Signaller {
 
 fn signal_loop(receiver: mpsc::Receiver<Job>) {
     let mut pending: VecDeque<Job> = VecDeque::new();
+    // wgpu's fence, where it is a timeline semaphore whose value is the
+    // submission index: waited on here directly, since wgpu-core's poll
+    // holds the device's fence lock while it waits, and every submit from
+    // another thread waits for that lock.
+    let fence = shared_device().and_then(|device| {
+        // SAFETY: the handle is only copied out, never destroyed here.
+        let fence = unsafe { shared().device_fence_as_hal::<Vulkan>(device.device) }?;
+        match &*fence {
+            wgpu_hal::vulkan::Fence::TimelineSemaphore(semaphore) => Some(*semaphore),
+            _ => None,
+        }
+    });
     loop {
         let job = match pending.pop_front() {
             Some(job) => job,
@@ -541,15 +553,21 @@ fn signal_loop(receiver: mpsc::Receiver<Job>) {
         let (Some(device), Ok(opened)) = (shared_device(), opened()) else {
             return;
         };
-        let waited = shared().device_poll(
-            device.device,
-            wgpu_types::PollType::Wait {
-                submission_index: Some(job.submission),
-                timeout: None,
-            },
-        );
+        let waited = match fence {
+            Some(semaphore) => host_wait(&opened.device, semaphore, job.submission),
+            None => shared()
+                .device_poll(
+                    device.device,
+                    wgpu_types::PollType::Wait {
+                        submission_index: Some(job.submission),
+                        timeout: None,
+                    },
+                )
+                .map(|_| ())
+                .map_err(|e| anyhow!("{e}")),
+        };
         if let Err(e) = waited {
-            eprintln!("[gpu] waiting for a copy of a picture: {e}");
+            eprintln!("[gpu] waiting for a copy of a picture: {e:#}");
         }
         for (semaphore, value) in &job.signals {
             let info = vk::SemaphoreSignalInfo::default()
