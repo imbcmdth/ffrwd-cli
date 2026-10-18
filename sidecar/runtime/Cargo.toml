@@ -12,7 +12,7 @@ crate-type = ["rlib"]
 [features]
 # wasi:webgpu for modules granted `-gpu`, over wgpu-core (Vulkan, D3D12,
 # Metal). Off, a module importing wasi:webgpu is refused at instantiation.
-gpu = ["dep:wasi-webgpu-wasmtime", "dep:wasmtime-wasi-io", "dep:wgpu-hal", "dep:windows", "dep:objc2", "dep:objc2-metal", "dep:objc2-core-video", "dep:objc2-core-foundation"]
+gpu = ["dep:wasi-webgpu-wasmtime", "dep:wasmtime-wasi-io", "dep:wgpu-hal", "dep:windows", "dep:objc2", "dep:objc2-metal", "dep:objc2-core-video", "dep:objc2-core-foundation", "dep:ash"]
 
 [dependencies]
 # The wasi:webgpu@0.0.1 host, vendored and adapted from wasi-gfx-runtime;
@@ -78,6 +78,13 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Di
 # CUDA is the only GPU provider the Linux artifacts carry.
 wasmtime-wasi-nn = { version = "48.0.1", default-features = false, features = ["onnx-cuda"] }
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["cuda"] }
+
+# The Vulkan device under the process's wgpu device, opened here rather than
+# by wgpu so it carries the video extensions and the queues a decoder and an
+# encoder on it need: wgpu-hal's vulkan types, and the `ash` version they are
+# declared in (wgpu-hal 29's).
+wgpu-hal = { version = "29", features = ["vulkan"], optional = true }
+ash = { version = "0.38", default-features = false, features = ["std"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # CoreML is Apple's, and the only GPU provider there.

@@ -253,11 +253,14 @@ pub(crate) fn made_yuv_color(color: Option<ColorInfo>, yuv: Yuv) -> ColorInfo {
 
 /// A decoder on the process's own device, where `hw` allows the device
 /// it is (`auto`, or that device by name: `d3d12va` on Windows,
-/// `videotoolbox` on macOS), the wire's format is one its pictures are made
+/// `videotoolbox` on macOS, `vulkan` on Linux), the wire's format is one its pictures are made
 /// on the device (yuv420p, or rgba in a matrix the conversion has: `yuv`),
 /// and the device opens. None, having said why on stderr where it is not
 /// obvious, otherwise.
-#[cfg(all(feature = "gpu", any(windows, target_os = "macos")))]
+#[cfg(all(
+    feature = "gpu",
+    any(windows, target_os = "macos", target_os = "linux")
+))]
 pub(crate) fn open_on_shared_device(
     codec: &str,
     extradata: &[u8],
@@ -275,6 +278,10 @@ pub(crate) fn open_on_shared_device(
     const DEVICE: &str = "videotoolbox";
     #[cfg(target_os = "macos")]
     const API: &str = "Metal";
+    #[cfg(target_os = "linux")]
+    const DEVICE: &str = "vulkan";
+    #[cfg(target_os = "linux")]
+    const API: &str = "Vulkan";
     let allowed = match hw {
         Hw::Auto => true,
         Hw::Device(named) => named == DEVICE,
@@ -303,6 +310,8 @@ pub(crate) fn open_on_shared_device(
     let device = gpu::d3d12::av_device();
     #[cfg(target_os = "macos")]
     let device = gpu::metal::av_device();
+    #[cfg(target_os = "linux")]
+    let device = gpu::vulkan::av_device();
     let Some(device) = device else {
         eprintln!(
             "[gpu] decode {codec}: the process's device is not a {API} one, so {DEVICE} \
@@ -322,7 +331,10 @@ pub(crate) fn open_on_shared_device(
     }
 }
 
-#[cfg(not(all(feature = "gpu", any(windows, target_os = "macos"))))]
+#[cfg(not(all(
+    feature = "gpu",
+    any(windows, target_os = "macos", target_os = "linux")
+)))]
 pub(crate) fn open_on_shared_device(
     _codec: &str,
     _extradata: &[u8],
@@ -621,7 +633,10 @@ pub struct Encode {
     /// for an encoder opened on that device. Dropped before the encoder,
     /// waiting for the copies still running into its pictures.
     #[cfg_attr(
-        not(all(feature = "gpu", any(windows, target_os = "macos"))),
+        not(all(
+            feature = "gpu",
+            any(windows, target_os = "macos", target_os = "linux")
+        )),
         allow(dead_code)
     )]
     feed: Option<Feed>,
@@ -631,7 +646,10 @@ pub struct Encode {
     /// The colour an rgba frame is made NV12 in on the device: the stream's
     /// matrix and range, as the header declares them.
     #[cfg_attr(
-        not(all(feature = "gpu", any(windows, target_os = "macos"))),
+        not(all(
+            feature = "gpu",
+            any(windows, target_os = "macos", target_os = "linux")
+        )),
         allow(dead_code)
     )]
     yuv: ColorInfo,
@@ -640,7 +658,10 @@ pub struct Encode {
     /// How frames on the device were last copied into the encoder's
     /// pictures, said on stderr when it changes.
     #[cfg_attr(
-        not(all(feature = "gpu", any(windows, target_os = "macos"))),
+        not(all(
+            feature = "gpu",
+            any(windows, target_os = "macos", target_os = "linux")
+        )),
         allow(dead_code)
     )]
     copies: Option<String>,
@@ -650,12 +671,19 @@ pub struct Encode {
 type Feed = ffrwd_wasm_runtime::gpu::d3d12::EncoderFeed;
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 type Feed = ffrwd_wasm_runtime::gpu::metal::EncoderFeed;
-#[cfg(not(all(feature = "gpu", any(windows, target_os = "macos"))))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
+type Feed = ffrwd_wasm_runtime::gpu::vulkan::EncoderFeed;
+#[cfg(not(all(
+    feature = "gpu",
+    any(windows, target_os = "macos", target_os = "linux")
+)))]
 type Feed = std::convert::Infallible;
 
 /// The process's device for an encoder that reads its pool there, and the
 /// feed that copies frames on it into the encoder's: D3D12 on Windows,
-/// Metal on macOS. None for both where the process has no such device.
+/// Metal on macOS, Vulkan on Linux, where the encoder is NVENC reading CUDA
+/// pictures on the same card. None for both where the process has no such
+/// device.
 #[cfg(all(feature = "gpu", windows))]
 fn encoder_device() -> Option<(av::Shared, Feed)> {
     Some((
@@ -672,7 +700,18 @@ fn encoder_device() -> Option<(av::Shared, Feed)> {
     ))
 }
 
-#[cfg(not(all(feature = "gpu", any(windows, target_os = "macos"))))]
+#[cfg(all(feature = "gpu", target_os = "linux"))]
+fn encoder_device() -> Option<(av::Shared, Feed)> {
+    Some((
+        ffrwd_wasm_runtime::gpu::vulkan::av_device()?,
+        Feed::default(),
+    ))
+}
+
+#[cfg(not(all(
+    feature = "gpu",
+    any(windows, target_os = "macos", target_os = "linux")
+)))]
 fn encoder_device() -> Option<(av::Shared, Feed)> {
     None
 }
@@ -808,9 +847,12 @@ impl Encode {
         // An encoder that reads NV12 has an rgba input converted to it, in
         // the colour the stream's header then declares. A VideoToolbox
         // encoder reads a pool on the device only where its frames are on
-        // a Metal one.
+        // a Metal one, and NVENC on Linux only where they are on a Vulkan
+        // one.
         let reads_d3d12 = Encoder::reads_d3d12(codec);
-        let device = if reads_d3d12 || (Encoder::reads_videotoolbox(codec) && on_gpu) {
+        let fed_on_device = Encoder::reads_videotoolbox(codec)
+            || (cfg!(target_os = "linux") && Encoder::reads_cuda(codec));
+        let device = if reads_d3d12 || (fed_on_device && on_gpu) {
             on_gpu.then(encoder_device).flatten()
         } else {
             None
@@ -1004,7 +1046,7 @@ impl Encode {
         Ok(true)
     }
 
-    #[cfg(all(feature = "gpu", target_os = "macos"))]
+    #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "linux")))]
     fn send_on_device(
         &mut self,
         data: &FrameData,
@@ -1036,7 +1078,11 @@ impl Encode {
         self.encoder
             .send_picture(picture, pts, duration)
             .map_err(|e| anyhow!("{name}: {e}"))?;
-        let how = "from the device, each frame a copy per plane, waited for";
+        let how = if cfg!(target_os = "linux") {
+            "from the device, each frame a copy per plane, then to CUDA on the card"
+        } else {
+            "from the device, each frame a copy per plane, waited for"
+        };
         let how = if frame.pix_fmt() == "nv12" {
             how.to_string()
         } else {
@@ -1050,7 +1096,10 @@ impl Encode {
         Ok(true)
     }
 
-    #[cfg(not(all(feature = "gpu", any(windows, target_os = "macos"))))]
+    #[cfg(not(all(
+        feature = "gpu",
+        any(windows, target_os = "macos", target_os = "linux")
+    )))]
     fn send_on_device(
         &mut self,
         _data: &FrameData,

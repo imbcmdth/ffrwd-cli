@@ -1551,10 +1551,12 @@ fn read_on_gpu(
             && call.options.iter().any(|(key, value)| {
                 use ffrwd_wasm_runtime::av::Encoder;
                 // A VideoToolbox encoder reads its pool on the device on
-                // macOS, where the device is Metal.
+                // macOS, where the device is Metal, and NVENC on Linux, where
+                // it is Vulkan.
                 key == "codec"
                     && (Encoder::reads_d3d12(value)
-                        || (cfg!(target_os = "macos") && Encoder::reads_videotoolbox(value)))
+                        || (cfg!(target_os = "macos") && Encoder::reads_videotoolbox(value))
+                        || (cfg!(target_os = "linux") && Encoder::reads_cuda(value)))
             })
         {
             return Ok(true);

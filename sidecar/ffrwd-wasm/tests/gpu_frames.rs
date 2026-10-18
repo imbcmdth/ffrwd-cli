@@ -551,21 +551,39 @@ fn frames_in(path: &Path) -> Vec<(i64, Vec<u8>)> {
 const UPLOAD_LINE: &str = "putting the frames of stream";
 
 /// The device a decoder shares the process's device through, and the
-/// libav directory: `d3d12va` on Windows, `videotoolbox` on macOS. None,
-/// having said why the test is skipped, elsewhere.
+/// libav directory: `d3d12va` on Windows, `videotoolbox` on macOS, `vulkan`
+/// on Linux. None, having said why the test is skipped, elsewhere.
 fn shared_decoder(test: &str) -> Option<(&'static str, PathBuf)> {
     let device = if cfg!(windows) {
         "d3d12va"
     } else if cfg!(target_os = "macos") {
         "videotoolbox"
+    } else if cfg!(target_os = "linux") {
+        "vulkan"
     } else {
         eprintln!(
-            "SKIPPED: {test}. A decoder shares the process's device on Windows (D3D12) and \
-             macOS (Metal) only."
+            "SKIPPED: {test}. A decoder shares the process's device on Windows (D3D12), \
+             macOS (Metal) and Linux (Vulkan) only."
         );
         return None;
     };
     Some((device, libav(test)?))
+}
+
+/// What the sidecar says on Linux where the process's Vulkan device has no
+/// decoder: a software adapter, or a card without the video extensions.
+const NO_DEVICE_DECODER: &str = "[gpu] no decoder or encoder on the process's Vulkan device";
+
+/// True, having said why the test is skipped, where `output` is a run whose
+/// device has no decoder on it to share; what these tests skip rather than
+/// fail, as they skip a machine with no adapter.
+fn no_device_decoder(test: &str, output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let Some(line) = stderr.lines().find(|l| l.starts_with(NO_DEVICE_DECODER)) else {
+        return false;
+    };
+    eprintln!("SKIPPED: {test}. {line}");
+    true
 }
 
 /// What the decoder says of how its pictures are taken on `device`.
@@ -575,11 +593,14 @@ fn decoded_line(device: &str) -> String {
 
 /// The device a decoder shares the process's device through, the h264
 /// encoder that reads its pool there, and the libav directory:
-/// `h264_d3d12va` on Windows, `h264_videotoolbox` on macOS.
+/// `h264_d3d12va` on Windows, `h264_videotoolbox` on macOS, `h264_nvenc` on
+/// Linux, fed from the Vulkan device through CUDA.
 fn shared_encoder(test: &str) -> Option<(&'static str, &'static str, PathBuf)> {
     let (device, dir) = shared_decoder(test)?;
     let encoder = if cfg!(windows) {
         "h264_d3d12va"
+    } else if cfg!(target_os = "linux") {
+        "h264_nvenc"
     } else {
         "h264_videotoolbox"
     };
@@ -600,6 +621,9 @@ fn pictures_decoded_on_the_device_reach_gpu_box_unuploaded_and_as_software_decod
     let output = run_decoded(&dir, &chain(device, "gpu"), &[("o", &on_device)]);
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    if no_device_decoder(test, &output) {
         return;
     }
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -682,6 +706,9 @@ fn encode_reads_a_picture_decoded_on_the_device_back_once_as_ffmpeg_decodes_it()
     let output = run_decoded(&dir, &chain, &[("o", &boxed), ("e", &encoded)]);
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    if no_device_decoder(test, &output) {
         return;
     }
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -899,6 +926,9 @@ fn an_encoder_on_the_device_takes_the_decoders_pictures_with_nothing_read_back()
         eprintln!("skipped: this machine has no GPU adapter");
         return;
     }
+    if no_device_decoder(test, &output) {
+        return;
+    }
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         output.status.success(),
@@ -1023,6 +1053,9 @@ fn an_encoder_on_the_device_takes_a_modules_rgba_as_nv12_made_there() {
     let output = run_chain(&dir, &source, &chain, &encoded, Some(&module));
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    if no_device_decoder(test, &output) {
         return;
     }
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();

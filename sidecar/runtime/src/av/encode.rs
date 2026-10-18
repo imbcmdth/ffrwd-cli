@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use super::decode::{DeviceFrame, Shared};
 use super::error::{Error, Result};
-use super::ffi::{AvErr, CodecCtx, Frame, Lib, Packet, RawColor, Scaler, Status};
+use super::ffi::{AvErr, BufferRef, CodecCtx, Frame, Lib, Packet, RawColor, Scaler, Status};
 use super::fourcc;
 use super::picture::{self, WIRE_PIX_FMTS};
 use super::sys::{AVRational, AV_CODEC_FLAG_GLOBAL_HEADER};
@@ -49,6 +49,10 @@ pub struct Encoder {
     /// Set for an encoder that reads D3D12 pictures from a pool of its own:
     /// the picture of the pool a host picture is uploaded into.
     pool: Option<Frame>,
+    /// Set for an encoder that reads CUDA pictures and is fed from a Vulkan
+    /// device: the pool of Vulkan pictures a frame on that device is written
+    /// into, each copied into one of the encoder's on the card.
+    staging: Option<BufferRef>,
 }
 
 /// The device type the encoders that read D3D12 pictures run on.
@@ -56,6 +60,9 @@ const D3D12VA: &str = "d3d12va";
 
 /// The device type the VideoToolbox encoders read pictures of.
 const VIDEOTOOLBOX: &str = "videotoolbox";
+
+/// The device type NVENC reads pictures of.
+const CUDA: &str = "cuda";
 
 /// The pictures an encoder that reads D3D12 pictures has in flight before
 /// it waits for one. Each picture reaches it through a copy on another
@@ -206,7 +213,12 @@ impl Encoder {
     /// `device`, or on a `d3d12va` device of its own when None. A
     /// VideoToolbox encoder given [`Shared::VideoToolbox`] is opened the
     /// same way on a pool of IOSurface-backed NV12 pictures, which any
-    /// Metal device reads and writes.
+    /// Metal device reads and writes. An NVENC encoder given
+    /// [`Shared::Vulkan`] is opened on a pool of CUDA pictures on the same
+    /// card, and is fed through a pool of Vulkan pictures on that device:
+    /// a frame is written into one of those on the device, and libavutil
+    /// copies it into a CUDA picture on the card, the two APIs sharing the
+    /// image's memory and its timeline semaphore.
     ///
     /// A picture is written into one of the pool's textures on the device
     /// ([`device_picture`](Encoder::device_picture), then
@@ -287,6 +299,14 @@ impl Encoder {
         codec.ends_with("_d3d12va")
     }
 
+    /// Whether `codec` names an NVENC encoder, which reads pictures in host
+    /// memory or a pool of CUDA pictures that
+    /// [`open_on_device`](Encoder::open_on_device) gives it, fed from a
+    /// Vulkan device.
+    pub fn reads_cuda(codec: &str) -> bool {
+        codec.ends_with("_nvenc")
+    }
+
     /// Whether `codec` names a VideoToolbox encoder, which reads pictures
     /// in host memory or a pool of IOSurface-backed pictures that
     /// [`open_on_device`](Encoder::open_on_device) gives it.
@@ -362,6 +382,7 @@ impl Encoder {
                     Some(Shared::VideoToolbox) => {
                         ("videotoolbox_vld", VIDEOTOOLBOX, "VideoToolbox")
                     }
+                    Some(Shared::Vulkan(_)) => ("cuda", CUDA, "CUDA"),
                     _ => ("d3d12", D3D12VA, "D3D12"),
                 };
                 let reads = lib.pix_fmt(format).is_some_and(|f| supported.contains(&f));
@@ -459,7 +480,29 @@ impl Encoder {
         // unless told otherwise; an explicit `threads` below replaces this.
         ctx.set_option("threads", "auto")
             .map_err(call("av_opt_set threads", &name))?;
-        if let (Some((device_type, nv12)), Some(Some(Shared::VideoToolbox))) = (on_device, &device)
+        let mut staging = None;
+        if let (Some((_, nv12)), Some(Some(Shared::Vulkan(vulkan)))) = (on_device, &device) {
+            let refuse = |why: String| Error::Call {
+                call: "av_hwframe_ctx_init",
+                codec: name.clone(),
+                why,
+            };
+            let cuda = vulkan.cuda().map_err(refuse)?;
+            let format = lib
+                .pix_fmt("cuda")
+                .expect("checked above that the encoder reads it");
+            let frames = lib
+                .frames_on_device(cuda, format, nv12, w, h)
+                .map_err(call("av_hwframe_ctx_init", &name))?;
+            ctx.attach_frames(frames, format, nv12);
+            staging = Some(
+                lib.vulkan_frames(vulkan.device(), nv12, w, h)
+                    .map_err(|e| {
+                        refuse(format!("the Vulkan pictures it is fed from: {}", e.why))
+                    })?,
+            );
+        } else if let (Some((device_type, nv12)), Some(Some(Shared::VideoToolbox))) =
+            (on_device, &device)
         {
             let format = lib
                 .pix_fmt("videotoolbox_vld")
@@ -469,7 +512,9 @@ impl Encoder {
         } else if let (Some((device_type, nv12)), Some(device)) = (on_device, device) {
             let raw = match device {
                 Some(Shared::D3d12(raw)) => raw.into_raw(),
-                Some(Shared::VideoToolbox) => unreachable!("taken by the branch above"),
+                Some(Shared::VideoToolbox | Shared::Vulkan(_)) => {
+                    unreachable!("taken by the branches above")
+                }
                 None => std::ptr::null_mut(),
             };
             ctx.attach_d3d12_frames(device_type, raw, nv12, w, h)
@@ -535,6 +580,7 @@ impl Encoder {
                 Some(_) => Some(Frame::new(lib).map_err(call("av_frame_alloc", &name))?),
                 None => None,
             },
+            staging,
             name,
         })
     }
@@ -555,9 +601,11 @@ impl Encoder {
     /// [`send_picture`](Encoder::send_picture).
     pub fn device_picture(&mut self) -> Result<DeviceFrame> {
         let mut frame = Frame::new(self.lib).map_err(call("av_frame_alloc", &self.name))?;
-        self.ctx
-            .pool_frame(&mut frame)
-            .map_err(call("av_hwframe_get_buffer", &self.name))?;
+        match &self.staging {
+            Some(staging) => staging.get_buffer(&mut frame),
+            None => self.ctx.pool_frame(&mut frame),
+        }
+        .map_err(call("av_hwframe_get_buffer", &self.name))?;
         Ok(DeviceFrame {
             pts: 0,
             duration: None,
@@ -576,12 +624,44 @@ impl Encoder {
         pts: i64,
         duration: Option<i64>,
     ) -> Result<()> {
-        if picture.frame.d3d12().is_none() && picture.frame.videotoolbox().is_none() {
+        if picture.frame.d3d12().is_none()
+            && picture.frame.videotoolbox().is_none()
+            && picture.frame.vulkan().is_none()
+        {
             return Err(Error::Call {
                 call: "avcodec_send_frame",
                 codec: self.name.clone(),
                 why: "the picture is not one of the encoder's pool".to_string(),
             });
+        }
+        if picture.frame.vulkan().is_some() {
+            // A Vulkan picture is copied into one of the encoder's CUDA
+            // pictures on the card, after what was written into it.
+            let Some(cuda) = self.pool.as_mut() else {
+                return Err(Error::Call {
+                    call: "avcodec_send_frame",
+                    codec: self.name.clone(),
+                    why: "the encoder has no pool of CUDA pictures".to_string(),
+                });
+            };
+            let copied = self
+                .ctx
+                .pool_frame(cuda)
+                .map_err(call("av_hwframe_get_buffer", &self.name))
+                .and_then(|()| {
+                    cuda.transfer_from(&picture.frame)
+                        .map_err(call("av_hwframe_transfer_data", &self.name))
+                });
+            picture.frame.unref();
+            if let Err(e) = copied {
+                cuda.unref();
+                return Err(e);
+            }
+            cuda.set_color(self.color);
+            cuda.set_timing(pts, duration);
+            let status = self.ctx.send_frame(Some(cuda));
+            cuda.unref();
+            return sent(status, &self.name);
         }
         picture.frame.set_color(self.color);
         picture.frame.set_timing(pts, duration);

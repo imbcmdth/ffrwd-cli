@@ -653,6 +653,7 @@ name = "ffrwd-wasm-runtime"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "ash",
  "ffrwd-frame",
  "http",
  "http-body",

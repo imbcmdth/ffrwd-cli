@@ -57,6 +57,8 @@ pub enum Shared {
     /// caller's: it writes IOSurface-backed pictures, which any Metal device
     /// on the machine reads.
     VideoToolbox,
+    /// A Vulkan device the caller made, which becomes the `vulkan` device.
+    Vulkan(super::VulkanDevice),
 }
 
 impl Shared {
@@ -65,6 +67,7 @@ impl Shared {
         match self {
             Shared::D3d12(_) => "d3d12va",
             Shared::VideoToolbox => "videotoolbox",
+            Shared::Vulkan(_) => "vulkan",
         }
     }
 
@@ -73,6 +76,7 @@ impl Shared {
         match self {
             Shared::D3d12(device) => Shared::D3d12(device.share()),
             Shared::VideoToolbox => Shared::VideoToolbox,
+            Shared::Vulkan(device) => Shared::Vulkan(device.share()),
         }
     }
 }
@@ -160,6 +164,15 @@ impl DeviceFrame {
                 sync_value: p.sync_ctx.sync_value,
             })
         }
+    }
+
+    /// The picture's Vulkan images, under libav's lock on the picture until
+    /// the result is dropped; None for a picture of another device.
+    pub fn vulkan(&mut self) -> Option<super::VkPictureLock<'_>> {
+        let (frame, frames) = self.frame.vulkan()?;
+        // SAFETY: the frame holds the picture and a reference to its frames
+        // context, both alive while it is, which the lock borrows.
+        Some(unsafe { super::VkPictureLock::lock(frame, frames) })
     }
 
     /// The picture's `CVPixelBufferRef`, valid while it is; None for a
@@ -486,6 +499,9 @@ impl Decoder {
                 .attach_d3d12_device(device_type, raw.into_raw())
                 .map_err(|e| refused(format!("the host's device: {}", e.why)))?,
             Shared::VideoToolbox => ctx.attach_device(device_type).map_err(|e| refused(e.why))?,
+            Shared::Vulkan(device) => ctx
+                .attach_shared_device(device.device())
+                .map_err(|e| refused(format!("the host's device: {}", e.why)))?,
         }
         ctx.set_option("threads", "auto")
             .map_err(|e| refused(e.why))?;
@@ -612,13 +628,16 @@ impl Decoder {
     }
 
     /// The format a picture just received stays on the device in, where
-    /// it does: an `nv12` D3D12 or VideoToolbox picture, wanted as one of
+    /// it does: an `nv12` D3D12, VideoToolbox or Vulkan picture, wanted as one of
     /// [`ON_DEVICE`].
     fn held_as(&self) -> Option<&'static str> {
         if !self.shared || !ON_DEVICE.contains(&self.want) {
             return None;
         }
-        if self.frame.d3d12().is_none() && self.frame.videotoolbox().is_none() {
+        if self.frame.d3d12().is_none()
+            && self.frame.videotoolbox().is_none()
+            && self.frame.vulkan().is_none()
+        {
             return None;
         }
         let nv12 = self.lib.pix_fmt("nv12")?;

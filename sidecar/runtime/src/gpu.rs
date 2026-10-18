@@ -40,6 +40,8 @@ pub mod metal;
 pub mod output;
 #[cfg(feature = "gpu")]
 pub mod tensor;
+#[cfg(all(feature = "gpu", target_os = "linux"))]
+pub mod vulkan;
 
 /// A build without the `gpu` feature holds no frame on a GPU; the type
 /// exists so [`crate::node::FrameData`] has its variant, and is never made.
@@ -292,7 +294,31 @@ mod enabled {
             required_limits: limits.clone(),
             ..Default::default()
         };
-        let (device, queue) = match instance.adapter_request_device(adapter, &desc, None, None) {
+        // On Linux a Vulkan device is opened here, with the video extensions
+        // and queues a decoder on it needs; wgpu's own open is what is left
+        // where that fails.
+        #[cfg(target_os = "linux")]
+        let opened = if info.backend == wgpu_types::Backend::Vulkan {
+            match super::vulkan::open(instance, adapter, &desc) {
+                Ok(ids) => Some(ids),
+                Err(e) => {
+                    eprintln!(
+                        "[gpu] opening {} with the video queues: {e:#}; opened as wgpu opens it,                          with no decoder on it",
+                        info.name
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let opened = None;
+        let requested = match opened {
+            Some(ids) => Ok(ids),
+            None => instance.adapter_request_device(adapter, &desc, None, None),
+        };
+        let (device, queue) = match requested {
             Ok(ids) => ids,
             Err(e) => {
                 eprintln!("[gpu] opening {} ({:?}): {e}", info.name, info.backend);

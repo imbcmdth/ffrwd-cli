@@ -160,6 +160,13 @@ impl Filter {
                         .to_string(),
                 ))
             }
+            Some(Shared::Vulkan(_)) => {
+                return Err(refuse(
+                    "av_hwframe_ctx_init",
+                    "the graph runs on a d3d12va device, and the device is a Vulkan one"
+                        .to_string(),
+                ))
+            }
             None => std::ptr::null_mut(),
         };
         let frames = lib

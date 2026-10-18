@@ -29,6 +29,7 @@ mod filter;
 mod fourcc;
 mod picture;
 mod sys;
+mod vulkan;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -42,6 +43,7 @@ pub use error::{Error, Result, INSTALL_HINT};
 pub use filter::Filter;
 pub use fourcc::{codec_for_fourcc, fourcc_for_codec};
 pub use picture::{frame_len, WIRE_PIX_FMTS};
+pub use vulkan::{QueueFamily, VkImageState, VkPictureLock, VulkanDevice, VulkanHandles};
 
 /// The environment variable naming the libav directory when the command
 /// line does not.

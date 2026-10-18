@@ -93,6 +93,112 @@ pub struct AVD3D12VAFrame {
     pub flags: c_int,
 }
 
+/// `AVVulkanDeviceQueueFamily` (libavutil/hwcontext_vulkan.h), whole: one
+/// queue family the device context may submit to.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AVVulkanDeviceQueueFamily {
+    /// The queue family's index.
+    pub idx: c_int,
+    /// How many of its queues, from index 0, libav uses.
+    pub num: c_int,
+    /// `VkQueueFlagBits`: what libav may use the family for.
+    pub flags: c_uint,
+    /// `VkVideoCodecOperationFlagBitsKHR`: what it decodes or encodes.
+    pub video_caps: c_uint,
+}
+
+/// `AVVulkanDeviceContext` (libavutil/hwcontext_vulkan.h), whole, as
+/// libavutil 61 declares it: `lock_queue` and `unlock_queue` are there while
+/// `FF_API_VULKAN_SYNC_QUEUES` is (major < 62). What a vulkan device
+/// reference's hwctx points at, every field set before
+/// `av_hwdevice_ctx_init`.
+#[repr(C)]
+pub struct AVVulkanDeviceContext {
+    /// `const VkAllocationCallbacks *`; null.
+    pub alloc: *const c_void,
+    /// `PFN_vkGetInstanceProcAddr`.
+    pub get_proc_addr: *const c_void,
+    /// `VkInstance`.
+    pub inst: *mut c_void,
+    /// `VkPhysicalDevice`.
+    pub phys_dev: *mut c_void,
+    /// `VkDevice`.
+    pub act_dev: *mut c_void,
+    /// `VkPhysicalDeviceFeatures2`, copied in whole: the features the
+    /// device was created with, its `pNext` chain included.
+    pub device_features: [u64; 30],
+    pub enabled_inst_extensions: *const *const c_char,
+    pub nb_enabled_inst_extensions: c_int,
+    pub enabled_dev_extensions: *const *const c_char,
+    pub nb_enabled_dev_extensions: c_int,
+    /// Left null, so libavutil's own mutexes guard the queues it is given.
+    pub lock_queue: *const c_void,
+    pub unlock_queue: *const c_void,
+    pub qf: [AVVulkanDeviceQueueFamily; 64],
+    pub nb_qf: c_int,
+    /// `VkDeviceQueueCreateFlags`, for `vkGetDeviceQueue2`.
+    pub queue_flags: c_uint,
+}
+
+/// `AVVulkanFramesContext` (libavutil/hwcontext_vulkan.h), whole: what a
+/// vulkan frames reference's hwctx points at.
+#[repr(C)]
+pub struct AVVulkanFramesContext {
+    /// `VkImageTiling`.
+    pub tiling: c_uint,
+    /// `VkImageUsageFlagBits`.
+    pub usage: c_uint,
+    pub create_pnext: *mut c_void,
+    pub alloc_pnext: [*mut c_void; AV_NUM_DATA_POINTERS],
+    /// `AVVkFrameFlags`.
+    pub flags: c_uint,
+    /// `VkImageCreateFlags`.
+    pub img_flags: c_uint,
+    /// `VkFormat` of each image.
+    pub format: [c_uint; AV_NUM_DATA_POINTERS],
+    pub nb_layers: c_int,
+    /// `void (*)(AVHWFramesContext *, AVVkFrame *)`.
+    pub lock_frame: Option<unsafe extern "C" fn(*mut AVHWFramesContext, *mut AVVkFrame)>,
+    pub unlock_frame: Option<unsafe extern "C" fn(*mut AVHWFramesContext, *mut AVVkFrame)>,
+}
+
+/// `AV_VK_FRAME_FLAG_DISABLE_MULTIPLANE`: one image per plane, which CUDA
+/// can import, rather than one multi-planar image.
+pub const AV_VK_FRAME_FLAG_DISABLE_MULTIPLANE: c_uint = 1 << 2;
+
+/// `AVVkFrame` (libavutil/hwcontext_vulkan.h), whole: what a vulkan
+/// frame's `data[0]` points at. Every handle is a Vulkan one.
+#[repr(C)]
+pub struct AVVkFrame {
+    /// `VkImage`: one multi-planar image, or one per plane.
+    pub img: [u64; AV_NUM_DATA_POINTERS],
+    /// `VkImageTiling`.
+    pub tiling: c_uint,
+    /// `VkDeviceMemory`.
+    pub mem: [u64; AV_NUM_DATA_POINTERS],
+    pub size: [usize; AV_NUM_DATA_POINTERS],
+    /// `VkMemoryPropertyFlagBits`.
+    pub flags: c_uint,
+    /// `VkAccessFlagBits2`, one per image, as the last barrier left it.
+    pub access: [u64; AV_NUM_DATA_POINTERS],
+    /// `VkImageLayout`, one per image, as the last barrier left it.
+    pub layout: [c_uint; AV_NUM_DATA_POINTERS],
+    /// Timeline `VkSemaphore`, one per image.
+    pub sem: [u64; AV_NUM_DATA_POINTERS],
+    /// The value each semaphore reaches once the image is ready: waited for
+    /// by every submission, and signalled one higher by it.
+    pub sem_value: [u64; AV_NUM_DATA_POINTERS],
+    pub offset: [isize; AV_NUM_DATA_POINTERS],
+    /// `VK_QUEUE_FAMILY_IGNORED` for an image shared by its families.
+    pub queue_family: [u32; AV_NUM_DATA_POINTERS],
+    pub internal: *mut c_void,
+}
+
+/// `AV_CUDA_USE_PRIMARY_CONTEXT` (libavutil/hwcontext_cuda.h): a CUDA device
+/// on the device's primary context rather than one of its own.
+pub const AV_CUDA_USE_PRIMARY_CONTEXT: c_int = 1;
+
 /// `AVDictionary`, only ever handled by pointer.
 #[repr(C)]
 pub struct AVDictionary {
@@ -581,6 +687,9 @@ pub type FnHwFramesAlloc = unsafe extern "C" fn(*mut AVBufferRef) -> *mut AVBuff
 pub type FnHwFramesInit = unsafe extern "C" fn(*mut AVBufferRef) -> c_int;
 pub type FnHwFrameGetBuffer = unsafe extern "C" fn(*mut AVBufferRef, *mut AVFrame, c_int) -> c_int;
 pub type FnBufferUnref = unsafe extern "C" fn(*mut *mut AVBufferRef);
+pub type FnBufferRef = unsafe extern "C" fn(*const AVBufferRef) -> *mut AVBufferRef;
+pub type FnHwDeviceDerived =
+    unsafe extern "C" fn(*mut *mut AVBufferRef, c_int, *mut AVBufferRef, c_int) -> c_int;
 pub type FnFrameRef = unsafe extern "C" fn(*mut AVFrame, *const AVFrame) -> c_int;
 pub type FnHwTransfer = unsafe extern "C" fn(*mut AVFrame, *const AVFrame, c_int) -> c_int;
 pub type FnOptSet = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, c_int) -> c_int;
@@ -747,6 +856,41 @@ mod offsets {
     const _: () = assert!(offset_of!(AVD3D12VAFrame, sync_ctx) == 16);
     const _: () = assert!(offset_of!(AVD3D12VAFrame, flags) == 40);
     const _: () = assert!(size_of::<AVD3D12VAFrame>() == 48);
+
+    const _: () = assert!(size_of::<AVVulkanDeviceQueueFamily>() == 16);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, get_proc_addr) == 8);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, act_dev) == 32);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, device_features) == 40);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, enabled_inst_extensions) == 280);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, nb_enabled_inst_extensions) == 288);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, enabled_dev_extensions) == 296);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, nb_enabled_dev_extensions) == 304);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, lock_queue) == 312);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, unlock_queue) == 320);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, qf) == 328);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, nb_qf) == 1352);
+    const _: () = assert!(offset_of!(AVVulkanDeviceContext, queue_flags) == 1356);
+    const _: () = assert!(size_of::<AVVulkanDeviceContext>() == 1360);
+
+    const _: () = assert!(offset_of!(AVVulkanFramesContext, create_pnext) == 8);
+    const _: () = assert!(offset_of!(AVVulkanFramesContext, flags) == 80);
+    const _: () = assert!(offset_of!(AVVulkanFramesContext, format) == 88);
+    const _: () = assert!(offset_of!(AVVulkanFramesContext, nb_layers) == 120);
+    const _: () = assert!(offset_of!(AVVulkanFramesContext, lock_frame) == 128);
+    const _: () = assert!(size_of::<AVVulkanFramesContext>() == 144);
+
+    const _: () = assert!(offset_of!(AVVkFrame, tiling) == 64);
+    const _: () = assert!(offset_of!(AVVkFrame, mem) == 72);
+    const _: () = assert!(offset_of!(AVVkFrame, size) == 136);
+    const _: () = assert!(offset_of!(AVVkFrame, flags) == 200);
+    const _: () = assert!(offset_of!(AVVkFrame, access) == 208);
+    const _: () = assert!(offset_of!(AVVkFrame, layout) == 272);
+    const _: () = assert!(offset_of!(AVVkFrame, sem) == 304);
+    const _: () = assert!(offset_of!(AVVkFrame, sem_value) == 368);
+    const _: () = assert!(offset_of!(AVVkFrame, offset) == 432);
+    const _: () = assert!(offset_of!(AVVkFrame, queue_family) == 496);
+    const _: () = assert!(offset_of!(AVVkFrame, internal) == 528);
+    const _: () = assert!(size_of::<AVVkFrame>() == 536);
 
     const _: () = assert!(offset_of!(AVOption, offset) == 16);
     const _: () = assert!(offset_of!(AVCodec, type_) == 16);

@@ -125,6 +125,8 @@ functions! {
         av_hwframe_ctx_init: FnHwFramesInit,
         av_hwframe_get_buffer: FnHwFrameGetBuffer,
         av_buffer_unref: FnBufferUnref,
+        av_buffer_ref: FnBufferRef,
+        av_hwdevice_ctx_create_derived: FnHwDeviceDerived,
         av_frame_ref: FnFrameRef,
         av_hwframe_transfer_data: FnHwTransfer,
         av_opt_set: FnOptSet,
@@ -450,6 +452,157 @@ impl Lib {
         self.frames_on(device_ref, format, sw_format, width, height)
     }
 
+    /// A `vulkan` device reference around a device the caller made and
+    /// keeps: its instance, physical device and device, the extensions and
+    /// features it was created with, and the queue families libav may submit
+    /// to. libav never destroys a device it did not make.
+    pub fn vulkan_device(
+        &'static self,
+        handles: &super::vulkan::VulkanHandles,
+    ) -> std::result::Result<BufferRef, AvErr> {
+        let refuse = |why: &str| AvErr {
+            code: 0,
+            why: why.to_string(),
+        };
+        let device_type = self
+            .hw_type("vulkan")
+            .ok_or_else(|| refuse("this libav cannot create a vulkan device"))?;
+        if handles.queue_families.len() > 64 {
+            return Err(refuse("more than 64 queue families"));
+        }
+        // libav keeps the extension lists' pointers for the life of the
+        // device context, and the device is the process's, so both lists
+        // live as long as the process.
+        let list = |names: &[std::ffi::CString]| -> (*const *const c_char, c_int) {
+            let names: &'static [std::ffi::CString] = Box::leak(names.to_vec().into_boxed_slice());
+            let pointers: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
+            let count = pointers.len() as c_int;
+            (Box::leak(pointers.into_boxed_slice()).as_ptr(), count)
+        };
+        let (inst_exts, nb_inst_exts) = list(&handles.instance_extensions);
+        let (dev_exts, nb_dev_exts) = list(&handles.device_extensions);
+        let f = &self.f;
+        // SAFETY: the reference av_hwdevice_ctx_alloc returns has an
+        // AVHWDeviceContext as its data, whose hwctx is a zeroed
+        // AVVulkanDeviceContext for a device of `device_type`; the features
+        // pointer names a VkPhysicalDeviceFeatures2, which is the 240 bytes
+        // copied. On failure the reference is unreffed, which leaves the
+        // caller's device alone.
+        unsafe {
+            let mut made = (f.av_hwdevice_ctx_alloc)(device_type);
+            if made.is_null() {
+                return Err(refuse("av_hwdevice_ctx_alloc allocated nothing"));
+            }
+            let ctx = (*made).data as *mut AVHWDeviceContext;
+            let hw = &mut *((*ctx).hwctx as *mut AVVulkanDeviceContext);
+            hw.get_proc_addr = handles.get_instance_proc_addr;
+            hw.inst = handles.instance;
+            hw.phys_dev = handles.physical_device;
+            hw.act_dev = handles.device;
+            ptr::copy_nonoverlapping(
+                handles.features as *const u8,
+                hw.device_features.as_mut_ptr() as *mut u8,
+                std::mem::size_of_val(&hw.device_features),
+            );
+            hw.enabled_inst_extensions = inst_exts;
+            hw.nb_enabled_inst_extensions = nb_inst_exts;
+            hw.enabled_dev_extensions = dev_exts;
+            hw.nb_enabled_dev_extensions = nb_dev_exts;
+            for (slot, family) in hw.qf.iter_mut().zip(&handles.queue_families) {
+                *slot = AVVulkanDeviceQueueFamily {
+                    idx: family.index as c_int,
+                    num: family.count as c_int,
+                    flags: family.flags,
+                    video_caps: family.video_caps,
+                };
+            }
+            hw.nb_qf = handles.queue_families.len() as c_int;
+            let ret = (f.av_hwdevice_ctx_init)(made);
+            if ret < 0 {
+                (f.av_buffer_unref)(&mut made);
+                return Err(self.err(ret));
+            }
+            Ok(BufferRef {
+                ptr: made,
+                lib: self,
+            })
+        }
+    }
+
+    /// A CUDA device on the same card as `vulkan`, a vulkan device
+    /// reference, found by the card's UUID, on the card's primary context.
+    pub fn cuda_from_vulkan(
+        &'static self,
+        vulkan: &BufferRef,
+    ) -> std::result::Result<BufferRef, AvErr> {
+        let device_type = self.hw_type("cuda").ok_or_else(|| AvErr {
+            code: 0,
+            why: "this libav cannot create a cuda device".to_string(),
+        })?;
+        let mut made: *mut AVBufferRef = ptr::null_mut();
+        // SAFETY: the out-pointer is ours; the source is a live device
+        // reference, which libav refers to and does not take.
+        let ret = unsafe {
+            (self.f.av_hwdevice_ctx_create_derived)(
+                &mut made,
+                device_type,
+                vulkan.ptr,
+                AV_CUDA_USE_PRIMARY_CONTEXT,
+            )
+        };
+        if ret < 0 || made.is_null() {
+            return Err(self.err(ret));
+        }
+        Ok(BufferRef {
+            ptr: made,
+            lib: self,
+        })
+    }
+
+    /// A `vulkan` frames context of `sw_format` pictures of `width` x
+    /// `height` on `device`, each plane an image of its own: the layout
+    /// libavutil can hand to CUDA.
+    pub fn vulkan_frames(
+        &'static self,
+        device: &BufferRef,
+        sw_format: c_int,
+        width: c_int,
+        height: c_int,
+    ) -> std::result::Result<BufferRef, AvErr> {
+        let vulkan = self.pix_fmt("vulkan").ok_or_else(|| AvErr {
+            code: 0,
+            why: "libavutil has no vulkan pixel format".to_string(),
+        })?;
+        let device_ref = device.another()?.into_raw();
+        self.frames_with(device_ref, vulkan, sw_format, width, height, |frames| {
+            // SAFETY: a vulkan frames context's hwctx is its
+            // AVVulkanFramesContext, set before av_hwframe_ctx_init.
+            unsafe {
+                let hw = (*frames).hwctx as *mut AVVulkanFramesContext;
+                (*hw).flags |= AV_VK_FRAME_FLAG_DISABLE_MULTIPLANE;
+            }
+        })
+    }
+
+    /// A frames context of `format` pictures holding `sw_format`, on
+    /// `device`, which keeps its own reference.
+    pub fn frames_on_device(
+        &'static self,
+        device: &BufferRef,
+        format: c_int,
+        sw_format: c_int,
+        width: c_int,
+        height: c_int,
+    ) -> std::result::Result<BufferRef, AvErr> {
+        self.frames_on(
+            device.another()?.into_raw(),
+            format,
+            sw_format,
+            width,
+            height,
+        )
+    }
+
     /// A default device of `device_type`, as a new reference.
     fn default_device(&self, device_type: c_int) -> std::result::Result<*mut AVBufferRef, AvErr> {
         let mut made: *mut AVBufferRef = ptr::null_mut();
@@ -467,11 +620,25 @@ impl Lib {
     /// A frames context on `device_ref`, whose one reference moves in.
     fn frames_on(
         &'static self,
+        device_ref: *mut AVBufferRef,
+        format: c_int,
+        sw_format: c_int,
+        width: c_int,
+        height: c_int,
+    ) -> std::result::Result<BufferRef, AvErr> {
+        self.frames_with(device_ref, format, sw_format, width, height, |_| {})
+    }
+
+    /// As [`Lib::frames_on`], with `prepare` given the frames context to set
+    /// its device's own fields before it is initialised.
+    fn frames_with(
+        &'static self,
         mut device_ref: *mut AVBufferRef,
         format: c_int,
         sw_format: c_int,
         width: c_int,
         height: c_int,
+        prepare: impl FnOnce(*mut AVHWFramesContext),
     ) -> std::result::Result<BufferRef, AvErr> {
         let f = &self.f;
         // SAFETY: the frames reference av_hwframe_ctx_alloc returns has an
@@ -492,6 +659,7 @@ impl Lib {
             (*ctx).sw_format = sw_format;
             (*ctx).width = width;
             (*ctx).height = height;
+            prepare(ctx);
             let ret = (f.av_hwframe_ctx_init)(frames);
             if ret < 0 {
                 (f.av_buffer_unref)(&mut frames);
@@ -1176,6 +1344,25 @@ impl BufferRef {
         raw
     }
 
+    /// Another reference to the same buffer, as a raw one for a struct or a
+    /// call that takes it over.
+    fn share(&self) -> *mut AVBufferRef {
+        // SAFETY: a live reference; the new one is the caller's.
+        unsafe { (self.lib.f.av_buffer_ref)(self.ptr) }
+    }
+
+    /// Another reference to the same buffer.
+    pub fn another(&self) -> std::result::Result<BufferRef, AvErr> {
+        let ptr = self.share();
+        if ptr.is_null() {
+            return Err(AvErr {
+                code: 0,
+                why: "av_buffer_ref allocated nothing".to_string(),
+            });
+        }
+        Ok(BufferRef { ptr, lib: self.lib })
+    }
+
     /// A picture of this frames context's pool, in `frame`.
     pub fn get_buffer(&self, frame: &mut Frame) -> std::result::Result<(), AvErr> {
         frame.unref();
@@ -1643,6 +1830,28 @@ impl CodecCtx {
         Ok(())
     }
 
+    /// Gives the context another reference to `device`, a device reference
+    /// shared with others.
+    pub fn attach_shared_device(&mut self, device: &BufferRef) -> std::result::Result<(), AvErr> {
+        let made = device.another()?;
+        // SAFETY: a fresh context has no device; the reference moves in.
+        unsafe { (*self.ptr).hw_device_ctx = made.into_raw() };
+        Ok(())
+    }
+
+    /// Gives an encoder the pool it reads its pictures from: `frames`, a
+    /// frames context of `format` pictures holding `sw_format`. The
+    /// context's pixel format becomes `format`.
+    pub fn attach_frames(&mut self, frames: BufferRef, format: c_int, sw_format: c_int) {
+        // SAFETY: a fresh context has no frames context; the reference
+        // moves in.
+        unsafe {
+            (*self.ptr).hw_frames_ctx = frames.into_raw();
+            (*self.ptr).pix_fmt = format;
+            (*self.ptr).sw_pix_fmt = sw_format;
+        }
+    }
+
     /// Gives an encoder that takes D3D12 frames the pool it reads them
     /// from: `sw_format` textures of `width` x `height` on a `d3d12va`
     /// device built around `device` (an `ID3D12Device *` whose one
@@ -1987,6 +2196,32 @@ impl Frame {
         let f = self.get();
         let videotoolbox = self.lib.pix_fmt("videotoolbox_vld")?;
         (f.format == videotoolbox && !f.data[3].is_null()).then(|| f.data[3] as *mut c_void)
+    }
+
+    /// The Vulkan picture a `vulkan` frame's first data pointer names, and
+    /// the frames context it is of; None for any other frame.
+    pub fn vulkan(&self) -> Option<(*mut AVVkFrame, *mut AVHWFramesContext)> {
+        let f = self.get();
+        let vulkan = self.lib.pix_fmt("vulkan")?;
+        if f.format != vulkan || f.data[0].is_null() || f.hw_frames_ctx.is_null() {
+            return None;
+        }
+        // SAFETY: a hardware frame's hw_frames_ctx is a live reference to its
+        // AVHWFramesContext.
+        let frames = unsafe { (*f.hw_frames_ctx).data as *mut AVHWFramesContext };
+        Some((f.data[0] as *mut AVVkFrame, frames))
+    }
+
+    /// Copies the picture `source`, of another device's pool, into this
+    /// frame, one of this device's pool, on the devices: libavutil's
+    /// transfer between two hardware frames (Vulkan to CUDA).
+    pub fn transfer_from(&mut self, source: &Frame) -> std::result::Result<(), AvErr> {
+        // SAFETY: two live frames, each holding a picture of its pool.
+        let ret = unsafe { (self.lib.f.av_hwframe_transfer_data)(self.ptr, source.ptr, 0) };
+        if ret < 0 {
+            return Err(self.lib.err(ret));
+        }
+        Ok(())
     }
 
     /// Moves the picture `from` holds into this frame, which held nothing,

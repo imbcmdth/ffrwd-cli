@@ -50,6 +50,8 @@ use super::d3d12 as platform;
 #[cfg(target_os = "macos")]
 use super::metal as platform;
 use super::tensor::{DeviceTensor, Rect, Source, TensorSpec};
+#[cfg(target_os = "linux")]
+use super::vulkan as platform;
 use super::{shared, shared_device};
 use crate::av::DeviceFrame;
 
@@ -109,7 +111,7 @@ pub struct GpuFrame {
     /// from, or what reading it back gave.
     bytes: OnceLock<Arc<Vec<u8>>>,
     /// The decoder's own texture, where the frame is it.
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     wrapped: Mutex<Option<platform::Wrapped>>,
 }
 
@@ -170,7 +172,7 @@ impl GpuFrame {
             converted: Mutex::new(Vec::new()),
             tensors: Mutex::new(Vec::new()),
             bytes: OnceLock::new(),
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             wrapped: Mutex::new(None),
         }
     }
@@ -629,7 +631,7 @@ impl Drop for GpuFrame {
         for texture in &self.owned {
             self.global.texture_drop(*texture);
         }
-        #[cfg(any(windows, target_os = "macos"))]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         if let Some(wrapped) = self
             .wrapped
             .lock()
@@ -648,7 +650,7 @@ pub struct DecodedPictures {
     /// What the line on stderr names: `decode h264: d3d12va`.
     who: String,
     said: Option<String>,
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     taker: platform::Taker,
 }
 
@@ -659,7 +661,7 @@ impl DecodedPictures {
         DecodedPictures {
             who: format!("decode {codec}: {device_type}"),
             said: None,
-            #[cfg(any(windows, target_os = "macos"))]
+            #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
             taker: Default::default(),
         }
     }
@@ -673,7 +675,7 @@ impl DecodedPictures {
             said: None,
             #[cfg(windows)]
             taker: platform::Taker::for_filter(),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             taker: Default::default(),
         }
     }
@@ -706,7 +708,7 @@ impl DecodedPictures {
         self.take(picture, held, wire, yuv)
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
     fn take(
         &mut self,
         picture: DeviceFrame,
@@ -739,7 +741,7 @@ impl DecodedPictures {
         }))
     }
 
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     fn take(
         &mut self,
         picture: DeviceFrame,
@@ -749,7 +751,7 @@ impl DecodedPictures {
     ) -> Result<Arc<GpuFrame>> {
         let _ = (&self.who, &self.said, picture);
         let _ = (held, wire, yuv);
-        bail!("a decoder's pictures are taken on the device on Windows and macOS only, so far")
+        bail!("a decoder's pictures are taken on the device on Windows, macOS and Linux only")
     }
 }
 
