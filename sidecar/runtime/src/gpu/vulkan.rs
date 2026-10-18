@@ -19,9 +19,12 @@
 //! it.
 //!
 //! Decoding. A picture the decoder wrote is copied on the device into two
-//! textures wgpu made, luma and chroma, by commands recorded into wgpu's own
-//! command buffer, so the copy runs on wgpu's queue in order with what reads
-//! the frame. It is not wrapped as it is: wgpu-core takes a texture made from
+//! textures of the device, luma and chroma, by commands recorded into wgpu's
+//! own command buffer, so the copy runs on wgpu's queue in order with what
+//! reads the frame. The textures are made by wgpu-hal and handed to
+//! wgpu-core, which counts such a texture as written; one wgpu-core made
+//! itself would be cleared before its first read, over what the copy wrote.
+//! The picture is not wrapped as it is: wgpu-core takes a texture made from
 //! a raw image as uninitialised, and its first barrier would start from
 //! `VK_IMAGE_LAYOUT_UNDEFINED`, which lets the driver discard the picture;
 //! and the decoder keeps reading a picture it holds as a reference, in its

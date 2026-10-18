@@ -570,6 +570,21 @@ fn shared_decoder(test: &str) -> Option<(&'static str, PathBuf)> {
     Some((device, libav(test)?))
 }
 
+/// The device a decoder shares the process's device through where the
+/// 64x48 fixture decodes on it, and the libav directory: `d3d12va` on
+/// Windows, `vulkan` on Linux. None, having said why the test is skipped,
+/// elsewhere: VideoToolbox decodes nothing that small.
+fn small_shared_decoder(test: &str) -> Option<(&'static str, PathBuf)> {
+    if !cfg!(windows) && !cfg!(target_os = "linux") {
+        eprintln!(
+            "SKIPPED: {test}. Its 64x48 fixture decodes on the process's device on Windows \
+             and Linux only."
+        );
+        return None;
+    }
+    shared_decoder(test)
+}
+
 /// What the sidecar says on Linux where the process's Vulkan device has no
 /// decoder: a software adapter, or a card without the video extensions.
 const NO_DEVICE_DECODER: &str = "[gpu] no decoder or encoder on the process's Vulkan device";
@@ -1291,7 +1306,7 @@ fn has_the_box(picture: &[u8], width: usize, side: usize) -> bool {
 #[test]
 fn pictures_decoded_on_the_device_reach_an_rgba_reader_converted_there() {
     let test = "pictures_decoded_on_the_device_reach_an_rgba_reader_converted_there";
-    let Some(dir) = d3d12va_libav(test) else {
+    let Some((device, dir)) = small_shared_decoder(test) else {
         return;
     };
     let Some(()) = ffmpeg(test) else {
@@ -1302,12 +1317,17 @@ fn pictures_decoded_on_the_device_reach_an_rgba_reader_converted_there() {
     let output = run_chain(
         &dir,
         &h264_fixture(),
-        "[0:v]decode=format=rgba:hw=d3d12va[d];[v=d]gpu_box=memory=gpu:out=gpu:size=5[out=out0]",
+        &format!(
+            "[0:v]decode=format=rgba:hw={device}[d];[v=d]gpu_box=memory=gpu:out=gpu:size=5[out=out0]"
+        ),
         &out,
         Some(&module),
     );
     if no_gpu(&output) {
         eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    if no_device_decoder(test, &output) {
         return;
     }
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -1316,7 +1336,7 @@ fn pictures_decoded_on_the_device_reach_an_rgba_reader_converted_there() {
         "exited {:?}:\n{stderr}",
         output.status.code()
     );
-    assert!(stderr.contains(&decoded_line("d3d12va")), "{stderr}");
+    assert!(stderr.contains(&decoded_line(device)), "{stderr}");
     assert!(
         stderr.contains("[gpu] convert nv12 64x48 to rgba 64x48"),
         "the decoder's NV12 is made rgba on the device:\n{stderr}"
@@ -1417,7 +1437,7 @@ fn decoded_bt709(
 fn a_picture_decoded_on_the_device_is_made_rgba_in_the_colour_the_software_decoder_reads() {
     let test =
         "a_picture_decoded_on_the_device_is_made_rgba_in_the_colour_the_software_decoder_reads";
-    let Some(dir) = d3d12va_libav(test) else {
+    let Some((hw, dir)) = small_shared_decoder(test) else {
         return;
     };
     let Some(()) = ffmpeg(test) else {
@@ -1450,9 +1470,12 @@ fn a_picture_decoded_on_the_device_is_made_rgba_in_the_colour_the_software_decod
         (h264_fixture(), "bt709", "bt601"),
         (said.clone(), "bt601", "bt709"),
     ] {
-        let (device, output) = decoded_bt709(&dir, &module, &source, "d3d12va");
+        let (device, output) = decoded_bt709(&dir, &module, &source, hw);
         if no_gpu(&output) {
             eprintln!("skipped: this machine has no GPU adapter");
+            return;
+        }
+        if no_device_decoder(test, &output) {
             return;
         }
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
