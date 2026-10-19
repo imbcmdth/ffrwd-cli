@@ -178,11 +178,7 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     nowhere else: `ffrwd.switch.video(prog.v, ads.video)`. A filter, a
     module's pad or a `COPY` reading one is refused. Feeders of one group
     fed by its picture and its sound share one connection, which an
-    instance writes as one NUT, picture then sound. An input of the body
-    that declares its `shape` is probed for half a second
-    (`analyzeduration` and `probesize` 500000) unless it sets either:
-    ffmpeg's own default reads about five seconds of a live feed and then
-    sends them at once.
+    instance writes as one NUT, picture then sound.
   - A node's data input whose `interval` names a hold group the lateral
     feeds (`interval.group`) takes the lateral's rows on that group's
     connection, after its picture and sound in the same NUT, and binds no

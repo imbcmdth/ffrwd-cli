@@ -542,30 +542,6 @@ def test_a_shape_missing_a_required_key_is_refused_at_compile(
     assert "a picture (width, height) without its fps" in caught.value.message
 
 
-def test_a_feeders_input_with_a_declared_shape_is_probed_for_half_a_second() -> None:
-    """A run-time lateral's instance writes its input to a feeder's port. With
-    the shape declared, ffmpeg's probe only holds the feed back (about 5 s of
-    a live one, sent at once), so it is half a second unless the input says."""
-    query = (
-        "COPY (SELECT f.video[1], f.audio[1] FROM input('tcp://127.0.0.1:9100', "
-        "format => 'mpegts'{} , shape => " + _STRUCT + ") f) "
-        "TO 'tcp://127.0.0.1:50000' WITH (format 'nut', video_codec 'copy', "
-        "audio_codec 'pcm_f32le')"
-    )
-    (graph,) = compile_all(query.format("")).graphs
-    assert graph.input_options["f"]["analyzeduration"] == 500000
-    assert graph.input_options["f"]["probesize"] == 500000
-    assert render_options(graph.input_options["f"])[-4:] == [
-        "-analyzeduration", "500000", "-probesize", "500000",
-    ]  # fmt: skip
-    (written,) = compile_all(query.format(", analyzeduration => 2000000")).graphs
-    assert written.input_options["f"]["analyzeduration"] == 2000000
-    assert written.input_options["f"]["probesize"] == 500000
-    # Anywhere else a declared shape changes nothing ffmpeg is handed.
-    (elsewhere,) = compile_all(query.format("").replace("tcp://127.0.0.1:50000", "o.nut")).graphs
-    assert "analyzeduration" not in elsewhere.input_options.get("f", {})
-
-
 def test_an_rtmp_listener_renders_listen_before_its_input() -> None:
     """ffmpeg's RTMP waits for a publisher only with ``-listen 1``; a
     ``?listen=1`` in the URL is read as part of the stream name and dials."""
