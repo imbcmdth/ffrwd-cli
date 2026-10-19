@@ -2922,8 +2922,85 @@ probe. The real findings from that work:
   before still had bytes queued behind a full input was refused as a
   second feeder. It now waits and is read once the first ends.
 
+### Where the CPU goes on the Linux route (2026-10-19)
+
+foundmeat's broadcast query on 0.32.1 took 1.1 to 1.5 cores of the box's
+i7-8750H for compose's sidecar with no feeds, against 0.93 on Windows.
+The GPU route's host waits were suspected. Measured in a container with
+perf, strace and gdb (`~/ffrwd-build/lrcpu`, `comp.sh`), they are not
+where the time goes. The per-frame host waits were: on the decode thread,
+`vkWaitSemaphores` for the decoder's write before each copy; on the
+encode lane, `vkWaitSemaphores` on the encoder's two images for their
+last transfer to CUDA; on the signaller, `vkWaitSemaphores` on wgpu's
+timeline for each copy; in libavutil's transfer to CUDA, two
+`vkWaitForFences` in `ff_vk_exec_start`; in NVENC, `nvEncLockBitstream`
+with `doNotWait` 0. libavutil already makes the CUDA primary context with
+`CU_CTX_SCHED_BLOCKING_SYNC` before it retains it, so CUDA blocks. The
+NVIDIA driver and CUDA together were 1.7% of the samples at 0.32.1 and 5%
+after the changes below. The threads looked asleep when sampled because
+they were: every worker was in a futex.
+
+The time was the scheduler. compose's sidecar also runs `listen_audio`,
+clocked one sample a tick at 48 kHz, and every task a worker takes or
+finishes wakes every worker (`notify_all` on two condition variables). The
+four workers made 30,000 voluntary context switches a second each, the
+main thread 50,000; strace counted 96,000 futex calls a second; 61% of
+the samples were in the kernel. `fix/lane-queue-cap` (a turn takes up to
+1024 settled ticks) takes that to about 350 switches a worker and 0.2
+cores of system time. Then, of what is left, the largest pieces of host
+time were making and destroying textures, about 15% of the samples: the
+conversion to NV12 for the encoder made two textures a frame and compose
+makes its output texture a frame, each a driver allocation. Then the
+module itself (compiled wasm, 20% of the samples), the scheduler cutting
+`listen_audio`'s 48,000 ticks a second one at a time (`State::cut` and
+`Assembler::next_clocked`, 15%), wasmtime's host calls, and malloc.
+
+Changed on `fix/linux-route-cpu` (on top of `fix/lane-queue-cap`):
+
+- The decoder's copy is a submission of the host's own on wgpu's queue,
+  made under wgpu-core's lock on its submissions (the lock
+  `Global::device_fence_as_hal` holds for reading and wgpu-core's submit
+  for writing). It waits
+  for the decoder's semaphore on the device and signals it itself. A
+  queue of our own in wgpu's family would not do: wgpu's queue cannot wait
+  on our semaphore, and later batches are ordered after the copy only by
+  being on the same queue, behind a pipeline barrier.
+- The encoder's feed is the same: the copy into the Vulkan picture waits
+  on the device for the picture's last transfer and signals it, with no
+  host waits, no host signals and no textures wrapped a frame.
+- The textures the host makes for a frame's planes (conversions and
+  uploads) are kept, four free of each size and format, and used again.
+
+Measured on the box, the card shared with slot1 idle, release builds,
+`comp.sh`: process CPU from `/proc` over 20 s from 20 or 30 s in, media
+seconds per 10 s of wall from ffmpeg reading the UDP output.
+
+| build | idle cores (user, sys) | with the 1080p60 feed | sm, enc, dec with the feed | card memory idle, feed | media s / 10 s |
+|---|---|---|---|---|---|
+| 0.32.1 (6fb5f73) | 1.34, 1.37 (0.74, 0.60) | 1.51 (1.02, 0.48) | 43, 21, 7 | 231, 375 MiB | 10.15 to 10.52 |
+| `fix/lane-queue-cap` | 0.99, 0.99 (0.79, 0.20) | 1.02, 1.02 | 43, 20, 8 | 359, 375 to 439 | 10.15 to 10.52 |
+| and the decoder's copy on the device | | 0.99 | 42, 19, 8 | 443 | 10.15 |
+| and the encoder's feed on the device | 1.00 | | | 365 | 10.52 |
+| and the planes kept (f8adea3) | 0.92 to 0.96 (0.81 to 0.84, 0.11 to 0.12) | 0.91, 0.95 | 42, 19, 7 | 301, 375 to 443 | 10.15 to 10.34 |
+
+The feed thread went from 5.5% of a core to 3.8 to 4.9% without the host
+wait. The card's memory moved by 60 to 130 MiB between runs of the same
+build, so only the 0.32.1 idle figure (231, twice) against the lane
+branch's (359) stands out; it is not explained.
+
 ### What is left
 
+- The scheduler with a fast clock. `fix/lane-queue-cap` is most of the
+  saving above and should be merged for it. After it, `listen_audio`'s
+  48,000 ticks a second still cost about 0.13 cores to cut and assemble
+  one at a time; the module declaring a window of a packet, or the
+  scheduler cutting a run of settled ticks at once, would remove it. The
+  workers still wake one another with `notify_all` for every task taken
+  or finished.
+- compose makes a new output texture every frame, which the host adopts
+  and destroys, about 6% of the samples. The host could hand a module a
+  texture kept from an adopted frame, but a new WebGPU texture is
+  cleared, and a module may depend on that.
 - The 1023-task queue and 0.32.0 falling short of real time (2026-10-19).
   The pace fix shipped in 0.32.1. The rest is on branch
   `fix/lane-queue-cap`, unmerged until the lane change is wanted for
@@ -2951,12 +3028,6 @@ probe. The real findings from that work:
   query keeps real time (10.15 against 8.02 on 0.32.0). Left for
   foundmeat: `listen_audio` could declare a window of a packet or more,
   since it reads only the times.
-- The host waits for the decoder's write before each copy is submitted,
-  and the decode thread waits with it. A wait on the queue would need a
-  submit with wait semaphores, which wgpu-core does not have; a raw submit
-  on a queue of our own in wgpu's family, ordered against wgpu's by a
-  timeline semaphore of our own, is the way if the wait shows in a
-  profile.
 - The copy into the pool, 3 MB a 1080p picture. Wrapping the decoder's
   picture needs wgpu-core to take an image in a layout it is told, and a
   decoder whose output pictures are not its references.
