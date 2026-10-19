@@ -26,7 +26,7 @@
 //! past their newest time first.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1188,6 +1188,25 @@ pub fn worker_count(jobs: Option<usize>) -> usize {
     jobs.unwrap_or(DEFAULT_WORKERS).min(cores).max(1)
 }
 
+/// Where the scheduler puts what an output's writer calls once it has taken
+/// something: the writers are opened before the scheduler, so they call
+/// through this.
+pub type WakeSlot = OnceLock<Arc<dyn Fn() + Send + Sync>>;
+
+/// What an output's writer calls once it has taken something: room may
+/// have opened, or the output may have stopped.
+fn waker_of(shared: &Arc<Shared>) -> Arc<dyn Fn() + Send + Sync> {
+    let shared = Arc::clone(shared);
+    Arc::new(move || {
+        let mut state = shared.lock();
+        if state.unread() {
+            state.finished = true;
+        }
+        drop(state);
+        shared.notify();
+    })
+}
+
 /// The running network: workers spawned, lanes wired, waiting to be fed.
 pub struct Scheduler {
     shared: Arc<Shared>,
@@ -1196,8 +1215,12 @@ pub struct Scheduler {
 
 impl Scheduler {
     /// Opens every instance a state lane needs, cuts what the lanes can cut
-    /// before anything arrives, and spawns `workers` threads.
-    pub fn start(plan: Plan, workers: usize) -> Result<Scheduler> {
+    /// before anything arrives, puts its waker in `wake`, and spawns
+    /// `workers` threads. The waker is in place before any worker runs: a
+    /// lane with no inputs runs at once, and a writer that drains what it
+    /// made before the waker was there would wake nobody, leaving a worker
+    /// that found the output full asleep for good.
+    pub fn start(plan: Plan, workers: usize, wake: &WakeSlot) -> Result<Scheduler> {
         let Plan {
             lanes: specs,
             consumers,
@@ -1291,6 +1314,7 @@ impl Scheduler {
             work: Condvar::new(),
             space: Condvar::new(),
         });
+        let _ = wake.set(waker_of(&shared));
         let handles = (0..workers)
             .map(|k| {
                 let shared = Arc::clone(&shared);
@@ -1300,20 +1324,6 @@ impl Scheduler {
         Ok(Scheduler {
             shared,
             handles: Mutex::new(handles),
-        })
-    }
-
-    /// What an output's writer calls once it has taken something: room may
-    /// have opened, or the output may have stopped.
-    pub fn waker(&self) -> Arc<dyn Fn() + Send + Sync> {
-        let shared = Arc::clone(&self.shared);
-        Arc::new(move || {
-            let mut state = shared.lock();
-            if state.unread() {
-                state.finished = true;
-            }
-            drop(state);
-            shared.notify();
         })
     }
 
@@ -1680,7 +1690,7 @@ mod tests {
             writers: Vec::new(),
             mirrors: HashMap::new(),
         };
-        let scheduler = Scheduler::start(plan, 2).expect("the lanes");
+        let scheduler = Scheduler::start(plan, 2, &WakeSlot::new()).expect("the lanes");
         let epoch = 17_909_860_700i64;
         for k in 0..30 {
             let frame = TickFrame {
@@ -1713,5 +1723,128 @@ mod tests {
             calls.len() <= 32,
             "a turn per arrival at most, the first and the last"
         );
+    }
+
+    /// A source of `count` messages, one a call, finished on the last.
+    struct Counting {
+        shape: NodeShape,
+        made: i64,
+        count: i64,
+    }
+
+    impl Node for Counting {
+        fn name(&self) -> &str {
+            "counting"
+        }
+
+        fn shape(&self) -> &NodeShape {
+            &self.shape
+        }
+
+        fn set_params(&mut self, _params: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn process(&mut self, tick: Tick) -> Result<Emitted> {
+            if tick.last {
+                return Ok(Emitted::default());
+            }
+            self.made += 1;
+            Ok(Emitted {
+                items: vec![model::Emission {
+                    port: 0,
+                    payload: Payload::Message(Message {
+                        pts: self.made,
+                        data: b"{}".to_vec(),
+                    }),
+                }],
+                finished: self.made >= self.count,
+                ..Emitted::default()
+            })
+        }
+    }
+
+    /// A source lane starts as the scheduler does and fills its output's
+    /// queue at once, and the writer drains it while the thread that started
+    /// the scheduler has not got further yet. The waker the writer calls is
+    /// in place by then, so the worker that found the queue full is woken
+    /// and the source runs to its end. Were the waker put in place only
+    /// where the starting thread gets to after `start`, the writer would
+    /// wake nobody and the run would never end.
+    #[test]
+    fn a_source_finishes_when_its_writer_drains_before_the_starting_thread_goes_on() {
+        let shape = NodeShape {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            clock: Clock::SelfClocked,
+            pure: false,
+            one_to_one: false,
+            bounded: true,
+            relation: Vec::new(),
+        };
+        let assembler = Assembler::new(&shape, &[], "counting", &[]).expect("an assembler");
+        let slot = Arc::new(WakeSlot::new());
+        let wake: Arc<dyn Fn() + Send + Sync> = {
+            let slot = Arc::clone(&slot);
+            Arc::new(move || {
+                if let Some(wake) = slot.get() {
+                    wake();
+                }
+            })
+        };
+        let dir = std::env::temp_dir().join(format!("ffrwd-lanes-waker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let mut writer = crate::edges::spawn_writer(
+            crate::OutputPath::File(dir.join("out.ndjson").display().to_string()),
+            "the test's output".to_string(),
+            crate::edges::Target::Null,
+            wake,
+            Arc::new(crate::edges::Ending::default()),
+        );
+        let base = TimeBase { num: 1, den: 1000 };
+        let plan = Plan {
+            lanes: vec![LaneSpec {
+                gpu: HashMap::new(),
+                name: "counting".to_string(),
+                shape: shape.clone(),
+                intake: Intake::Assembled(Box::new(assembler)),
+                bound: Vec::new(),
+                state: Vec::new(),
+                tick_base: base,
+                runners: vec![Box::new(Counting {
+                    shape,
+                    made: 0,
+                    count: 40,
+                })],
+                opener: None,
+                ports: vec![Some(PortOut {
+                    stream: 0,
+                    base,
+                    latency: 0.0,
+                })],
+                rows: None,
+                unbuffered: false,
+            }],
+            consumers: HashMap::from([(0, vec![Consumer::Writer(0, 0)])]),
+            writers: vec![Arc::clone(&writer.queue)],
+            mirrors: HashMap::new(),
+        };
+        let scheduler = Arc::new(Scheduler::start(plan, 1, &slot).expect("the lanes"));
+        // The starting thread held back where it used to put the waker in
+        // place: by now the source has filled the queue and the writer has
+        // drained it.
+        thread::sleep(Duration::from_millis(300));
+        let _ = slot.set(waker_of(&scheduler.shared));
+        let (done, finished) = mpsc::channel();
+        {
+            let scheduler = Arc::clone(&scheduler);
+            thread::spawn(move || done.send(scheduler.finish()));
+        }
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the source ran to its end")
+            .expect("the run");
+        writer.join();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

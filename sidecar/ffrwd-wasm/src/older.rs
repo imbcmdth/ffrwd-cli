@@ -320,7 +320,7 @@ pub fn run(
         });
     }
 
-    let wake_slot: Arc<OnceLock<Arc<dyn Fn() + Send + Sync>>> = Arc::new(OnceLock::new());
+    let wake_slot: Arc<crate::lanes::WakeSlot> = Arc::new(OnceLock::new());
     let wake: Arc<dyn Fn() + Send + Sync> = {
         let slot = Arc::clone(&wake_slot);
         Arc::new(move || {
@@ -356,8 +356,11 @@ pub fn run(
         writers: writers.iter().map(|w| Arc::clone(&w.queue)).collect(),
         mirrors: HashMap::new(),
     };
-    let scheduler = Arc::new(Scheduler::start(plan, lanes::worker_count(jobs))?);
-    let _ = wake_slot.set(scheduler.waker());
+    let scheduler = Arc::new(Scheduler::start(
+        plan,
+        lanes::worker_count(jobs),
+        &wake_slot,
+    )?);
 
     let mut feeding = Vec::with_capacity(inputs);
     for (input, mut reader) in readers.into_iter().enumerate() {

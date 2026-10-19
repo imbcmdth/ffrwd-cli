@@ -313,7 +313,7 @@ pub fn run_carrying(args: &Args, bindings: &[Binding], wiring: &str) -> Result<A
     // writes an input may itself wait for one of them to accept.
     let mut early = bind_feed_ports(args, bindings, &calls);
     let inputs = edges::open_inputs(&args.inputs)?;
-    let wake_slot: Arc<OnceLock<Arc<dyn Fn() + Send + Sync>>> = Arc::new(OnceLock::new());
+    let wake_slot: Arc<crate::lanes::WakeSlot> = Arc::new(OnceLock::new());
     let wake: Arc<dyn Fn() + Send + Sync> = {
         let slot = Arc::clone(&wake_slot);
         Arc::new(move || {
@@ -333,8 +333,7 @@ pub fn run_carrying(args: &Args, bindings: &[Binding], wiring: &str) -> Result<A
         feeds,
         timing,
     } = open(args, bindings, &calls, &headers, wake, Arc::clone(&ending))?;
-    let scheduler = Arc::new(Scheduler::start(plan, workers)?);
-    let _ = wake_slot.set(scheduler.waker());
+    let scheduler = Arc::new(Scheduler::start(plan, workers, &wake_slot)?);
     ending.set_over(scheduler.over());
 
     let mut listeners = Vec::with_capacity(feeds.len());
