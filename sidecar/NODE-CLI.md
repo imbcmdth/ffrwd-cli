@@ -289,7 +289,10 @@ it, where it would be decoded on the device: a way to tell what the
 device's decode does from what the rest of the run does.
 `FFRWD_ENCODE_FEED=host` keeps NVENC on Linux but feeds it each frame read
 back to host memory, rather than copied on the device into its CUDA
-pictures: the same split on the encoding side.
+pictures: the same split on the encoding side. `FFRWD_TEE_OUT=<file>`
+appends a copy of every byte the sidecar writes to its NUT output to that
+file as it is written (a second NUT output to `<file>.1`, and so on), so
+what the output's reader was handed can be measured apart from it.
 
 One connection at a time: a second while one is on is accepted and closed
 at once, and a connection that has sent nothing is dropped for one that

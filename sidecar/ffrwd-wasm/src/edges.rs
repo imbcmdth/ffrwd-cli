@@ -388,13 +388,16 @@ fn write_all(
     queue: &Queue,
     wake: &dyn Fn(),
 ) -> Result<OutputWriter> {
-    let writer = BufWriter::with_capacity(1 << 20, open_output(path)?);
+    let output = open_output(path)?;
+    if let Target::Nut(streams) = target {
+        let live = crate::output_is_pipe(path);
+        let writer = BufWriter::with_capacity(1 << 20, Tee::new(output));
+        let writer = write_nut(writer, streams, live, queue, wake)?;
+        return Ok(writer.into_inner().map_err(|e| e.into_error())?.inner);
+    }
+    let writer = BufWriter::with_capacity(1 << 20, output);
     match target {
-        Target::Nut(streams) => {
-            let live = crate::output_is_pipe(path);
-            let writer = write_nut(writer, streams, live, queue, wake)?;
-            Ok(writer.into_inner().map_err(|e| e.into_error())?)
-        }
+        Target::Nut(_) => unreachable!("written above"),
         Target::Ndjson(base) => {
             let mut writer = writer;
             while let Some((_, out)) = next(queue, wake) {
@@ -443,6 +446,62 @@ fn write_all(
             }
             Ok(writer.into_inner().map_err(|e| e.into_error())?)
         }
+    }
+}
+
+/// A NUT output, and where `FFRWD_TEE_OUT` names a file a copy of every
+/// byte written to it there, appended and written through as it goes: what
+/// the reader of the output was handed, for measuring it apart from that
+/// reader. The run's first NUT output is copied to the file named, each
+/// later one to the name with `.1`, `.2`... after it.
+struct Tee<W> {
+    inner: W,
+    copy: Option<std::fs::File>,
+}
+
+impl<W: Write> Tee<W> {
+    fn new(inner: W) -> Tee<W> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let copy = std::env::var_os("FFRWD_TEE_OUT").and_then(|named| {
+            let k = NEXT.fetch_add(1, Ordering::SeqCst);
+            let mut path = std::path::PathBuf::from(named);
+            if k > 0 {
+                let mut name = path.clone().into_os_string();
+                name.push(format!(".{k}"));
+                path = name.into();
+            }
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(file) => Some(file),
+                Err(e) => {
+                    eprintln!(
+                        "ffrwd-wasm: FFRWD_TEE_OUT: opening {}: {e}; no copy",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        });
+        Tee { inner, copy }
+    }
+}
+
+impl<W: Write> Write for Tee<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if let Some(copy) = self.copy.as_mut() {
+            if copy.write_all(&buf[..n]).is_err() {
+                self.copy = None;
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 

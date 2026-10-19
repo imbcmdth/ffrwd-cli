@@ -983,8 +983,8 @@ impl State {
                             }
                         } else if let Some(l) = crate::trace::luma(&f.data) {
                             crate::trace::line(format_args!(
-                                "emit: {} stream {stream} picture {} luma {l:.1}",
-                                lane.name, f.pts
+                                "emit: {} stream {stream} picture {} (base {}/{}) luma {l:.1}",
+                                lane.name, f.pts, base.num, base.den
                             ));
                         }
                     }

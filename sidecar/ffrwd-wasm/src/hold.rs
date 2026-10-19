@@ -1171,14 +1171,7 @@ impl Group {
                             seconds(f.pts),
                             crate::trace::luma(&f.data)
                                 .map_or(String::new(), |l| format!(" luma {l:.1}")),
-                            f.data.gpu().map_or(String::new(), |g| {
-                                let ids: Vec<String> = g
-                                    .planes()
-                                    .iter()
-                                    .map(|p| format!("{:?}", p.texture))
-                                    .collect();
-                                format!(" textures {}", ids.join(" "))
-                            })
+                            crate::trace::textures(&f.data)
                         ),
                         None => format!("{index} nothing"),
                     }
