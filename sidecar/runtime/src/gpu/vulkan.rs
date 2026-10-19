@@ -19,11 +19,11 @@
 //! it.
 //!
 //! Decoding. A picture the decoder wrote is copied on the device into two
-//! textures of the device, luma and chroma, by commands recorded into wgpu's
-//! own command buffer, so the copy runs on wgpu's queue in order with what
-//! reads the frame. The textures are made by wgpu-hal and handed to
-//! wgpu-core, which counts such a texture as written; one wgpu-core made
-//! itself would be cleared before its first read, over what the copy wrote.
+//! textures of the device, luma and chroma, on wgpu's queue, so the copy
+//! runs in order with what reads the frame. The textures are made by
+//! wgpu-hal and handed to wgpu-core, which counts such a texture as
+//! written; one wgpu-core made itself would be cleared before its first
+//! read, over what the copy wrote.
 //! The picture is not wrapped as it is: wgpu-core takes a texture made from
 //! a raw image as uninitialised, and its first barrier would start from
 //! `VK_IMAGE_LAYOUT_UNDEFINED`, which lets the driver discard the picture;
@@ -32,11 +32,14 @@
 //! wgpu's. The copy reads the picture in the layout libav left it in and
 //! leaves it in the copy's, says so to libav, and moves the picture's
 //! timeline semaphore on by one once it has run. wgpu's submit waits on no
-//! semaphore, so the host waits for the decoder's write before the copy is
-//! submitted; a semaphore signalled by wgpu's submit could be taken up by
-//! another thread's submit first, so the semaphore is signalled from the
-//! host once the copy has run ([`Signaller`]). The decoder waits for that
-//! value before it writes the picture again.
+//! semaphore, and a semaphore it is asked to signal is taken up by
+//! whichever submit comes next, which may be another thread's; so the copy
+//! is a submission of the host's own on wgpu's queue ([`submit_raw`]),
+//! made while wgpu-core's lock on its submissions is held. It waits on the
+//! device for the decoder's write and signals the picture's semaphore
+//! itself, and wgpu's later submissions run after it. The decoder waits
+//! for that value before it writes the picture again; the copy's targets
+//! are kept until it has run ([`Signaller`]).
 //!
 //! Encoding. NVENC reads CUDA pictures. An encoder fed from this device is
 //! given a pool of Vulkan pictures, each plane an image of its own, which
@@ -81,6 +84,9 @@ struct Opened {
     families: Vec<av::QueueFamily>,
     /// Why libav is given none, where it is not.
     no_codec: Option<String>,
+    /// The family of wgpu's queue, which the host's own command buffers
+    /// are made for.
+    graphics: u32,
 }
 
 // SAFETY: the handles are Vulkan's, usable from any thread; the features
@@ -439,6 +445,7 @@ pub fn open(
         features: kept as *const _ as *const c_void,
         families,
         no_codec,
+        graphics,
     });
     Ok(ids)
 }
@@ -497,19 +504,180 @@ pub fn device_uuid() -> Option<[u8; 16]> {
     Some(id.device_uuid)
 }
 
-// Host signals of a picture's semaphore, once the commands that used it
-// have run.
+// Submissions of the host's own on wgpu's queue, and what they read and
+// write kept alive until they have run.
+
+/// Command buffers of the host's own, submitted on wgpu's queue between
+/// wgpu's own submissions, for what wgpu's submit cannot do: wait on and
+/// signal another API's timeline semaphores on the device. Each submission
+/// also signals `timeline` with the next value, which says when it has run
+/// and its command buffer is free.
+struct Raw {
+    timeline: vk::Semaphore,
+    buffers: Mutex<Buffers>,
+}
+
+/// The command buffers of [`Raw`], used under its lock.
+struct Buffers {
+    pool: vk::CommandPool,
+    /// The value the last submission signals.
+    last: u64,
+    /// Command buffers submitted, with the value their submission signals.
+    in_flight: VecDeque<(u64, vk::CommandBuffer)>,
+    free: Vec<vk::CommandBuffer>,
+}
+
+static RAW: OnceLock<std::result::Result<Raw, String>> = OnceLock::new();
+
+fn raw(opened: &Opened) -> Result<&'static Raw> {
+    let made = RAW.get_or_init(|| {
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(opened.graphics);
+        // SAFETY: a valid create info for a family the device has a queue
+        // of.
+        let pool = unsafe { opened.device.create_command_pool(&pool_info, None) }
+            .map_err(|e| format!("a command pool: {e}"))?;
+        let mut kind = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
+        // SAFETY: a valid create info; timeline semaphores are on wherever
+        // libav has the device, the only way here.
+        let timeline = unsafe { opened.device.create_semaphore(&info, None) }
+            .map_err(|e| format!("a timeline semaphore: {e}"))?;
+        Ok(Raw {
+            timeline,
+            buffers: Mutex::new(Buffers {
+                pool,
+                last: 0,
+                in_flight: VecDeque::new(),
+                free: Vec::new(),
+            }),
+        })
+    });
+    made.as_ref().map_err(|e| anyhow!("{e}"))
+}
+
+/// Records commands with `record` into a command buffer of the host's own
+/// and submits it on wgpu's queue: after every submission wgpu has made and
+/// before every one it makes later, so wgpu's later reads and writes of
+/// what it touched are ordered after it, as they are after a submission of
+/// wgpu's. The submission waits on the device for each of `waits` and
+/// signals each of `signals`, timeline semaphores at a value, once it has
+/// run. Returns the value of the host's timeline it signals.
+fn submit_raw(
+    global: &Global,
+    device: &SharedDevice,
+    opened: &Opened,
+    waits: &[(vk::Semaphore, u64)],
+    signals: &[(vk::Semaphore, u64)],
+    record: impl FnOnce(vk::CommandBuffer),
+) -> Result<u64> {
+    let raw = raw(opened)?;
+    let timeline = raw.timeline;
+    let mut buffers = raw.buffers.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: a live timeline semaphore of the device.
+    let done = unsafe { opened.device.get_semaphore_counter_value(timeline) }
+        .context("reading the host's timeline")?;
+    while buffers
+        .in_flight
+        .front()
+        .is_some_and(|(value, _)| *value <= done)
+    {
+        let (_, buffer) = buffers.in_flight.pop_front().expect("checked above");
+        buffers.free.push(buffer);
+    }
+    let buffer = match buffers.free.pop() {
+        Some(buffer) => buffer,
+        None => {
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(buffers.pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            // SAFETY: the pool is ours, used under the lock held.
+            unsafe { opened.device.allocate_command_buffers(&info) }.context("a command buffer")?[0]
+        }
+    };
+    let value = buffers.last + 1;
+    let submitted = (|| -> Result<()> {
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: a command buffer of the pool, not in use: a free one has
+        // run, and beginning it resets it.
+        unsafe { opened.device.begin_command_buffer(buffer, &begin) }
+            .context("beginning a command buffer")?;
+        record(buffer);
+        // SAFETY: as above, recorded by `record`.
+        unsafe { opened.device.end_command_buffer(buffer) }.context("ending a command buffer")?;
+        let semaphore = |(semaphore, value): &(vk::Semaphore, u64)| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(*semaphore)
+                .value(*value)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        };
+        let wait_infos: Vec<_> = waits.iter().map(semaphore).collect();
+        let signal_infos: Vec<_> = signals
+            .iter()
+            .chain(std::iter::once(&(timeline, value)))
+            .map(semaphore)
+            .collect();
+        let command_buffers = [vk::CommandBufferSubmitInfo::default().command_buffer(buffer)];
+        let submit = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&wait_infos)
+            .command_buffer_infos(&command_buffers)
+            .signal_semaphore_infos(&signal_infos);
+        // wgpu-core makes each submission holding, for writing, the lock
+        // that `device_fence_as_hal` takes for reading, so holding it keeps
+        // wgpu's submissions off the queue while this one is made; the lock
+        // on `buffers` keeps ours apart.
+        // SAFETY: the handles are only used while the guards are held.
+        let _submissions = unsafe { global.device_fence_as_hal::<Vulkan>(device.device) }
+            .ok_or_else(|| anyhow!("the process's device is not a Vulkan one"))?;
+        let queue = unsafe { global.queue_as_hal::<Vulkan>(*device.queue) }
+            .ok_or_else(|| anyhow!("the process's queue is not a Vulkan one"))?;
+        // SAFETY: wgpu's queue, which nothing else submits to while the
+        // locks are held; every handle in the submission is alive.
+        unsafe {
+            opened
+                .device
+                .queue_submit2(queue.as_raw(), &[submit], vk::Fence::null())
+        }
+        .context("submitting on wgpu's queue")
+    })();
+    match submitted {
+        Ok(()) => {
+            buffers.last = value;
+            buffers.in_flight.push_back((value, buffer));
+            Ok(value)
+        }
+        Err(e) => {
+            buffers.free.push(buffer);
+            Err(e)
+        }
+    }
+}
+
+/// What a job waits for before it signals and lets go: a submission of
+/// wgpu's, or one of the host's own, by the value it signals the host's
+/// timeline with.
+enum Until {
+    Submission(wgpu_core::SubmissionIndex),
+    Raw(u64),
+}
 
 /// The semaphores to signal once a submission has run, and what to keep
-/// alive until then: the decoder's picture, or the frames copied from.
+/// alive until then: the decoder's picture and the textures copied into, or
+/// the frames copied from.
 struct Job {
-    submission: wgpu_core::SubmissionIndex,
+    until: Until,
     signals: Vec<(vk::Semaphore, u64)>,
     kept: Box<dyn std::any::Any + Send>,
 }
 
-/// The thread that signals pictures' semaphores from the host, in the order
-/// their submissions were made, each once its submission has run.
+/// The thread that signals pictures' semaphores from the host and lets go
+/// of what submissions used, in the order the submissions were made, each
+/// once its submission has run.
 struct Signaller {
     jobs: Mutex<mpsc::Sender<Job>>,
 }
@@ -553,13 +721,18 @@ fn signal_loop(receiver: mpsc::Receiver<Job>) {
         let (Some(device), Ok(opened)) = (shared_device(), opened()) else {
             return;
         };
-        let waited = match fence {
-            Some(semaphore) => host_wait(&opened.device, semaphore, job.submission),
-            None => shared()
+        let waited = match (&job.until, fence) {
+            (Until::Raw(value), _) => {
+                raw(opened).and_then(|raw| host_wait(&opened.device, raw.timeline, *value))
+            }
+            (Until::Submission(index), Some(semaphore)) => {
+                host_wait(&opened.device, semaphore, *index)
+            }
+            (Until::Submission(index), None) => shared()
                 .device_poll(
                     device.device,
                     wgpu_types::PollType::Wait {
-                        submission_index: Some(job.submission),
+                        submission_index: Some(*index),
                         timeout: None,
                     },
                 )
@@ -848,7 +1021,7 @@ impl Taker {
         let opened = opened()?;
         let slot = self.slot(global, device, picture.width, picture.height)?;
         let (y, uv) = (slot.y, slot.uv);
-        let (submission, signal) = copy_picture(global, device, opened, &mut picture, &y, &uv)?;
+        let copied = copy_picture(global, device, opened, &mut picture, &y, &uv)?;
         if crate::trace::on() {
             crate::trace::line(format_args!(
                 "taker: picture pts {} into slot {} (y {:?}, uv {:?})",
@@ -862,10 +1035,13 @@ impl Taker {
                 uv.texture
             ));
         }
+        // wgpu counts the targets used by its own submission before the
+        // copy, which may finish first: the pair is kept, and out of the
+        // pool, until the copy has run.
         signaller().send(Job {
-            submission,
-            signals: vec![signal],
-            kept: Box::new(picture),
+            until: Until::Raw(copied),
+            signals: Vec::new(),
+            kept: Box::new((picture, Arc::clone(&slot))),
         })?;
         Ok(Taken {
             planes: vec![y, uv],
@@ -875,8 +1051,10 @@ impl Taker {
     }
 }
 
-/// Copies the decoder's `picture` into `y` and `uv` on wgpu's queue, and
-/// says what of its semaphore to signal once the copy has run.
+/// Copies the decoder's `picture` into `y` and `uv`, by a submission of the
+/// host's own on wgpu's queue that waits for the decoder's write and moves
+/// the picture's semaphore on by one once it has run. Returns the value of
+/// the host's timeline the submission signals.
 fn copy_picture(
     global: &Global,
     device: &SharedDevice,
@@ -884,7 +1062,7 @@ fn copy_picture(
     picture: &mut DeviceFrame,
     y: &Plane,
     uv: &Plane,
-) -> Result<(wgpu_core::SubmissionIndex, (vk::Semaphore, u64))> {
+) -> Result<u64> {
     let (width, height) = (y.width, y.height);
     let mut lock = picture
         .vulkan()
@@ -912,36 +1090,27 @@ fn copy_picture(
     }
     let source = vk::Image::from_raw(image.image);
     let semaphore = vk::Semaphore::from_raw(image.semaphore);
-    // wgpu's submit waits on no semaphore: the decoder's write is waited
-    // for here.
-    host_wait(&opened.device, semaphore, image.value)?;
 
-    // The targets in the layout the copy writes, by wgpu.
-    let first = command_encoder(global, device)?;
-    global
-        .command_encoder_transition_resources(
-            first,
-            std::iter::empty(),
-            [y.texture, uv.texture]
-                .into_iter()
-                .map(|texture| wgpu_types::TextureTransition {
-                    texture,
-                    selector: None,
-                    state: wgpu_types::TextureUses::COPY_DST,
-                }),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
-    let first = finish(global, first)?;
-
+    // The targets in the layout the copy writes, by wgpu, so that wgpu's
+    // next use of them starts from that layout.
+    transition(
+        global,
+        device,
+        &[y.texture, uv.texture],
+        wgpu_types::TextureUses::COPY_DST,
+    )?;
     let (y_image, uv_image) = (
         raw_image(global, y.texture)?,
         raw_image(global, uv.texture)?,
     );
-    let second = command_encoder(global, device)?;
-    let recorded = unsafe {
-        global.command_encoder_as_hal_mut::<Vulkan, _, _>(second, |encoder| -> Result<()> {
-            let encoder = encoder.ok_or_else(|| anyhow!("the command encoder is not open"))?;
-            let commands = encoder.raw_handle();
+    let next = image.value + 1;
+    let copied = submit_raw(
+        global,
+        device,
+        opened,
+        &[(semaphore, image.value)],
+        &[(semaphore, next)],
+        |commands| {
             let barrier = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
                 .src_access_mask(vk::AccessFlags2::from_raw(image.access))
@@ -952,74 +1121,132 @@ fn copy_picture(
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(source)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })];
-            opened.device.cmd_pipeline_barrier2(
-                commands,
-                &vk::DependencyInfo::default().image_memory_barriers(&barrier),
-            );
-            let region = |aspect: vk::ImageAspectFlags, w: u32, h: u32| vk::ImageCopy {
-                src_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: aspect,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                src_offset: vk::Offset3D::default(),
-                dst_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                dst_offset: vk::Offset3D::default(),
-                extent: vk::Extent3D {
-                    width: w,
-                    height: h,
-                    depth: 1,
-                },
-            };
-            opened.device.cmd_copy_image(
-                commands,
-                source,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                y_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region(vk::ImageAspectFlags::PLANE_0, width, height)],
-            );
-            opened.device.cmd_copy_image(
-                commands,
-                source,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                uv_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region(vk::ImageAspectFlags::PLANE_1, uv.width, uv.height)],
-            );
-            Ok(())
-        })
-    };
-    if let Err(e) = recorded {
-        global.command_encoder_drop(second);
-        global.command_buffer_drop(first);
-        return Err(e);
-    }
-    let second = finish(global, second)?;
-    let submission = global
-        .queue_submit(*device.queue, &[first, second])
-        .map_err(|(_, e)| anyhow!("submitting the copy: {e}"))?;
-    let next = image.value + 1;
+                .subresource_range(COLOR_RANGE)];
+            // After an earlier copy into the same targets that nothing of
+            // wgpu's came between.
+            let after_copies = [copies_after_copies()];
+            // SAFETY: commands of the device into a command buffer being
+            // recorded; the picture is alive and locked, the targets alive
+            // and in the layout wgpu moved them to.
+            unsafe {
+                opened.device.cmd_pipeline_barrier2(
+                    commands,
+                    &vk::DependencyInfo::default()
+                        .memory_barriers(&after_copies)
+                        .image_memory_barriers(&barrier),
+                );
+                opened.device.cmd_copy_image(
+                    commands,
+                    source,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    y_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region(
+                        vk::ImageAspectFlags::PLANE_0,
+                        vk::ImageAspectFlags::COLOR,
+                        width,
+                        height,
+                    )],
+                );
+                opened.device.cmd_copy_image(
+                    commands,
+                    source,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    uv_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region(
+                        vk::ImageAspectFlags::PLANE_1,
+                        vk::ImageAspectFlags::COLOR,
+                        uv.width,
+                        uv.height,
+                    )],
+                );
+            }
+        },
+    )?;
     lock.used(
         0,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL.as_raw() as u32,
         vk::AccessFlags2::TRANSFER_READ.as_raw(),
         next,
     );
-    Ok((submission, (semaphore, next)))
+    Ok(copied)
+}
+
+/// The colour aspect of a single-level, single-layer image.
+const COLOR_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
+    aspect_mask: vk::ImageAspectFlags::COLOR,
+    base_mip_level: 0,
+    level_count: 1,
+    base_array_layer: 0,
+    layer_count: 1,
+};
+
+/// A dependency of copies on the copies before them on the queue: wgpu
+/// moves a texture already in the layout a copy writes nowhere, and orders
+/// nothing between two writes of it it did not make.
+fn copies_after_copies() -> vk::MemoryBarrier2<'static> {
+    vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+}
+
+/// A copy of `width` x `height` texels from the `from` aspect of one image
+/// to the `to` aspect of another, both single-level.
+fn region(
+    from: vk::ImageAspectFlags,
+    to: vk::ImageAspectFlags,
+    width: u32,
+    height: u32,
+) -> vk::ImageCopy {
+    let layers = |aspect_mask| vk::ImageSubresourceLayers {
+        aspect_mask,
+        mip_level: 0,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    vk::ImageCopy {
+        src_subresource: layers(from),
+        src_offset: vk::Offset3D::default(),
+        dst_subresource: layers(to),
+        dst_offset: vk::Offset3D::default(),
+        extent: vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        },
+    }
+}
+
+/// Moves `textures` into the layout of `state` by a submission of wgpu's,
+/// for a submission of the host's own that uses them in it next.
+fn transition(
+    global: &Global,
+    device: &SharedDevice,
+    textures: &[TextureId],
+    state: wgpu_types::TextureUses,
+) -> Result<()> {
+    let encoder = command_encoder(global, device)?;
+    global
+        .command_encoder_transition_resources(
+            encoder,
+            std::iter::empty(),
+            textures
+                .iter()
+                .map(|&texture| wgpu_types::TextureTransition {
+                    texture,
+                    selector: None,
+                    state,
+                }),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    let commands = finish(global, encoder)?;
+    global
+        .queue_submit(*device.queue, &[commands])
+        .map_err(|(_, e)| anyhow!("submitting a transition: {e}"))?;
+    Ok(())
 }
 
 /// Writes frames on the process's device into the Vulkan pictures an
@@ -1137,7 +1364,7 @@ impl EncoderFeed {
         }
         drop(lock);
         signaller().send(Job {
-            submission,
+            until: Until::Submission(submission),
             signals,
             kept: Box::new(vec![Arc::clone(frame), nv12]),
         })
