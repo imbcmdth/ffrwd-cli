@@ -1271,6 +1271,8 @@ enum Delivery {
 /// What several ticks of one lane hand on, less each progress mark that a
 /// later one on the same stream says again with nothing between them on
 /// that stream: a turn of many small ticks moves its readers' progress once.
+/// A mark is kept when it is the last on its stream before the stream's
+/// next item, end or rows, or the last on its stream at all.
 fn superseded_progress_dropped(deliveries: Vec<(u32, Delivery)>) -> Vec<(u32, Delivery)> {
     let mut marked: HashSet<u32> = HashSet::new();
     let mut kept: Vec<(u32, Delivery)> = deliveries
@@ -1711,7 +1713,10 @@ fn worker(shared: &Shared) {
                     PROFILE.process.add(0, started);
                     // A tick the node says it finished on, or failed on, is
                     // the last of the turn: what was taken after it is not
-                    // run, as a lane that stops drops its queue.
+                    // run, as a lane that stops drops its queue. Its flush
+                    // skips their ordinals, drops what is queued (a last
+                    // tick behind them too) and queues the last call for
+                    // the instance that finished; a failure stops the run.
                     let stop = result.as_ref().map_or(true, |emitted| emitted.finished);
                     let result = result.map(|emitted| Done {
                         emitted,
@@ -2241,6 +2246,188 @@ mod tests {
             queues.iter().all(|q| *q <= 4),
             "no call saw more than the cap"
         );
+    }
+
+    /// A node that waits on `gate` in its first call and finishes, or
+    /// fails, on its third; it notes each call's pts and whether it was
+    /// the last.
+    struct Stopping {
+        shape: NodeShape,
+        calls: Arc<Mutex<Vec<(i64, bool)>>>,
+        gate: Arc<Gate>,
+        fail: bool,
+    }
+
+    impl Node for Stopping {
+        fn name(&self) -> &str {
+            "stopping"
+        }
+
+        fn shape(&self) -> &NodeShape {
+            &self.shape
+        }
+
+        fn set_params(&mut self, _params: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn process(&mut self, tick: Tick) -> Result<Emitted> {
+            let count = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push((tick.pts, tick.last));
+                calls.len()
+            };
+            if count == 1 {
+                self.gate.wait();
+            }
+            if count == 3 && !tick.last {
+                if self.fail {
+                    bail!("the third call fails");
+                }
+                return Ok(Emitted {
+                    finished: true,
+                    ..Emitted::default()
+                });
+            }
+            Ok(Emitted::default())
+        }
+    }
+
+    /// What a run of [`a_turn_cut_short`] came to: the node's calls, the
+    /// run's end, and the lane's next ordinal, its front task's and whether
+    /// that is the last, while the first call waited.
+    struct CutShort {
+        calls: Vec<(i64, bool)>,
+        result: Result<()>,
+        queued: Vec<Option<u64>>,
+    }
+
+    /// One lane of a node clocked by its sound a sample a tick, its first
+    /// turn holding six ticks and the last tick queued behind them, the node
+    /// finishing (or failing) on the third: the run ends, and nothing waits.
+    fn a_turn_cut_short(fail: bool) -> CutShort {
+        let shape = NodeShape {
+            inputs: vec![input_port("a", PortKind::Audio, Pairing::Lockstep)],
+            outputs: Vec::new(),
+            clock: Clock::Input("a".to_string()),
+            pure: false,
+            one_to_one: false,
+            bounded: true,
+            relation: Vec::new(),
+        };
+        let bound = BoundStream {
+            port: "a".to_string(),
+            id: 0,
+            info: StreamInfo::default(),
+            time_base: TimeBase {
+                num: 1,
+                den: 48_000,
+            },
+            format: StreamFormat::Audio(AudioFormat {
+                sample_rate: 48_000,
+                channels: 1,
+                sample_fmt: "f32",
+                channel_layout: None,
+            }),
+            rendition: Default::default(),
+            row: None,
+            decode_delay: 0,
+            latency: None,
+            hint: Default::default(),
+        };
+        let assembler = Assembler::new(&shape, &[bound], "stopping", &[]).expect("an assembler");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(Gate::default());
+        let node = Stopping {
+            shape: shape.clone(),
+            calls: Arc::clone(&calls),
+            gate: Arc::clone(&gate),
+            fail,
+        };
+        let plan = Plan {
+            lanes: vec![LaneSpec {
+                gpu: HashMap::new(),
+                name: "stopping".to_string(),
+                shape,
+                intake: Intake::Assembled(Box::new(assembler)),
+                bound: vec![0],
+                state: Vec::new(),
+                tick_base: TimeBase {
+                    num: 1,
+                    den: 48_000,
+                },
+                runners: vec![Box::new(node)],
+                opener: None,
+                ports: Vec::new(),
+                rows: None,
+                unbuffered: false,
+            }],
+            consumers: HashMap::from([(0, vec![Consumer::Lane(0)])]),
+            writers: Vec::new(),
+            mirrors: HashMap::new(),
+        };
+        let scheduler = Scheduler::start(plan, 1, &WakeSlot::new()).expect("the lanes");
+        let packet = TickFrame {
+            pts: 0,
+            duration: Some(6),
+            data: Arc::new(vec![0u8; 6 * 4]).into(),
+            rows: Vec::new(),
+        };
+        assert!(scheduler.arrive(0, Item::Frame(packet)));
+        wait_until("the first tick ran", || !calls.lock().unwrap().is_empty());
+        assert!(scheduler.end(0));
+        let queued = {
+            let state = scheduler.shared.lock();
+            let lane = &state.lanes[0];
+            vec![
+                Some(lane.next_ordinal),
+                lane.queue.front().map(|t| t.ordinal),
+                Some(u64::from(lane.queue.front().is_some_and(|t| t.tick.last))),
+            ]
+        };
+        gate.open();
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || done.send(scheduler.finish()));
+        let result = finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the run ended, nothing waiting");
+        let calls = calls.lock().unwrap().clone();
+        CutShort {
+            calls,
+            result,
+            queued,
+        }
+    }
+
+    #[test]
+    fn a_node_that_finishes_in_a_turn_skips_the_rest_of_it_and_takes_its_last_call() {
+        let CutShort {
+            calls,
+            result,
+            queued,
+        } = a_turn_cut_short(false);
+        assert_eq!(
+            queued,
+            [Some(7), Some(6), Some(1)],
+            "six ticks in the turn, the last queued behind them"
+        );
+        result.expect("the run");
+        assert_eq!(
+            calls,
+            [(0, false), (1, false), (2, false), (3, true)],
+            "the ticks after the one it finished on are skipped, and the last call follows"
+        );
+    }
+
+    #[test]
+    fn a_node_that_fails_in_a_turn_stops_the_run() {
+        let CutShort { calls, result, .. } = a_turn_cut_short(true);
+        let error = result.expect_err("the run failed");
+        assert!(
+            format!("{error:#}").contains("the third call fails"),
+            "{error:#}"
+        );
+        assert_eq!(calls, [(0, false), (1, false), (2, false)]);
     }
 
     /// A self-clocked reader (a decoder) slower than what reaches it holds
