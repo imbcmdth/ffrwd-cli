@@ -2924,8 +2924,13 @@ probe. The real findings from that work:
 
 ### What is left
 
-- Done (2026-10-19, branch `fix/lane-queue-cap`): the 1023-task queue and
-  0.32.0 falling short of real time. The lane was `listen_audio` in
+- The 1023-task queue and 0.32.0 falling short of real time (2026-10-19).
+  The pace fix shipped in 0.32.1. The rest is on branch
+  `fix/lane-queue-cap`, unmerged until the lane change is wanted for
+  something: the 1023 queue did not keep 0.31.0 from real time, and the
+  hangs seen while testing the branch were the scheduler's waker being set
+  after its workers started, on main too (`fix/waker-before-workers`).
+  The lane was `listen_audio` in
   compose's sidecar. Its clock is the programme's sound, an `asplit` copy
   that rides one input with compose's own `a`, and the module declares
   a window of one sample, so each 1024-sample packet settled 1024 ticks.
