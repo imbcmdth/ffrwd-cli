@@ -174,6 +174,15 @@ from.
   the same streams: a reader that also needs frames another module
   writes cannot join the others, and a `UNSUPPORTED_SQL` names what reads
   the column and says to call the module once per reader.
+- **A held input's first ticks can be cut before its feed arrives.** A
+  hold on a bound stream with no frame yet counts as ready once the
+  clock's input is `timeout` past the tick (a second by default), and
+  nothing keeps the clock's reader from running that far ahead of the
+  feed's reader while the lane waits on the hold. So a feed that is
+  present from the start can come up a few ticks late: measured on
+  2026-10-19 on main, the first feed row's `at` was 3 in 253 of 300 runs
+  of one such chain and 4 to 12 in the rest. Seen as a rare failure of
+  `a_pad_tags_a_held_stream_and_a_tagged_anchor_reads_it`.
 - **A module reading several streams needs them in lockstep.** They
   have to reach it from one point through modules that declare one
   frame out per frame in; a `split` counts, and an ffmpeg filter does
