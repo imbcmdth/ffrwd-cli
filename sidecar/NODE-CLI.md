@@ -377,7 +377,8 @@ tick that held them.
   bound to sound is cut 1024 ticks by a packet of 1024 samples, 48000 a
   second. Those past the bound stay with the clock and are cut as the
   queue drains, and while any are left the node counts as full to its
-  readers. A self-clocked node is handed one arrival an input a call, and
+  readers, except to the reader of that audio clock, which waits only
+  once the bound's worth of packets waits on the clock. A self-clocked node is handed one arrival an input a call, and
   the arrivals waiting on its input count against the same bound, so a
   decoder ahead of a slower encoder holds its reader back rather than
   queue every picture it made. A node that runs one tick at a time takes

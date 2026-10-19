@@ -571,6 +571,9 @@ pub struct Assembler {
     /// how many, and their bytes, which a timing clock carries none of.
     audio_buffer: Vec<u8>,
     audio_buffered: usize,
+    /// How many samples the packet merged last brought, for how many
+    /// packets the samples not yet consumed are.
+    audio_packet: usize,
     audio_pts: Option<i64>,
     /// Whether the last tick has been made.
     done: bool,
@@ -893,6 +896,7 @@ impl Assembler {
             packets_time: None,
             audio_buffer: Vec::new(),
             audio_buffered: 0,
+            audio_packet: 0,
             audio_pts: None,
             done: false,
             made_end: None,
@@ -1005,6 +1009,21 @@ impl Assembler {
     /// handed over; None where no input is bound to it.
     pub fn queued(&self, id: u32) -> Option<usize> {
         Some(self.inputs.iter().find(|i| i.id == id)?.queue.len())
+    }
+
+    /// How many packets wait on an audio clock bound to stream `id`, those
+    /// not yet looked at and those whose samples no tick has taken yet;
+    /// None where `id` is not an audio clock.
+    pub fn audio_backlog(&self, id: u32) -> Option<usize> {
+        let ClockState::Input(clock) = self.clock else {
+            return None;
+        };
+        let input = &self.inputs[clock];
+        if input.id != id || input.kind != PortKind::Audio {
+            return None;
+        }
+        let buffered = self.audio_buffered.div_ceil(self.audio_packet.max(1));
+        Some(input.queue.len() + buffered)
     }
 
     /// How many more frames the hold input bound to stream `id` takes before
@@ -1354,7 +1373,9 @@ impl Assembler {
                     if self.audio_buffered == 0 {
                         self.audio_pts = Some(frame.pts);
                     }
-                    self.audio_buffered += sample_count(frame, audio.sample_len());
+                    let samples = sample_count(frame, audio.sample_len());
+                    self.audio_buffered += samples;
+                    self.audio_packet = samples;
                     self.audio_buffer.extend_from_slice(frame.data.host());
                     input.queue.pop_front();
                 }

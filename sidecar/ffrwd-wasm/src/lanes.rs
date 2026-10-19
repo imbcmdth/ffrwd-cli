@@ -405,7 +405,12 @@ impl State {
     /// queued on its input, which count against the same bound as a task
     /// queue: without that, a decoder ahead of a slower encoder would queue
     /// every picture it made. An input clock is cut no further than the
-    /// cap, and while its cut stopped there the lane counts as full.
+    /// cap, and while its cut stopped there the lane counts as full, but
+    /// to the reader of its audio clock: one packet of sound settles as
+    /// many ticks as it has samples over the stride, so while ticks are
+    /// held back what waits there is counted in packets, against the same
+    /// bound, and that reader is held back only once the lane is that many
+    /// packets behind.
     fn room(&self, stream: u32, consumers: &[Consumer]) -> bool {
         consumers.iter().all(|c| match c {
             Consumer::Lane(j) => {
@@ -416,8 +421,21 @@ impl State {
                     }
                     _ => 0,
                 };
+                let sound = match &lane.intake {
+                    LaneIntake::Assembled(a) if lane.clock == ClockKind::Input => {
+                        a.audio_backlog(stream)
+                    }
+                    _ => None,
+                };
                 lane.stopped
-                    || (lane.queue.len() < self.cap && lane.withheld.is_none() && queued < self.cap)
+                    || match sound {
+                        Some(packets) if lane.withheld.is_some() => packets < self.cap,
+                        _ => {
+                            lane.queue.len() < self.cap
+                                && lane.withheld.is_none()
+                                && queued < self.cap
+                        }
+                    }
             }
             Consumer::Writer(w, _) => self.writers[*w].len() < self.cap,
         })
@@ -2166,7 +2184,8 @@ mod tests {
         };
         assert!(scheduler.arrive(0, packet(0)));
         wait_until("the first tick ran", || !seen.lock().unwrap().is_empty());
-        // The first packet's ticks went in one turn; the second's wait.
+        // The first packet's ticks went in one turn; the second's wait, and
+        // the reader goes on until the cap's worth of packets waits.
         assert!(scheduler.arrive(0, packet(1024)));
         {
             let state = scheduler.shared.lock();
@@ -2181,13 +2200,27 @@ mod tests {
                 "the rest of the packet's ticks wait"
             );
             assert!(
+                state.room(0, &state.consumers(0)),
+                "one packet behind, the reader goes on"
+            );
+        }
+        for k in 2..5 {
+            assert!(scheduler.arrive(0, packet(k * 1024)));
+        }
+        {
+            let state = scheduler.shared.lock();
+            assert!(
+                state.lanes[0].queue.len() <= state.cap,
+                "the queue holds no more than the cap"
+            );
+            assert!(
                 !state.room(0, &state.consumers(0)),
-                "the reader waits while ticks are withheld"
+                "the reader waits once the cap's worth of packets waits"
             );
         }
         gate.open();
         wait_until("every sample's tick ran", || {
-            seen.lock().unwrap().len() == 2048
+            seen.lock().unwrap().len() == 5 * 1024
         });
         assert!(scheduler.end(0));
         let (done, finished) = mpsc::channel();
@@ -2197,7 +2230,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the lane ended with its input")
             .expect("the run");
-        assert_eq!(*seen.lock().unwrap(), (0..2048).collect::<Vec<i64>>());
+        assert_eq!(*seen.lock().unwrap(), (0..5 * 1024).collect::<Vec<i64>>());
         let queues = shared_queues.lock().unwrap();
         assert!(
             queues[1..1024].iter().all(|q| *q == 4),
@@ -2205,9 +2238,8 @@ mod tests {
             &queues[..12]
         );
         assert!(
-            queues[1024..2048].iter().all(|q| *q == 0),
-            "the second packet's ticks ran in one turn: {:?}",
-            &queues[1024..1036]
+            queues.iter().all(|q| *q <= 4),
+            "no call saw more than the cap"
         );
     }
 
