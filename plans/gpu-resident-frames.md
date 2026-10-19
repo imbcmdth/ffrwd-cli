@@ -2957,6 +2957,20 @@ probe. The real findings from that work:
 - Only h264 was run. HEVC and AV1 decode on the device are untried (this
   card decodes no AV1), and 10-bit pictures are not held on the GPU, since
   the wire has no 10-bit format.
+- A raw edge out of a GPU module to a software encoder. foundmeat's CPU
+  fallback (`video_codec 'libx264'`, 2026-10-19, ffrwd 0.32.0, the box's
+  six-core i7) stays below real time at 1080p60 at every x264 preset:
+  0.60x at medium, 0.45x at veryfast with zerolatency, 0.71x at
+  ultrafast, with the cli's output ffmpeg at 276% of a core and the
+  sidecar at 247% while x264 at ultrafast needs well under a core. The
+  cost is the route: compose's frame is read back from the device as
+  rgba, 8.3 MB a frame, 500 MB/s over the pipe as NUT, and the output
+  ffmpeg converts it to yuv420p itself (`-pix_fmt yuv420p`) before x264.
+  The fix is to make the raw edge yuv420p (or nv12) on the device, as
+  the device encoders' feed already makes nv12 there, and read back
+  3 MB a frame, so the output ffmpeg converts nothing; the compiler
+  chooses the raw edge's format (`_encoded_colour`, the raw pipe's
+  pix_fmt) and today asks a GPU module's output for rgba.
 - Memory: the scheduler's bound of 10 arrivals a reader is up to 80 MiB of
   1080p rgba between two nodes, and could count bytes for frames on the
   GPU; NVENC keeps 15 CUDA pictures; a decoder on a Vulkan device of
