@@ -317,6 +317,10 @@ struct Conn {
     /// Per stream of the NUT, the member it feeds.
     lanes: Vec<Option<Lane>>,
     opened: bool,
+    /// Whether it has waited for room in its input since the host last
+    /// caught up with it: its feeder may have finished and closed with what
+    /// it sent still in the socket, which the host only learns by reading on.
+    held_back: bool,
 }
 
 impl Conn {
@@ -338,6 +342,7 @@ impl Conn {
             bytes: 0,
             lanes: Vec::new(),
             opened: false,
+            held_back: false,
         })
     }
 }
@@ -743,6 +748,9 @@ pub fn serve(
     report(format!("{ROW_PREFIX}{row}"));
     let mut serial = 0u64;
     let mut current: Option<Conn> = None;
+    // A feeder that connected while the one before was held back by a full
+    // input: read once that one ends, from its first byte.
+    let mut waiting: Option<TcpStream> = None;
     let mut chunk = vec![0u8; READ_CHUNK];
     loop {
         if scheduler.stopped() {
@@ -766,21 +774,43 @@ pub fn serve(
                 Turn::Open => {}
             }
         }
+        if current.is_none() {
+            if let Some(socket) = waiting.take() {
+                serial += 1;
+                report(format!(
+                    "feed: {}: the feeder that waited on 127.0.0.1:{} is read now",
+                    spec.names(),
+                    spec.port
+                ));
+                current = Some(Conn::new(serial, socket, spec.members.len())?);
+            }
+        }
         match listener.accept() {
             Ok((socket, _)) => {
                 let silent = current.as_ref().is_some_and(|c| c.bytes == 0);
+                let held_back = current.as_ref().is_some_and(|c| c.held_back);
                 if current.is_none() || silent {
                     serial += 1;
-                    let granted = socket2::SockRef::from(&socket)
-                        .set_recv_buffer_size(RECEIVE_BUFFER)
-                        .and_then(|_| socket2::SockRef::from(&socket).recv_buffer_size())
-                        .unwrap_or(0);
+                    let granted = buffered(&socket);
                     report(format!(
                         "feed: {}: a feeder connected on 127.0.0.1:{} (receive buffer {granted} bytes)",
                         spec.names(),
                         spec.port
                     ));
                     current = Some(Conn::new(serial, socket, spec.members.len())?);
+                } else if held_back && waiting.is_none() {
+                    // The one being read may have finished already, its end
+                    // unread behind a full input: this one is read after it,
+                    // its bytes waiting in its own socket meanwhile.
+                    let granted = buffered(&socket);
+                    report(format!(
+                        "feed: {}: a feeder connected on 127.0.0.1:{} while the one before \
+                         waits for room (receive buffer {granted} bytes); it is read once that \
+                         one ends",
+                        spec.names(),
+                        spec.port
+                    ));
+                    waiting = Some(socket);
                 } else {
                     drop(socket);
                     report(format!(
@@ -797,6 +827,15 @@ pub fn serve(
             thread::sleep(POLL);
         }
     }
+}
+
+/// Asks for the large receive buffer a feeder's connection is given, and
+/// says what was granted.
+fn buffered(socket: &TcpStream) -> usize {
+    socket2::SockRef::from(socket)
+        .set_recv_buffer_size(RECEIVE_BUFFER)
+        .and_then(|_| socket2::SockRef::from(socket).recv_buffer_size())
+        .unwrap_or(0)
 }
 
 /// What one turn of reading a connection came to.
@@ -819,7 +858,10 @@ fn read_on(
     if conn.opened {
         match scheduler.wait_room(spec.members[0].id, POLL) {
             Room::Stopped => return Turn::Stopped,
-            Room::Full => return Turn::Open,
+            Room::Full => {
+                conn.held_back = true;
+                return Turn::Open;
+            }
             Room::Open => {}
         }
     }
@@ -841,7 +883,11 @@ fn read_on(
                 Err(e) => Turn::Closed(format!("the feeder's stream was refused: {e:#}")),
             }
         }
-        Err(e) if is_timeout(&e) => Turn::Open,
+        Err(e) if is_timeout(&e) => {
+            // Caught up with the feeder: nothing of it waits unread.
+            conn.held_back = false;
+            Turn::Open
+        }
         Err(e) => Turn::Closed(format!("the connection broke: {e}")),
     }
 }

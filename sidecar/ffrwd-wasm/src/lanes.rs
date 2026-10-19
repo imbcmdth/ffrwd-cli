@@ -968,6 +968,19 @@ impl State {
                 };
                 let stream = port.out.stream;
                 if crate::trace::on() {
+                    // A data output's messages: what a node hands a listener
+                    // on another lane or process, rows by another name.
+                    if let Payload::Message(m) = &item.payload {
+                        if !m.data.is_empty() {
+                            let text = String::from_utf8_lossy(&m.data);
+                            crate::trace::line(format_args!(
+                                "emit: {} stream {stream} message at {}: {}",
+                                lane.name,
+                                m.pts,
+                                text.chars().take(160).collect::<String>()
+                            ));
+                        }
+                    }
                     if let Payload::Frame(f) = &item.payload {
                         // A run of samples: 48 kHz or the like, a duration.
                         let base = port.out.base;

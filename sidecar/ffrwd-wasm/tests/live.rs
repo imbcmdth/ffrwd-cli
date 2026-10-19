@@ -1421,6 +1421,45 @@ fn a_second_feeder_is_refused_and_a_silent_one_is_replaced() {
 }
 
 #[test]
+fn a_feeder_that_rejoins_while_the_one_before_waits_for_room_is_read_after_it() {
+    // The first feeder sends 12 s of itself at once and closes: the hold
+    // takes what it has room for and the rest waits in the socket, unread,
+    // so the host cannot yet see that the feeder has gone. The second
+    // connects then, as a feeder rejoining after a drop does, and is read
+    // once the first's last bytes have been: its feed comes up after the
+    // first's ends, from its own start, and nothing is refused.
+    let _serial = serial();
+    let program = Program::new(30, 20.0);
+    let (mut run, port) = start("rejoin", &program, "1", &["shape_switch"], SWITCH);
+    wait_for_port(&mut run, port);
+    let mut first = Feeder::new(25, 12.0);
+    first.paced = false;
+    let one = feed(port, first, Duration::from_secs(1));
+    let two = feed(port, Feeder::new(25, 2.0), Duration::from_secs(2));
+    let out = finish(run);
+    one.join().expect("one");
+    two.join().expect("two");
+    assert!(
+        out.stderr.contains("while the one before waits for room"),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("was refused"), "{}", out.stderr);
+    let mut feeds: Vec<(i64, i64)> = out
+        .feeds
+        .iter()
+        .filter(|r| r["event"] != "end" && r["event"] != "clock")
+        .filter_map(|r| Some((r["at"].as_i64()?, r["first_pts"].as_i64()?)))
+        .collect();
+    feeds.dedup();
+    assert_eq!(feeds.len(), 2, "two feeds: {feeds:?}\n{}", out.stderr);
+    assert_eq!(feeds[1].1, 0, "the second from its own start");
+    let insertions = out.insertions();
+    assert_eq!(insertions.len(), 2, "{insertions:?}\n{}", out.stderr);
+    assert!(insertions[1].0 > insertions[0].1, "{insertions:?}");
+}
+
+#[test]
 fn a_feeder_that_sends_one_frame_and_stalls_is_never_switched_in() {
     let _serial = serial();
     let program = Program::new(30, 5.0);

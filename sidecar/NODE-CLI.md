@@ -298,7 +298,11 @@ One connection at a time: a second while one is on is accepted and closed
 at once, and a connection that has sent nothing is dropped for one that
 knocks. Every connection asks for a 16 MiB receive buffer, and is read
 only while the input has room, so a source that outruns the clock waits on
-its socket. Each connection is a feed (`tick.feed`), with the source's own
+its socket. While the one being read has unread bytes behind a full input
+(its feeder may have finished, its end still in the socket), one more that
+connects waits rather than being refused: it is read from its first byte
+once the one before ends, as a feeder rejoining after a drop behind a slow
+output is. Each connection is a feed (`tick.feed`), with the source's own
 tags and time base from its start on; a source whose pts jump backwards or
 more than a second forwards is a new feed on the same connection. A
 connection may carry any of a group's members, and streams beyond them are

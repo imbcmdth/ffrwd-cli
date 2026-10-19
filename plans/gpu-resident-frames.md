@@ -2892,8 +2892,50 @@ MiB, opens no wgpu device: libav's own Vulkan device (13 MiB alone) and its
 decoder at `threads=auto` (about 66 for the session and bitstream, 48 for 16
 pictures); the same decode on one thread under ffmpeg is 94 MiB in all.
 
+### Lip sync and live feeds on foundmeat's box (2026-10-19)
+
+The lip-sync skew reported from foundmeat's box was a fault in how it was
+measured. Their analyzer decoded video and audio in two ffmpeg passes
+without `-copyts`, and each pass counted from its own stream's start.
+Measured again with `-copyts`, every build was within 5 ms of its sound:
+stock 0.31.0, and every branch build from 131410c on, with the device or
+software decode, the device or host encode, and the default or short
+probe. The real findings from that work:
+
+- **The held sound going silent during warm-up.** A 1080p programme starts
+  about half a second behind real time, and a port feed fixed then was
+  early by the backlog. Fixed in 3dad921.
+- **The probe backlog.** The lateral's ffmpeg reads about 5 s of a live
+  MPEG-TS input before it sends anything, then sends it at once. A query
+  can shorten that with `analyzeduration` and `probesize` on its
+  `input()`. A default of half a second was tried and reverted (f9116cf):
+  with a 2 s GOP, a lateral that joins mid-stream then sees no SPS and its
+  NUT header is refused.
+- **The CPU split.** On their composite, compose and its workers take
+  about 1.3 cores and the feed reader 0.5. A comparable composite here
+  takes 0.75 to 0.97 cores.
+- **0.31.0 and a software output encoder.** 0.31.0 loses every held feed
+  behind an output encoder in ffmpeg (libx264): the sidecar is not told
+  where libav is and refuses the feed's decode. Fixed in cd86c19; worth a
+  line in the release notes.
+- **A rejoin behind a slow output.** A feeder rejoining while the one
+  before still had bytes queued behind a full input was refused as a
+  second feeder. It now waits and is read once the first ends.
+
 ### What is left
 
+- A lane's task queue can grow past the scheduler's cap. On foundmeat's
+  libx264 run, a node of the foundmeat package in compose's sidecar reached
+  1023 tasks against a cap of 10, while the reader of the stream it reads
+  waited for room. How it got past the cap is not known yet. The cap
+  (`lane.queue.len() < cap`) is checked only where a producer waits for
+  room, before a reader delivers and before a lane starts a task, so tasks
+  queued any other way would not be counted. The check predates the
+  branch's change to the bound, since a6a649c counts only the arrivals
+  queued at a self-clocked reader. While such a queue stays above the cap,
+  every reader of the streams that lane reads is held back with it. Next:
+  find which path queued the tasks, with the `room:` trace and the lane's
+  intake, and bound it.
 - The host waits for the decoder's write before each copy is submitted,
   and the decode thread waits with it. A wait on the queue would need a
   submit with wait semaphores, which wgpu-core does not have; a raw submit
@@ -2917,8 +2959,7 @@ pictures); the same decode on one thread under ffmpeg is 94 MiB in all.
   the wire has no 10-bit format.
 - Memory: the scheduler's bound of 10 arrivals a reader is up to 80 MiB of
   1080p rgba between two nodes, and could count bytes for frames on the
-  GPU; NVENC keeps 15 CUDA pictures; the copy's targets are allocated a
-  picture at a time rather than recycled; a decoder on a Vulkan device of
+  GPU; NVENC keeps 15 CUDA pictures; a decoder on a Vulkan device of
   its own (`hw=auto` into host memory) still decodes on `threads=auto`,
   33 MiB more than one thread under ffmpeg.
 - The L4 itself, and the acceptance lines that name it.
