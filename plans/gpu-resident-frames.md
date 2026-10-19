@@ -2924,18 +2924,28 @@ probe. The real findings from that work:
 
 ### What is left
 
-- A lane's task queue can grow past the scheduler's cap. On foundmeat's
-  libx264 run, a node of the foundmeat package in compose's sidecar reached
-  1023 tasks against a cap of 10, while the reader of the stream it reads
-  waited for room. How it got past the cap is not known yet. The cap
-  (`lane.queue.len() < cap`) is checked only where a producer waits for
-  room, before a reader delivers and before a lane starts a task, so tasks
-  queued any other way would not be counted. The check predates the
-  branch's change to the bound, since a6a649c counts only the arrivals
-  queued at a self-clocked reader. While such a queue stays above the cap,
-  every reader of the streams that lane reads is held back with it. Next:
-  find which path queued the tasks, with the `room:` trace and the lane's
-  intake, and bound it.
+- Done (2026-10-19, branch `fix/lane-queue-cap`): the 1023-task queue and
+  0.32.0 falling short of real time. The lane was `listen_audio` in
+  compose's sidecar. Its clock is the programme's sound, an `asplit` copy
+  that rides one input with compose's own `a`, and the module declares
+  a window of one sample, so each 1024-sample packet settled 1024 ticks.
+  An input clock's cut queued every settled tick at once (the cap was
+  checked only where a reader delivers), and every tick cost a turn of the
+  scheduler. On top of that, 3dad921's pace check walked the whole quarter
+  second of ticks (12000 of them) on every tick whenever the clock ran at
+  real time. The lane fell behind and held back the reader that carries
+  compose's sound, so the programme ran at 50 fps: 8.3 media seconds per
+  10 s of wall on 0.32.0 with the main feed alone, against 10.15 on
+  0.31.0. Bisected in a container on the box. a6a649c and 912bf25
+  reverted: 8.34. bcce48e: 10.15. 8f6b9d9: 8.34. 0.32.0 with the pace
+  check off: 10.15. Fixed: the pace keeps running extremes and is asked
+  only where a port-fed hold uses it; the cut stops at the cap and holds
+  the next tick back; a one-at-a-time lane takes up to 1024 settled ticks
+  in a turn; a turn's progress marks leave once; and an audio clock's
+  reader is held back by packets waiting, not by ticks. With two cams the
+  query keeps real time (10.15 against 8.02 on 0.32.0). Left for
+  foundmeat: `listen_audio` could declare a window of a packet or more,
+  since it reads only the times.
 - The host waits for the decoder's write before each copy is submitted,
   and the decode thread waits with it. A wait on the queue would need a
   submit with wait semaphores, which wgpu-core does not have; a raw submit
