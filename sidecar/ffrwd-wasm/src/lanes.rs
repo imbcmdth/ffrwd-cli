@@ -967,6 +967,28 @@ impl State {
                     continue;
                 };
                 let stream = port.out.stream;
+                if crate::trace::on() {
+                    if let Payload::Frame(f) = &item.payload {
+                        // A run of samples: 48 kHz or the like, a duration.
+                        let base = port.out.base;
+                        if base.num == 1 && base.den >= 8_000 && f.duration.is_some() {
+                            if let Ok(bytes) = f.data.bytes() {
+                                crate::trace::line(format_args!(
+                                    "emit: {} stream {stream} sound {}+{} peak {:.3}",
+                                    lane.name,
+                                    f.pts,
+                                    f.duration.unwrap_or(0),
+                                    crate::trace::peak(&bytes, "f32")
+                                ));
+                            }
+                        } else if let Some(l) = crate::trace::luma(&f.data) {
+                            crate::trace::line(format_args!(
+                                "emit: {} stream {stream} picture {} luma {l:.1}",
+                                lane.name, f.pts
+                            ));
+                        }
+                    }
+                }
                 match item.payload {
                     Payload::Frame(f) => {
                         rows_out.extend(f.rows.iter().cloned().map(|r| (f.pts, r)));

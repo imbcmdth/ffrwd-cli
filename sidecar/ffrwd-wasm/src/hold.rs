@@ -1157,15 +1157,20 @@ impl Group {
                     let seconds = |t: i64| t as f64 * base.num as f64 / base.den.max(1) as f64;
                     match hand.frames.first() {
                         Some(f) if self.members[index].kind == PortKind::Audio => format!(
-                            "{index} sound {} ({:.4}s)+{}",
+                            "{index} sound {} ({:.4}s)+{} peak {:.3}",
                             f.pts,
                             seconds(f.pts),
-                            f.duration.unwrap_or(0)
+                            f.duration.unwrap_or(0),
+                            self.members[index]
+                                .audio
+                                .map_or(0.0, |a| crate::trace::peak(f.data.host(), a.sample_fmt))
                         ),
                         Some(f) => format!(
-                            "{index} picture {} ({:.4}s){}",
+                            "{index} picture {} ({:.4}s){}{}",
                             f.pts,
                             seconds(f.pts),
+                            crate::trace::luma(&f.data)
+                                .map_or(String::new(), |l| format!(" luma {l:.1}")),
                             f.data.gpu().map_or(String::new(), |g| {
                                 let ids: Vec<String> = g
                                     .planes()

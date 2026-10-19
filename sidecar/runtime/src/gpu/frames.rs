@@ -362,7 +362,8 @@ impl GpuFrame {
         Ok(frame)
     }
 
-    fn size(&self) -> (u32, u32) {
+    /// The frame's width and height.
+    pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
 
