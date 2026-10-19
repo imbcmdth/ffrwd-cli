@@ -600,9 +600,24 @@ pub struct Assembler {
 /// started behind (its clock's source queued while it started, say) cuts
 /// ticks faster than real time until it has caught up, and one falling
 /// behind cuts them slower.
+///
+/// Each tick is noted as how far its clock time is ahead of the wall, and
+/// the least and greatest of those over the span are kept as they change,
+/// so a clock of many small ticks (an audio clock cut a sample a tick, 12000
+/// ticks to the quarter second) costs the same per tick as one of few.
 #[derive(Default)]
 struct Pace {
-    cut: VecDeque<(Instant, i64)>,
+    /// What the times of the ticks are measured from.
+    origin: Option<Instant>,
+    /// The ticks over the span, oldest first: their number, pts, and clock
+    /// time less wall time in seconds.
+    cut: VecDeque<(u64, i64, f64)>,
+    /// The ticks whose lead on the wall no later tick's is as small as,
+    /// smallest first, and those no later tick's is as great as, greatest
+    /// first: the front of each is the least and the greatest over the span.
+    least: VecDeque<(u64, f64)>,
+    most: VecDeque<(u64, f64)>,
+    noted: u64,
 }
 
 impl Pace {
@@ -619,33 +634,57 @@ impl Pace {
     /// as the wall did, give or take `SLACK`. A span that only averages
     /// out, slow and then a burst, is not kept up with.
     fn keeps_up(&mut self, pts: i64, base: TimeBase) -> bool {
-        let now = Instant::now();
+        self.keeps_up_at(Instant::now(), pts, base)
+    }
+
+    fn keeps_up_at(&mut self, now: Instant, pts: i64, base: TimeBase) -> bool {
         let seconds = |t: i64| t as f64 * base.num as f64 / base.den.max(1) as f64;
         if self
             .cut
             .back()
-            .is_some_and(|(_, last)| pts < *last || seconds(pts - last) > hold::MAX_STEP_SECONDS)
+            .is_some_and(|(_, last, _)| pts < *last || seconds(pts - last) > hold::MAX_STEP_SECONDS)
         {
             self.cut.clear();
+            self.least.clear();
+            self.most.clear();
         }
-        self.cut.push_back((now, pts));
+        let origin = *self.origin.get_or_insert(now);
+        let ahead = seconds(pts) - now.saturating_duration_since(origin).as_secs_f64();
+        let number = self.noted;
+        self.noted += 1;
+        self.cut.push_back((number, pts, ahead));
+        while self.least.back().is_some_and(|(_, a)| *a >= ahead) {
+            self.least.pop_back();
+        }
+        self.least.push_back((number, ahead));
+        while self.most.back().is_some_and(|(_, a)| *a <= ahead) {
+            self.most.pop_back();
+        }
+        self.most.push_back((number, ahead));
         while self
             .cut
             .get(1)
-            .is_some_and(|(_, t)| seconds(pts - t) >= Self::SPAN)
+            .is_some_and(|(_, t, _)| seconds(pts - t) >= Self::SPAN)
         {
-            self.cut.pop_front();
+            let (gone, _, _) = self.cut.pop_front().expect("two are noted");
+            if self.least.front().is_some_and(|(n, _)| *n == gone) {
+                self.least.pop_front();
+            }
+            if self.most.front().is_some_and(|(n, _)| *n == gone) {
+                self.most.pop_front();
+            }
         }
-        let Some((_, from)) = self.cut.front() else {
+        let Some((_, from, _)) = self.cut.front() else {
             return false;
         };
         if seconds(pts - from) < Self::SPAN {
             return false;
         }
-        self.cut.iter().all(|(then, t)| {
-            let wall = now.duration_since(*then).as_secs_f64();
-            (seconds(pts - t) - wall).abs() <= Self::SLACK
-        })
+        let (least, most) = match (self.least.front(), self.most.front()) {
+            (Some((_, least)), Some((_, most))) => (*least, *most),
+            _ => return false,
+        };
+        ahead - least <= Self::SLACK && most - ahead <= Self::SLACK
     }
 }
 
@@ -1015,7 +1054,10 @@ impl Assembler {
             }
         }
         let clock_stream = self.take_clock(clock, &next)?;
-        let caught_up = !next.last && self.pace.keeps_up(next.pts, base);
+        // Only a port feed's hold asks whether the clock is kept up with.
+        let caught_up = !next.last
+            && self.holds.iter().any(|g| g.port_fed())
+            && self.pace.keeps_up(next.pts, base);
         let mut streams = Vec::with_capacity(self.inputs.len());
         streams.push(clock_stream);
         let mut held = self.hold_ticks(next.pts, end, base, caught_up);
@@ -1731,6 +1773,7 @@ mod tests {
     use super::*;
     use ffrwd_wasm_runtime::node::{Accepts, InputPort, Interval, NodeShape, Rational};
     use ffrwd_wasm_runtime::runtime::{StreamInfo, VideoFormat};
+    use std::time::Duration;
 
     const NTSC: TimeBase = TimeBase { num: 1, den: 30000 };
     const KHZ48: TimeBase = TimeBase { num: 1, den: 48000 };
@@ -2437,6 +2480,94 @@ mod tests {
             vec![(5, vec![(5, "b".to_string())]), (6, vec![])],
             "0.1 s later on its own origin is three ticks later on the clock's, and its \
              progress is restamped too"
+        );
+    }
+
+    /// Whether the clock is kept up with, by the definition: every tick over
+    /// the span against the newest, one by one.
+    fn kept_up_by_every_tick(cut: &[(Instant, i64)], base: TimeBase) -> bool {
+        let seconds = |t: i64| t as f64 * base.num as f64 / base.den as f64;
+        let Some(&(now, pts)) = cut.last() else {
+            return false;
+        };
+        let mut start = 0;
+        while cut
+            .get(start + 1)
+            .is_some_and(|(_, t)| seconds(pts - t) >= Pace::SPAN)
+        {
+            start += 1;
+        }
+        let window = &cut[start..];
+        seconds(pts - window[0].1) >= Pace::SPAN
+            && window.iter().all(|(then, t)| {
+                let wall = now.duration_since(*then).as_secs_f64();
+                (seconds(pts - t) - wall).abs() <= Pace::SLACK
+            })
+    }
+
+    /// The pace says what checking every tick of the span says: for a clock
+    /// cut at its own pace in packets of 1024 ticks, one cut slow and then
+    /// in a burst, and one that drifts behind the wall.
+    #[test]
+    fn the_pace_says_what_every_tick_of_the_span_says() {
+        let start = Instant::now();
+        let at = |s: f64| start + Duration::from_secs_f64(s);
+        // (wall seconds of the tick, its pts in 48 kHz samples)
+        let paced: Vec<(f64, i64)> = (0..96_000i64)
+            .map(|k| ((k / 1024 * 1024) as f64 / 48_000.0, k))
+            .collect();
+        let burst: Vec<(f64, i64)> = (0..96_000i64)
+            .map(|k| {
+                let due = k as f64 / 48_000.0;
+                (if due < 0.4 { due * 2.0 } else { due.max(0.8) }, k)
+            })
+            .collect();
+        let drifting: Vec<(f64, i64)> = (0..96_000i64)
+            .map(|k| (k as f64 / 48_000.0 * 1.3, k))
+            .collect();
+        for (name, ticks) in [("paced", paced), ("burst", burst), ("drifting", drifting)] {
+            let mut pace = Pace::default();
+            let mut cut = Vec::new();
+            let mut kept = 0;
+            for (k, (wall, pts)) in ticks.into_iter().enumerate() {
+                cut.push((at(wall), pts));
+                let says = pace.keeps_up_at(at(wall), pts, KHZ48);
+                // The definition, checked on a sample of the ticks: it reads
+                // the whole span every time.
+                if k % 997 == 0 {
+                    assert_eq!(
+                        says,
+                        kept_up_by_every_tick(&cut, KHZ48),
+                        "{name} at tick {k}"
+                    );
+                }
+                kept += usize::from(says);
+            }
+            match name {
+                "paced" => assert!(kept > 80_000, "{name}: {kept}"),
+                "drifting" => assert_eq!(kept, 0, "{name}"),
+                _ => assert!(kept > 40_000 && kept < 80_000, "{name}: {kept}"),
+            }
+        }
+    }
+
+    /// A clock of 48000 ticks a second costs the pace a few operations a
+    /// tick, not a pass over the 12000 ticks of its span.
+    #[test]
+    fn the_pace_of_a_clock_cut_a_sample_a_tick_costs_little_a_tick() {
+        let start = Instant::now();
+        let mut pace = Pace::default();
+        let begun = Instant::now();
+        let mut kept = 0;
+        for k in 0..96_000i64 {
+            let wall = start + Duration::from_secs_f64((k / 1024 * 1024) as f64 / 48_000.0);
+            kept += usize::from(pace.keeps_up_at(wall, k, KHZ48));
+        }
+        let took = begun.elapsed();
+        assert!(kept > 80_000, "{kept}");
+        assert!(
+            took < Duration::from_millis(200),
+            "two seconds of a clock cut a sample a tick took {took:?} to pace"
         );
     }
 }
