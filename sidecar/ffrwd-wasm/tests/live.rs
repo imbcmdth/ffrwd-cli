@@ -1588,6 +1588,50 @@ fn a_programme_without_a_feeder_passes_through_untouched() {
     assert_eq!(out.clock.len(), 3);
 }
 
+/// A node clocked by the programme's sound a sample a tick (48000 ticks a
+/// second, 1024 of them settled by each packet), on the same input as the
+/// programme's picture, as foundmeat's listener on the programme's sound
+/// is: every one of its ticks runs, and the programme leaves in its own
+/// time, the reader of the input not held back by the node's ticks.
+#[test]
+fn a_node_clocked_a_sample_a_tick_on_the_programmes_sound_keeps_the_programme_in_real_time() {
+    let _serial = serial();
+    let program = Program::new(60, 3.0);
+    let chain = "[v=0:v]inset=port={port}:lead=0.5[v=o];[a=0:a]shape_window=window=1[cues=c]";
+    let (mut run, port) = start(
+        "sample-clock",
+        &program,
+        "4",
+        &["inset", "shape_window"],
+        chain,
+    );
+    wait_for_port(&mut run, port);
+    let started = Instant::now();
+    let out = finish(run);
+    let took = started.elapsed().as_secs_f64();
+    assert_eq!(out.frames.len() as i64, program.frames(), "{}", out.stderr);
+    // The programme's sound is written in whole packets of 1024.
+    let samples = (program.seconds * RATE as f64) as usize / 1024 * 1024;
+    assert_eq!(
+        out.clock.len(),
+        samples,
+        "a tick for every sample of the programme's sound"
+    );
+    assert!(
+        out.clock
+            .iter()
+            .enumerate()
+            .all(|(k, cue)| cue["text"] == format!("window {k}")),
+        "the ticks ran in order"
+    );
+    assert!(
+        took < program.seconds + 1.5,
+        "the programme's {} s left in {took:.2} s\n{}",
+        program.seconds,
+        out.stderr
+    );
+}
+
 #[test]
 fn recipe_149_runs_with_a_feed_and_without_one_at_every_jobs() {
     let _serial = serial();

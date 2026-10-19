@@ -369,6 +369,27 @@ tick that held them.
   the clock reads: an `arrival` input's pts may sit on any origin (a feed
   at the epoch while the clock counts from 0), so they never hold the
   clock.
+- **Queues.** A node's ticks wait in a queue of at most `2 * jobs + 2`
+  until a worker runs them, and a reader waits while the queue of
+  anything reading its stream is full. Every clock is cut no further than
+  that. One arrival can settle many ticks: an audio clock ticks every
+  `window` samples, so a node with a window of one sample on a clock
+  bound to sound is cut 1024 ticks by a packet of 1024 samples, 48000 a
+  second. Those past the bound stay with the clock and are cut as the
+  queue drains, and while any are left the node counts as full to its
+  readers. A self-clocked node is handed one arrival an input a call, and
+  the arrivals waiting on its input count against the same bound, so a
+  decoder ahead of a slower encoder holds its reader back rather than
+  queue every picture it made. A node that runs one tick at a time takes
+  the ticks queued behind the one it starts, and those its clock has
+  settled past the bound, up to 1024, and runs them in order in one turn,
+  and the progress they send on each port leaves once, as the last of
+  them: a clock of small ticks costs a node call a tick, not a turn of
+  the scheduler a tick. A node with ticks held back goes first. A node
+  slower than its clock holds back the reader of its clock's input, and
+  with it every stream that input carries (two `asplit` copies of one
+  sound, one for a listener and one for the programme, ride one input),
+  so it can slow the whole programme.
 - **Hold inputs.** A hold input bound to a stream holds the tick until its
   source has arrived past it (its picture, or with none its sound, past
   `lead` beyond the tick), or ended, for no longer than its

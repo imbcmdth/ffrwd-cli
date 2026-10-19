@@ -167,6 +167,16 @@ enum LaneIntake {
     },
 }
 
+/// What a worker takes from a lane in one turn: the tasks it runs in
+/// order, the instance that runs them, and that instance or the means to
+/// open it.
+struct Turn {
+    tasks: Vec<Task>,
+    instance: usize,
+    runner: Option<Box<dyn Node>>,
+    opener: Option<Opener>,
+}
+
 struct Task {
     ordinal: u64,
     tick: Tick,
@@ -229,6 +239,10 @@ struct Lane {
     started: Option<Instant>,
     /// When a rate clock whose inputs all arrive unpaired last cut a tick.
     turned: Option<Instant>,
+    /// The next tick of an input clock whose cut stopped at the cap, and
+    /// where its interval ends: while one is held back the lane counts as
+    /// full to everything it reads.
+    withheld: Option<(Tick, Option<i64>)>,
     unbuffered: bool,
 }
 
@@ -390,7 +404,8 @@ impl State {
     /// taking one arrival an input, so what waits for it is the arrivals
     /// queued on its input, which count against the same bound as a task
     /// queue: without that, a decoder ahead of a slower encoder would queue
-    /// every picture it made.
+    /// every picture it made. An input clock is cut no further than the
+    /// cap, and while its cut stopped there the lane counts as full.
     fn room(&self, stream: u32, consumers: &[Consumer]) -> bool {
         consumers.iter().all(|c| match c {
             Consumer::Lane(j) => {
@@ -401,7 +416,8 @@ impl State {
                     }
                     _ => 0,
                 };
-                lane.stopped || (lane.queue.len() < self.cap && queued < self.cap)
+                lane.stopped
+                    || (lane.queue.len() < self.cap && lane.withheld.is_none() && queued < self.cap)
             }
             Consumer::Writer(w, _) => self.writers[*w].len() < self.cap,
         })
@@ -648,12 +664,34 @@ impl State {
                 let LaneIntake::Assembled(a) = &mut lane.intake else {
                     unreachable!("an input clock is assembled")
                 };
-                let mut cut = Vec::new();
-                while let Some(tick) = a.next_clocked()? {
-                    let last = tick.last;
-                    cut.push((tick, a.tick_end()));
+                // One arrival can settle many ticks (an audio clock cuts
+                // `window` samples a tick, so a packet of 1024 makes 1024
+                // ticks of one), so the cut stops at the cap as every other
+                // clock's does, holding the next tick back if one is
+                // settled, and the rest is cut as the queue drains.
+                let mut cut: Vec<(Tick, Option<i64>)> = Vec::new();
+                let mut last = false;
+                while lane.queue.len() + cut.len() < cap {
+                    let next = match lane.withheld.take() {
+                        Some(held) => held,
+                        None => match a.next_clocked()? {
+                            Some(tick) => {
+                                let end = a.tick_end();
+                                (tick, end)
+                            }
+                            None => break,
+                        },
+                    };
+                    last = next.0.last;
+                    cut.push(next);
                     if last {
                         break;
+                    }
+                }
+                if !last && lane.withheld.is_none() && lane.queue.len() + cut.len() >= cap {
+                    if let Some(tick) = a.next_clocked()? {
+                        let end = a.tick_end();
+                        lane.withheld = Some((tick, end));
                     }
                 }
                 for (tick, end) in cut {
@@ -844,31 +882,44 @@ impl State {
         }
     }
 
-    /// A rate clock's ticks are cut as its queue has room, and a
-    /// self-clocked node's as it returns, so both are cut here, where a
-    /// worker looks for work, as well as on arrivals.
+    /// A rate clock's ticks are cut as its queue has room, a self-clocked
+    /// node's as it returns, and an input clock's that the cap withheld as
+    /// its queue drains, so all are cut here, where a worker looks for
+    /// work, as well as on arrivals. A lane holding a tick back holds back
+    /// the readers of what it reads, so it goes first; then the lane with
+    /// the longest queue.
     fn pick(&mut self) -> Result<Option<usize>> {
         for j in 0..self.lanes.len() {
-            if matches!(
-                self.lanes[j].clock,
-                ClockKind::Rate { .. } | ClockKind::SelfClocked
-            ) {
+            let lane = &self.lanes[j];
+            if matches!(lane.clock, ClockKind::Rate { .. } | ClockKind::SelfClocked)
+                || (lane.withheld.is_some() && lane.queue.len() < self.cap)
+            {
                 self.cut(j)?;
             }
         }
         Ok((0..self.lanes.len())
             .filter(|i| self.dispatchable(*i))
-            .max_by_key(|i| self.lanes[*i].queue.len()))
+            .max_by_key(|i| {
+                (
+                    self.lanes[*i].withheld.is_some(),
+                    self.lanes[*i].queue.len(),
+                )
+            }))
     }
 
     /// Takes lane `i`'s front task with an instance, or the means to open
-    /// one, and hands a state input its earlier rows.
-    fn dispatch(&mut self, i: usize) -> (Task, usize, Option<Box<dyn Node>>, Option<Opener>) {
+    /// one, and hands a state input its earlier rows. A lane that runs one
+    /// tick at a time takes the tasks queued behind the front one too, and
+    /// the ticks its clock has settled past the cap, up to [`TURN`] and
+    /// short of its last, and runs them in order in one turn: a clock of
+    /// small ticks (an audio clock cut a sample a tick, 48000 a second)
+    /// would otherwise wait for a worker, and pay a turn of the scheduler
+    /// and a wake of every thread waiting on it, for each.
+    fn dispatch(&mut self, i: usize) -> Result<Turn> {
         let lane = &mut self.lanes[i];
-        let mut task = lane.queue.pop_front().expect("picked lanes have a task");
-        task.tick.ordinal = task.ordinal;
+        let front = lane.queue.pop_front().expect("picked lanes have a task");
         lane.in_flight += 1;
-        let wanted = match (task.tick.last, lane.finisher) {
+        let wanted = match (front.tick.last, lane.finisher) {
             (true, Some(finisher)) => lane.idle.iter().position(|(i, _)| *i == finisher),
             _ => lane.idle.len().checked_sub(1),
         };
@@ -880,55 +931,89 @@ impl State {
                 (instance, None, lane.opener.clone())
             }
         };
-        if !lane.state.is_empty() {
-            if let LaneIntake::Assembled(a) = &mut lane.intake {
-                for stream in &mut task.tick.streams {
-                    if lane.state.contains(&stream.id) {
-                        stream.earlier_rows = a.earlier.owed(instance, stream.id, task.ordinal);
+        let mut tasks = vec![front];
+        if lane.width == 1 && !lane.unbuffered && !tasks[0].tick.last {
+            loop {
+                let lane = &mut self.lanes[i];
+                while tasks.len() < TURN && lane.queue.front().is_some_and(|t| !t.tick.last) {
+                    tasks.extend(lane.queue.pop_front());
+                }
+                if tasks.len() >= TURN || !lane.queue.is_empty() || lane.withheld.is_none() {
+                    break;
+                }
+                self.cut(i)?;
+            }
+        }
+        let lane = &mut self.lanes[i];
+        for task in &mut tasks {
+            task.tick.ordinal = task.ordinal;
+            if !lane.state.is_empty() {
+                if let LaneIntake::Assembled(a) = &mut lane.intake {
+                    for stream in &mut task.tick.streams {
+                        if lane.state.contains(&stream.id) {
+                            stream.earlier_rows = a.earlier.owed(instance, stream.id, task.ordinal);
+                        }
+                    }
+                    a.earlier.processed(instance, task.ordinal);
+                    if lane.created >= lane.width {
+                        a.earlier.forget_told(lane.created);
                     }
                 }
-                a.earlier.processed(instance, task.ordinal);
+            }
+            if let LaneIntake::Assembled(a) = &mut lane.intake {
+                for stream in &mut task.tick.streams {
+                    stream.ended_feeds = a.ended.owed(instance, stream.id, task.ordinal);
+                }
+                a.ended.processed(instance, task.ordinal);
                 if lane.created >= lane.width {
-                    a.earlier.forget_told(lane.created);
+                    a.ended.forget_told(lane.created);
                 }
             }
         }
-        if let LaneIntake::Assembled(a) = &mut lane.intake {
-            for stream in &mut task.tick.streams {
-                stream.ended_feeds = a.ended.owed(instance, stream.id, task.ordinal);
-            }
-            a.ended.processed(instance, task.ordinal);
-            if lane.created >= lane.width {
-                a.ended.forget_told(lane.created);
-            }
-        }
-        (task, instance, runner, opener)
+        Ok(Turn {
+            tasks,
+            instance,
+            runner,
+            opener,
+        })
     }
 
+    /// The results of one turn of lane `i`, by ordinal, in the order they
+    /// ran.
     fn complete(
         &mut self,
         i: usize,
-        ordinal: u64,
+        results: Vec<(u64, Result<Done>)>,
         instance: usize,
         runner: Option<Box<dyn Node>>,
-        done: Result<Done>,
     ) {
         let lane = &mut self.lanes[i];
         lane.in_flight -= 1;
-        let last = done.as_ref().is_ok_and(|d| d.last);
+        let last = results
+            .iter()
+            .any(|(_, done)| done.as_ref().is_ok_and(|d| d.last));
         if let Some(runner) = runner {
             if !last {
                 lane.idle.push((instance, runner));
             }
         }
-        let flushed = match done {
-            Ok(done) => {
-                if ordinal >= lane.next_flush {
-                    lane.done.insert(ordinal, done);
+        let mut failed = None;
+        for (ordinal, done) in results {
+            match done {
+                Ok(done) => {
+                    if ordinal >= lane.next_flush {
+                        lane.done.insert(ordinal, done);
+                    }
                 }
-                self.flush(i)
+                Err(e) => {
+                    failed = Some(e.context(format!("in {}", lane.name)));
+                    break;
+                }
             }
-            Err(e) => Err(e.context(format!("in {}", self.lanes[i].name))),
+        }
+        let flushed = match failed {
+            Some(e) => Err(e),
+            None => self.flush(i),
         };
         if let Err(e) = flushed {
             if self.error.is_none() {
@@ -941,6 +1026,7 @@ impl State {
     /// port's readers, the node's progress down every port, and on the last
     /// tick the end of every port.
     fn flush(&mut self, i: usize) -> Result<()> {
+        let mut leaving: Vec<(u32, Delivery)> = Vec::new();
         loop {
             let lane = &mut self.lanes[i];
             let Some(done) = lane.done.remove(&lane.next_flush) else {
@@ -1098,6 +1184,7 @@ impl State {
                 lane.stopped = true;
                 lane.finisher = Some(instance);
                 lane.queue.clear();
+                lane.withheld = None;
                 lane.done.clear();
                 lane.next_flush = lane.next_ordinal;
                 let streams = lane
@@ -1123,17 +1210,18 @@ impl State {
                 });
                 lane.next_ordinal += 1;
             }
-            for (stream, delivery) in deliveries {
-                match delivery {
-                    Delivery::Item(item) => self.arrive(stream, item)?,
-                    Delivery::Progress(at) => self.progress(stream, at)?,
-                    Delivery::End => self.end(stream)?,
-                    Delivery::Trailing(rows) => self.trailing(stream, &rows),
-                    Delivery::Batch => {
-                        for consumer in self.consumers(stream) {
-                            if let Consumer::Writer(w, s) = consumer {
-                                self.writers[w].push(s, Out::Batch);
-                            }
+            leaving.extend(deliveries);
+        }
+        for (stream, delivery) in superseded_progress_dropped(leaving) {
+            match delivery {
+                Delivery::Item(item) => self.arrive(stream, item)?,
+                Delivery::Progress(at) => self.progress(stream, at)?,
+                Delivery::End => self.end(stream)?,
+                Delivery::Trailing(rows) => self.trailing(stream, &rows),
+                Delivery::Batch => {
+                    for consumer in self.consumers(stream) {
+                        if let Consumer::Writer(w, s) = consumer {
+                            self.writers[w].push(s, Out::Batch);
                         }
                     }
                 }
@@ -1162,6 +1250,26 @@ enum Delivery {
     Batch,
 }
 
+/// What several ticks of one lane hand on, less each progress mark that a
+/// later one on the same stream says again with nothing between them on
+/// that stream: a turn of many small ticks moves its readers' progress once.
+fn superseded_progress_dropped(deliveries: Vec<(u32, Delivery)>) -> Vec<(u32, Delivery)> {
+    let mut marked: HashSet<u32> = HashSet::new();
+    let mut kept: Vec<(u32, Delivery)> = deliveries
+        .into_iter()
+        .rev()
+        .filter(|(stream, delivery)| match delivery {
+            Delivery::Progress(_) => marked.insert(*stream),
+            _ => {
+                marked.remove(stream);
+                true
+            }
+        })
+        .collect();
+    kept.reverse();
+    kept
+}
+
 fn out_of(item: &Item) -> Out {
     match item {
         Item::Frame(f) => Out::Frame {
@@ -1179,6 +1287,10 @@ fn out_of(item: &Item) -> Out {
 /// 4K frames reached real time on four) without one sidecar taking every
 /// core from the ffmpeg processes and encoders beside it.
 pub const DEFAULT_WORKERS: usize = 4;
+
+/// The most ticks one turn of a lane that runs a tick at a time takes: a
+/// packet of sound's worth on a clock cut a sample a tick.
+const TURN: usize = 1024;
 
 /// How many worker threads a run gets: `-jobs` when it was given, else
 /// `DEFAULT_WORKERS`, never more than the machine's effective core count.
@@ -1294,6 +1406,7 @@ impl Scheduler {
                 finisher: None,
                 started: None,
                 turned: None,
+                withheld: None,
                 unbuffered: spec.unbuffered,
             });
         }
@@ -1360,7 +1473,12 @@ impl Scheduler {
                     .map(|c| match c {
                         Consumer::Lane(j) => {
                             let lane = &state.lanes[*j];
-                            format!("{} queue {}", lane.name, lane.queue.len())
+                            let withheld = if lane.withheld.is_some() {
+                                " and a tick withheld"
+                            } else {
+                                ""
+                            };
+                            format!("{} queue {}{withheld}", lane.name, lane.queue.len())
                         }
                         Consumer::Writer(w, _) => format!("writer {w} {}", state.writers[*w].len()),
                     })
@@ -1542,7 +1660,19 @@ fn worker(shared: &Shared) {
             };
             continue;
         };
-        let (task, instance, runner, opener) = state.dispatch(i);
+        let Turn {
+            tasks,
+            instance,
+            runner,
+            opener,
+        } = match state.dispatch(i) {
+            Ok(taken) => taken,
+            Err(e) => {
+                state.error = Some(e);
+                shared.notify();
+                return;
+            }
+        };
         drop(state);
         shared.notify();
 
@@ -1553,27 +1683,40 @@ fn worker(shared: &Shared) {
                 None => Err(anyhow!("a lane ran out of instances")),
             },
         };
-        let Task { ordinal, tick, end } = task;
-        let (pts, last) = (tick.pts, tick.last);
-        let (runner, done) = match opened {
+        let mut results = Vec::with_capacity(tasks.len());
+        let runner = match opened {
             Ok(mut runner) => {
-                let started = Instant::now();
-                let result = runner.process(tick);
-                PROFILE.process.add(0, started);
-                let result = result.map(|emitted| Done {
-                    emitted,
-                    pts,
-                    end,
-                    last,
-                    instance,
-                });
-                (Some(runner), result)
+                for Task { ordinal, tick, end } in tasks {
+                    let (pts, last) = (tick.pts, tick.last);
+                    let started = Instant::now();
+                    let result = runner.process(tick);
+                    PROFILE.process.add(0, started);
+                    // A tick the node says it finished on, or failed on, is
+                    // the last of the turn: what was taken after it is not
+                    // run, as a lane that stops drops its queue.
+                    let stop = result.as_ref().map_or(true, |emitted| emitted.finished);
+                    let result = result.map(|emitted| Done {
+                        emitted,
+                        pts,
+                        end,
+                        last,
+                        instance,
+                    });
+                    results.push((ordinal, result));
+                    if stop {
+                        break;
+                    }
+                }
+                Some(runner)
             }
-            Err(e) => (None, Err(e)),
+            Err(e) => {
+                results.push((tasks[0].ordinal, Err(e)));
+                None
+            }
         };
 
         state = shared.lock();
-        state.complete(i, ordinal, instance, runner, done);
+        state.complete(i, results, instance, runner);
         shared.notify();
     }
 }
@@ -1592,8 +1735,8 @@ mod tests {
         assert_eq!(worker_count(Some(1)), 1);
         assert_eq!(worker_count(Some(usize::MAX)), cores);
     }
-    use ffrwd_wasm_runtime::runtime::{StreamInfo, VideoFormat};
-    use std::sync::mpsc;
+    use ffrwd_wasm_runtime::runtime::{AudioFormat, StreamInfo, VideoFormat};
+    use std::sync::{mpsc, OnceLock};
 
     /// What a publisher's calls brought: frames per call, and whether each
     /// was the last.
@@ -1846,5 +1989,336 @@ mod tests {
             .expect("the run");
         writer.join();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opens when told to, for a node to wait on in its first call.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        opened: Condvar,
+    }
+
+    impl Gate {
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    /// A node that notes the pts of each tick and, at each call, how long
+    /// its lane's queue is; it waits on `gate` in its first call.
+    struct Noting {
+        shape: NodeShape,
+        seen: Arc<Mutex<Vec<i64>>>,
+        queues: Arc<Mutex<Vec<usize>>>,
+        gate: Arc<Gate>,
+        shared: Arc<OnceLock<Arc<Shared>>>,
+    }
+
+    impl Node for Noting {
+        fn name(&self) -> &str {
+            "noting"
+        }
+
+        fn shape(&self) -> &NodeShape {
+            &self.shape
+        }
+
+        fn set_params(&mut self, _params: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn process(&mut self, tick: Tick) -> Result<Emitted> {
+            if let Some(shared) = self.shared.get() {
+                let queue = shared.lock().lanes[0].queue.len();
+                self.queues.lock().unwrap().push(queue);
+            }
+            let first = {
+                let mut seen = self.seen.lock().unwrap();
+                if !tick.last {
+                    seen.push(tick.pts);
+                }
+                seen.len() == 1
+            };
+            if first {
+                self.gate.wait();
+            }
+            Ok(Emitted::default())
+        }
+    }
+
+    /// One lane running `node`, clocked by its one input `port` on stream
+    /// 0, and the scheduler running it on one worker (a cap of 4).
+    fn one_lane(shape: NodeShape, bound: BoundStream, node: Noting) -> Scheduler {
+        let assembler = Assembler::new(&shape, &[bound], "noting", &[]).expect("an assembler");
+        let plan = Plan {
+            lanes: vec![LaneSpec {
+                gpu: HashMap::new(),
+                name: "noting".to_string(),
+                shape,
+                intake: Intake::Assembled(Box::new(assembler)),
+                bound: vec![0],
+                state: Vec::new(),
+                tick_base: TimeBase {
+                    num: 1,
+                    den: 48_000,
+                },
+                runners: vec![Box::new(node)],
+                opener: None,
+                ports: Vec::new(),
+                rows: None,
+                unbuffered: false,
+            }],
+            consumers: HashMap::from([(0, vec![Consumer::Lane(0)])]),
+            writers: Vec::new(),
+            mirrors: HashMap::new(),
+        };
+        Scheduler::start(plan, 1, &WakeSlot::new()).expect("the lanes")
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < until, "{what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn input_port(name: &str, kind: PortKind, pairing: Pairing) -> InputPort {
+        InputPort {
+            name: name.to_string(),
+            kind,
+            required: true,
+            many: false,
+            pairing,
+            rows: RowsUse::Ignore,
+            window: 1,
+            stride: 1,
+            accepts: Accepts::default(),
+            schema: None,
+        }
+    }
+
+    /// A node clocked by its sound a sample a tick (a listener written for
+    /// pictures, bound to sound) is cut 1024 ticks by one packet of 1024
+    /// samples. The cut stops at the cap, the reader waits while ticks are
+    /// withheld, every tick still runs once and in order, and the ticks
+    /// queued behind the first are taken in one turn.
+    #[test]
+    fn an_audio_clock_a_sample_a_tick_queues_no_more_than_the_cap_and_runs_every_tick() {
+        let shape = NodeShape {
+            inputs: vec![input_port("a", PortKind::Audio, Pairing::Lockstep)],
+            outputs: Vec::new(),
+            clock: Clock::Input("a".to_string()),
+            pure: false,
+            one_to_one: false,
+            bounded: true,
+            relation: Vec::new(),
+        };
+        let samples = TimeBase {
+            num: 1,
+            den: 48_000,
+        };
+        let bound = BoundStream {
+            port: "a".to_string(),
+            id: 0,
+            info: StreamInfo::default(),
+            time_base: samples,
+            format: StreamFormat::Audio(AudioFormat {
+                sample_rate: 48_000,
+                channels: 1,
+                sample_fmt: "f32",
+                channel_layout: None,
+            }),
+            rendition: Default::default(),
+            row: None,
+            decode_delay: 0,
+            latency: None,
+            hint: Default::default(),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let queues = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(Gate::default());
+        let shared = Arc::new(OnceLock::new());
+        let node = Noting {
+            shape: shape.clone(),
+            seen: Arc::clone(&seen),
+            queues: Arc::clone(&queues),
+            gate: Arc::clone(&gate),
+            shared: Arc::clone(&shared),
+        };
+        let scheduler = one_lane(shape, bound, node);
+        let _ = shared.set(Arc::clone(&scheduler.shared));
+        let packet = |pts: i64| {
+            Item::Frame(TickFrame {
+                pts,
+                duration: Some(1024),
+                data: Arc::new(vec![0u8; 1024 * 4]).into(),
+                rows: Vec::new(),
+            })
+        };
+        assert!(scheduler.arrive(0, packet(0)));
+        wait_until("the first tick ran", || !seen.lock().unwrap().is_empty());
+        // The first packet's ticks went in one turn; the second's wait.
+        assert!(scheduler.arrive(0, packet(1024)));
+        {
+            let state = scheduler.shared.lock();
+            let lane = &state.lanes[0];
+            assert_eq!(
+                lane.queue.len(),
+                state.cap,
+                "the queue holds the cap's worth of the second packet's ticks"
+            );
+            assert!(
+                lane.withheld.is_some(),
+                "the rest of the packet's ticks wait"
+            );
+            assert!(
+                !state.room(0, &state.consumers(0)),
+                "the reader waits while ticks are withheld"
+            );
+        }
+        gate.open();
+        wait_until("every sample's tick ran", || {
+            seen.lock().unwrap().len() == 2048
+        });
+        assert!(scheduler.end(0));
+        let (done, finished) = mpsc::channel();
+        let shared_queues = Arc::clone(&queues);
+        thread::spawn(move || done.send(scheduler.finish()));
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the lane ended with its input")
+            .expect("the run");
+        assert_eq!(*seen.lock().unwrap(), (0..2048).collect::<Vec<i64>>());
+        let queues = shared_queues.lock().unwrap();
+        assert!(
+            queues[1..1024].iter().all(|q| *q == 4),
+            "the first packet's ticks ran in one turn, the second's queued behind it: {:?}",
+            &queues[..12]
+        );
+        assert!(
+            queues[1024..2048].iter().all(|q| *q == 0),
+            "the second packet's ticks ran in one turn: {:?}",
+            &queues[1024..1036]
+        );
+    }
+
+    /// A self-clocked reader (a decoder) slower than what reaches it holds
+    /// its writer back once the cap's worth of arrivals waits on its input,
+    /// whatever else the scheduler bounds.
+    #[test]
+    fn a_self_clocked_reader_holds_its_writer_at_the_cap() {
+        let shape = NodeShape {
+            inputs: vec![input_port("v", PortKind::Video, Pairing::Arrival)],
+            outputs: Vec::new(),
+            clock: Clock::SelfClocked,
+            pure: false,
+            one_to_one: false,
+            bounded: true,
+            relation: Vec::new(),
+        };
+        let bound = BoundStream {
+            port: "v".to_string(),
+            id: 0,
+            info: StreamInfo::default(),
+            time_base: TimeBase { num: 1, den: 30 },
+            format: StreamFormat::Video(VideoFormat {
+                width: 2,
+                height: 2,
+                pix_fmt: "rgba",
+                frame_len: 16,
+                color: None,
+            }),
+            rendition: Default::default(),
+            row: None,
+            decode_delay: 0,
+            latency: None,
+            hint: Default::default(),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(Gate::default());
+        let node = Noting {
+            shape: shape.clone(),
+            seen: Arc::clone(&seen),
+            queues: Arc::default(),
+            gate: Arc::clone(&gate),
+            shared: Arc::default(),
+        };
+        let scheduler = Arc::new(one_lane(shape, bound, node));
+        let delivered = Arc::new(Mutex::new(0usize));
+        let writer = {
+            let scheduler = Arc::clone(&scheduler);
+            let delivered = Arc::clone(&delivered);
+            thread::spawn(move || {
+                for k in 0..40 {
+                    let frame = TickFrame {
+                        pts: k,
+                        duration: None,
+                        data: Arc::new(vec![0; 16]).into(),
+                        rows: Vec::new(),
+                    };
+                    if !scheduler.arrive(0, Item::Frame(frame)) {
+                        return;
+                    }
+                    *delivered.lock().unwrap() += 1;
+                }
+                scheduler.end(0);
+            })
+        };
+        wait_until("the first call started", || {
+            !seen.lock().unwrap().is_empty()
+        });
+        thread::sleep(Duration::from_millis(200));
+        let held = *delivered.lock().unwrap();
+        assert!(
+            held <= 4 + 1,
+            "the writer waits once the cap's worth is queued ({held} delivered)"
+        );
+        gate.open();
+        writer.join().expect("the writer");
+        scheduler.finish().expect("the run");
+        assert_eq!(*delivered.lock().unwrap(), 40);
+    }
+
+    #[test]
+    fn a_progress_mark_a_later_one_says_again_is_dropped() {
+        let marks = |d: &[(u32, Delivery)]| -> Vec<String> {
+            d.iter()
+                .map(|(s, d)| match d {
+                    Delivery::Progress(at) => format!("{s}:p{at}"),
+                    Delivery::End => format!("{s}:end"),
+                    _ => format!("{s}:other"),
+                })
+                .collect()
+        };
+        let message = || {
+            Delivery::Item(Item::Message(Message {
+                pts: 0,
+                data: Vec::new(),
+            }))
+        };
+        let kept = superseded_progress_dropped(vec![
+            (1, Delivery::Progress(1)),
+            (1, Delivery::Progress(2)),
+            (2, Delivery::Progress(2)),
+            (1, message()),
+            (1, Delivery::Progress(3)),
+            (2, Delivery::Progress(3)),
+            (1, Delivery::Progress(4)),
+            (1, Delivery::End),
+        ]);
+        assert_eq!(
+            marks(&kept),
+            ["1:p2", "1:other", "2:p3", "1:p4", "1:end"],
+            "each stream's marks up to the next thing on it, or the end, are the last of them"
+        );
     }
 }
