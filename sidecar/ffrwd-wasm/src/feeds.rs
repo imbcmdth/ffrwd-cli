@@ -494,9 +494,12 @@ fn match_streams(spec: &FeedSpec, conn: &mut Conn, report: &mut dyn FnMut(String
                     Some(codec) => {
                         // On the device for a port held there, as `decode`
                         // opens for a reader on the GPU; in software
-                        // otherwise.
+                        // otherwise, or where FFRWD_FEED_DECODE=software
+                        // asks, to tell the device's decode from the rest.
                         let yuv = av_nodes::read_as(crate::color_from(&stream.media).as_ref());
-                        let shared = picture.on_gpu.and_then(|_| {
+                        let software =
+                            std::env::var("FFRWD_FEED_DECODE").is_ok_and(|v| v == "software");
+                        let shared = picture.on_gpu.filter(|_| !software).and_then(|_| {
                             av_nodes::open_on_shared_device(
                                 codec,
                                 &stream.extradata,

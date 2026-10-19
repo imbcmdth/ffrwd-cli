@@ -284,6 +284,9 @@ or rejoining leaves the first's feed as it was.
 written, for each packet, picture and sound a port feed brings, each
 offset its hold fixes, what each tick hands its node, and each frame
 written out, with the wall time and the thread; unset, nothing is traced.
+`FFRWD_FEED_DECODE=software` decodes a coded feed in software and uploads
+it, where it would be decoded on the device: a way to tell what the
+device's decode does from what the rest of the run does.
 
 One connection at a time: a second while one is on is accepted and closed
 at once, and a connection that has sent nothing is dropped for one that

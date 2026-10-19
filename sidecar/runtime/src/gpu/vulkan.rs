@@ -732,6 +732,31 @@ fn copy_target(
     })
 }
 
+/// The copy targets a decoder keeps and copies its pictures into in turn:
+/// a picture's frame holds its pair, and once every frame holding it is
+/// gone the pair is free for a later picture. A later copy is queued on
+/// wgpu's queue after every read of the pair queued so far, and wgpu
+/// orders it after them, so a pair is never written while a read of the
+/// picture before is still to run. Their wgpu ids are the same for the
+/// run, as a pool of the decoder's own textures wrapped would be.
+const SLOTS: usize = 32;
+
+/// One pair of copy targets, its luma and its chroma. Dropping the last
+/// reference drops the textures.
+struct Slot {
+    global: Arc<Global>,
+    index: usize,
+    y: Plane,
+    uv: Plane,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.global.texture_drop(self.y.texture);
+        self.global.texture_drop(self.uv.texture);
+    }
+}
+
 /// What a decoder's picture taken here is.
 pub(super) struct Taken {
     pub planes: Vec<Plane>,
@@ -746,31 +771,49 @@ impl Taken {
     }
 }
 
-/// A picture wrapped as a frame's planes. Nothing is: every picture is
-/// copied, so a frame holds nothing of the decoder's.
-pub(super) enum Wrapped {}
+/// The pair of copy targets a frame's planes are: handed back to its
+/// decoder's pool when the frame is dropped.
+pub(super) struct Wrapped {
+    slot: Arc<Slot>,
+}
 
 impl Wrapped {
     pub(super) fn release(self, _global: &Global, _device: &SharedDevice) {
-        match self {}
+        drop(self.slot);
     }
 }
 
-/// One decoder's way of taking its pictures.
+/// One decoder's way of taking its pictures: its pool of copy targets, and
+/// where in it the next free pair is looked for.
 #[derive(Default)]
-pub struct Taker;
+pub struct Taker {
+    slots: Vec<Arc<Slot>>,
+    next: usize,
+}
 
 impl Taker {
-    /// Takes `picture`, an NV12 picture the decoder wrote on the process's
-    /// device, by a copy into two textures of wgpu's.
-    pub(super) fn take(
+    /// A free pair of copy targets for a `width` x `height` picture: the
+    /// next free one in the pool after the last taken, so the pairs are
+    /// used in turn; a new one where none is free, kept while the pool has
+    /// room. Free pairs of another size are let go.
+    fn slot(
         &mut self,
-        global: &Global,
+        global: &Arc<Global>,
         device: &SharedDevice,
-        mut picture: DeviceFrame,
-    ) -> Result<Taken> {
-        let opened = opened()?;
-        let (width, height) = (picture.width, picture.height);
+        width: u32,
+        height: u32,
+    ) -> Result<Arc<Slot>> {
+        let fits = |s: &Slot| (s.y.width, s.y.height) == (width, height);
+        self.slots.retain(|s| Arc::strong_count(s) > 1 || fits(s));
+        let count = self.slots.len();
+        for k in 0..count {
+            let at = (self.next + k) % count;
+            let slot = &self.slots[at];
+            if Arc::strong_count(slot) == 1 && fits(slot) {
+                self.next = at + 1;
+                return Ok(Arc::clone(slot));
+            }
+        }
         let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
         let y = copy_target(global, device, width, height, TextureFormat::R8Unorm, 1)?;
         let uv = match copy_target(global, device, cw, ch, TextureFormat::Rg8Unorm, 2) {
@@ -780,26 +823,55 @@ impl Taker {
                 return Err(e);
             }
         };
-        let copied = copy_picture(global, device, opened, &mut picture, &y, &uv);
-        match copied {
-            Ok((submission, signal)) => {
-                signaller().send(Job {
-                    submission,
-                    signals: vec![signal],
-                    kept: Box::new(picture),
-                })?;
-                Ok(Taken {
-                    planes: vec![y, uv],
-                    owned: vec![y.texture, uv.texture],
-                    wrapped: None,
-                })
-            }
-            Err(e) => {
-                global.texture_drop(y.texture);
-                global.texture_drop(uv.texture);
-                Err(e)
-            }
+        let pooled = count < SLOTS;
+        let slot = Arc::new(Slot {
+            global: Arc::clone(global),
+            index: if pooled { count } else { usize::MAX },
+            y,
+            uv,
+        });
+        if pooled {
+            self.slots.push(Arc::clone(&slot));
+            self.next = count + 1;
         }
+        Ok(slot)
+    }
+
+    /// Takes `picture`, an NV12 picture the decoder wrote on the process's
+    /// device, by a copy into a pair of textures of wgpu's from the pool.
+    pub(super) fn take(
+        &mut self,
+        global: &Arc<Global>,
+        device: &SharedDevice,
+        mut picture: DeviceFrame,
+    ) -> Result<Taken> {
+        let opened = opened()?;
+        let slot = self.slot(global, device, picture.width, picture.height)?;
+        let (y, uv) = (slot.y, slot.uv);
+        let (submission, signal) = copy_picture(global, device, opened, &mut picture, &y, &uv)?;
+        if crate::trace::on() {
+            crate::trace::line(format_args!(
+                "taker: picture pts {} into slot {} (y {:?}, uv {:?})",
+                picture.pts,
+                if slot.index == usize::MAX {
+                    "none, the pool being full".to_string()
+                } else {
+                    slot.index.to_string()
+                },
+                y.texture,
+                uv.texture
+            ));
+        }
+        signaller().send(Job {
+            submission,
+            signals: vec![signal],
+            kept: Box::new(picture),
+        })?;
+        Ok(Taken {
+            planes: vec![y, uv],
+            owned: Vec::new(),
+            wrapped: Some(Wrapped { slot }),
+        })
     }
 }
 

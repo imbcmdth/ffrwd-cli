@@ -1162,7 +1162,19 @@ impl Group {
                             seconds(f.pts),
                             f.duration.unwrap_or(0)
                         ),
-                        Some(f) => format!("{index} picture {} ({:.4}s)", f.pts, seconds(f.pts)),
+                        Some(f) => format!(
+                            "{index} picture {} ({:.4}s){}",
+                            f.pts,
+                            seconds(f.pts),
+                            f.data.gpu().map_or(String::new(), |g| {
+                                let ids: Vec<String> = g
+                                    .planes()
+                                    .iter()
+                                    .map(|p| format!("{:?}", p.texture))
+                                    .collect();
+                                format!(" textures {}", ids.join(" "))
+                            })
+                        ),
                         None => format!("{index} nothing"),
                     }
                 })

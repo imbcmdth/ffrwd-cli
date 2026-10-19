@@ -1990,6 +1990,14 @@ impl gpu_ext::ffrwd::gpu::frames::Host for Host {
             Ok(planes) => planes,
             Err(e) => return Ok(Err(format!("frame {index} of stream {id}: {e:#}"))),
         };
+        if crate::trace::on() {
+            let ids: Vec<String> = planes.iter().map(|p| format!("{:?}", p.texture)).collect();
+            crate::trace::line(format_args!(
+                "planes: stream {id} frame {index} (pts {}) handed to the module as textures {}",
+                frame.pts,
+                ids.join(" ")
+            ));
+        }
         let mut handles = Vec::with_capacity(planes.len());
         for plane in planes {
             let texture = wasi_webgpu_wasmtime::Texture::shared(

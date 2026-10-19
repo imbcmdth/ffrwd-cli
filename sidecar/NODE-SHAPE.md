@@ -344,6 +344,19 @@ when it resizes:
     [gpu] convert rgba 64x48 to rgba 32x24
     [gpu] gpu_box: resizing the frames of stream 1 on the GPU to 32x24
 
+The textures `frames.planes` hands over are the host's and good for that
+call only, and which frame a texture holds is said by the frame, not by
+the texture: the host makes, reuses and frees its textures as frames come
+and go (a decoder's own textures, or the pool its pictures are copied
+into, are used again for later pictures, and a conversion makes new
+ones), so a handle, or
+the id behind it, that held one frame on one tick may hold another on a
+later one. A module that keeps anything it made from a frame's textures
+across ticks (a conversion of it, a view, a bind group) keys it by the
+frame: its stream, its pts, and its feed's start (`feed-start.at` and
+`first-pts`), as blitz's compose keys its pictures; and it asks
+`frames.planes` again on every tick it reads them.
+
 `modules/gpu-box` is the test module: `--params '{"memory":"gpu"}'` holds
 `v` and `out` on the GPU, `{"memory":"host"}` holds neither, and the two
 write the same bytes. `{"w":"pad"}` adds a second input, `w`, that

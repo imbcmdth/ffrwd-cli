@@ -7,3 +7,4 @@ pub mod nn;
 pub mod node;
 pub mod profile;
 pub mod runtime;
+pub mod trace;

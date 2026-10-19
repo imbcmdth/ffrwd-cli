@@ -2065,6 +2065,189 @@ fn a_coded_feed_held_on_the_gpu_is_decoded_on_the_device() {
         .all(|(_, p)| has_the_box(p, small.0 as usize, 3)));
 }
 
+/// Whether ffmpeg on PATH has `encoder`, having said why the test is
+/// skipped where it has not.
+fn ffmpeg_encodes(test: &str, encoder: &str) -> bool {
+    let listed = Command::new("ffmpeg")
+        .args(["-hide_banner", "-encoders"])
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(encoder))
+        .unwrap_or(false);
+    if !listed {
+        eprintln!("SKIPPED: {test}. The ffmpeg on PATH has no {encoder}.");
+    }
+    listed
+}
+
+#[test]
+fn a_device_decoded_feed_held_deep_shows_each_tick_the_picture_handed_for_it() {
+    // A feed of flat grey pictures, picture k a grey of its own for k mod
+    // 25, sent at twice real time into gpu_box's held input, so the hold
+    // holds a growing queue of pictures decoded on the device while the
+    // ones shown are dropped and the device's textures are made and freed
+    // all the while. Every tick from the feed's first on shows the picture
+    // that many ticks into the feed: its grey, read off the output, is
+    // that picture's and no other's.
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+    let test = "a_device_decoded_feed_held_deep_shows_each_tick_the_picture_handed_for_it";
+    let Some((device, dir)) = small_shared_decoder(test) else {
+        return;
+    };
+    if ffmpeg(test).is_none() || !ffmpeg_encodes(test, "libx264") {
+        return;
+    }
+    let (w, h) = (64u32, 48u32);
+    let clip = scratch("greys.nut");
+    let source =
+        format!("color=c=black:s={w}x{h}:r=25:d=10,geq=lum='20+mod(N\\,25)*8':cb=128:cr=128");
+    ffmpeg_ok(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            &source,
+            "-c:v",
+            "libx264",
+            "-qp",
+            "4",
+            "-bf",
+            "0",
+            "-g",
+            "25",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "nut",
+            path_str(&clip),
+        ],
+        "making the grey clip",
+    );
+    // Each grey as ffmpeg decodes it to rgba, at a pixel clear of the box.
+    let at = |k: usize| ((30 * w as usize + 40) * 4) + k * (w * h * 4) as usize;
+    let reference = decoded_by_ffmpeg(&clip, "rgba");
+    let greys: Vec<u8> = (0..25).map(|k| reference[at(k)]).collect();
+
+    let module = module();
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        listener.local_addr().expect("its address").port()
+    };
+    let wiring = format!("[v=0:v]gpu_box=memory=gpu:out=gpu:w=port:port={port}:size=3[out=o]");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .env("FFRWD_AV_RUNTIME", &dir)
+        .args(["-gpu", &module, "-f", "nut", "-i", "-", "-m"])
+        .arg(format!("gpu_box={module}"))
+        .args(["-filter_complex", &wiring, "-map", "[o]", "-f", "nut", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+    let (listening, stderr_reader) = watch_for_listening(&mut child);
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    // The programme: green at 25 a second for 14 s, paced from when the
+    // feed's port is up.
+    let ticks = 350i64;
+    let programme = std::thread::spawn(move || {
+        let mut stream = Stream::video("rgba", w, h, TIME_BASE).expect("rgba");
+        stream.frame_rate = Some((25, 1));
+        let mut muxer = Muxer::new(&mut stdin, &stream).expect("headers");
+        if muxer.write_frame(0, &green(w, h)).is_err() {
+            return;
+        }
+        let _ = muxer.flush();
+        let started = listening
+            .recv_timeout(LISTENING_BOUND)
+            .unwrap_or_else(|_| Instant::now());
+        for k in 1..ticks {
+            let due = started + Duration::from_millis(40 * k as u64);
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+            if muxer.write_frame(k, &green(w, h)).is_err() {
+                return;
+            }
+            let _ = muxer.flush();
+        }
+        let _ = muxer.finish();
+    });
+    // The feeder: the clip's packets at twice real time.
+    let feeding = clip.clone();
+    let feeder = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(10);
+        let socket = loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Ok(socket) = TcpStream::connect(("127.0.0.1", port)) {
+                break socket;
+            }
+            if Instant::now() > until {
+                return;
+            }
+        };
+        let file = std::fs::File::open(&feeding).expect("open the grey clip");
+        let mut demuxer = Demuxer::open(file).expect("read the clip's NUT headers");
+        let stream = demuxer.stream().clone();
+        let Ok(mut muxer) = Muxer::with_streams(std::io::BufWriter::new(socket), &[stream]) else {
+            return;
+        };
+        let mut buf = Vec::new();
+        while let Ok(Some(packet)) = demuxer.read_packet(&mut buf) {
+            if muxer.write_coded_to(0, &packet, &buf).is_err() || muxer.flush().is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = muxer.finish();
+    });
+    let output = child.wait_with_output().expect("wait for ffrwd-wasm");
+    let _ = (programme.join(), feeder.join());
+    let _ = std::fs::remove_file(&clip);
+    let stderr = stderr_reader.join().expect("read stderr");
+    if no_gpu(&output) {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return;
+    }
+    if let Some(line) = stderr.lines().find(|l| l.starts_with(NO_DEVICE_DECODER)) {
+        eprintln!("SKIPPED: {test}. {line}");
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    assert!(stderr.contains(&decoded_line(device)), "{stderr}");
+    let pictures = read_nut(&output.stdout);
+    assert_eq!(pictures.len() as i64, ticks, "a picture a programme frame");
+    // Which grey each picture shows, or None for the programme's green.
+    let shown: Vec<Option<usize>> = pictures
+        .iter()
+        .map(|(_, p)| {
+            let px = &p[at(0)..at(0) + 4];
+            (px[1] != 200 || px[0] != 0).then(|| {
+                (0..25)
+                    .min_by_key(|&k| (i32::from(greys[k]) - i32::from(px[0])).abs())
+                    .expect("25 greys")
+            })
+        })
+        .collect();
+    let first = shown
+        .iter()
+        .position(Option::is_some)
+        .unwrap_or_else(|| panic!("the feed never showed:\n{stderr}"));
+    // 250 pictures, shown from the first tick on, one a tick.
+    for (tick, grey) in shown.iter().enumerate().skip(first).take(250) {
+        let k = tick - first;
+        assert_eq!(
+            *grey,
+            Some(k % 25),
+            "tick {tick}, {k} into the feed: the grey of picture {k} (mod 25)"
+        );
+    }
+}
+
 // The host's `filter` node: a libavfilter graph on the device, between a
 // decoder and an encoder on it, or over pictures in host memory.
 
