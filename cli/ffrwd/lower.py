@@ -1736,6 +1736,9 @@ class _LateralUse:
 
 # What every feeder connection's destination starts with.
 _FEEDER_PREFIX = feeder_path(0).rpartition(":")[0] + ":"
+# What a feeder's input with a declared shape is probed for, microseconds and
+# bytes: half a second, where ffmpeg's default reads about five of a live feed.
+FEEDER_PROBE = 500000
 
 # How many picks a free feeder port is given before the compile gives up.
 _PORT_TRIES = 20
@@ -7374,6 +7377,16 @@ class _Lowerer:
                 )
         return options
 
+    def _feeds_a_feeder(self, alias: str) -> bool:
+        """Whether a stream of input `alias` is written to a feeder's port: a
+        run-time lateral's instance."""
+        return any(
+            unit.path is not None
+            and unit.path.startswith(_FEEDER_PREFIX)
+            and any(is_src(o.ref) and src_parts(o.ref)[0] == alias for o in unit.outputs)
+            for unit in self.graph.sinks
+        )
+
     def _lower_input_options(self) -> dict[str, dict[str, object]]:
         """Validate every `input('path', name => value, ...)`'s trailing options.
 
@@ -7388,9 +7401,16 @@ class _Lowerer:
             if options:
                 self._check_realtime_option(alias, options, raw_options)
             options = self._check_listening(alias, options, raw_options)
+            declared = "shape" in options
             # The compiler's own options (a declared `shape`) did their work
             # before lowering and are nothing ffmpeg is handed.
             options = rendered_options(options)
+            if declared and self._feeds_a_feeder(alias):
+                # Its shape is known, so ffmpeg's own probe only holds the
+                # feed back: by default it reads about 5 s of a live input
+                # and then sends them at once.
+                for key in ("analyzeduration", "probesize"):
+                    options.setdefault(key, FEEDER_PROBE)
             if options:
                 result[alias] = options
         # An input with no options is still checked: an SRT listener says it
