@@ -43,7 +43,7 @@ use wgpu_core::id::{BindGroupId, BindGroupLayoutId, BufferId, TextureViewId};
 use wgpu_core::id::{PipelineLayoutId, RenderPipelineId, ShaderModuleId};
 use wgpu_types::TextureFormat;
 
-use super::frames::{create_plane, Plane};
+use super::frames::{create_plane, release_plane, Plane};
 use crate::profile::PROFILE;
 
 const SHADER: &str = r#"
@@ -834,7 +834,7 @@ fn render(
         Ok(()) => Ok(planes),
         Err(e) => {
             for plane in &planes {
-                global.texture_drop(plane.texture);
+                release_plane(global, plane.texture);
             }
             Err(e)
         }

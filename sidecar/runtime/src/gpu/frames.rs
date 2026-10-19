@@ -208,7 +208,7 @@ impl GpuFrame {
                 Ok(plane) => plane,
                 Err(e) => {
                     for made in &planes {
-                        global.texture_drop(made.texture);
+                        release_plane(&global, made.texture);
                     }
                     return Err(e);
                 }
@@ -233,7 +233,7 @@ impl GpuFrame {
             planes.push(plane);
             if let Err(e) = written {
                 for made in &planes {
-                    global.texture_drop(made.texture);
+                    release_plane(&global, made.texture);
                 }
                 bail!("uploading a {w}x{h} {format:?} plane: {e}");
             }
@@ -505,6 +505,54 @@ fn read_plane(
     result
 }
 
+/// The size and format of a texture [`create_plane`] made.
+type PlaneKey = (u32, u32, TextureFormat);
+
+/// The textures [`create_plane`] made, and those of them no frame holds,
+/// kept for the next plane of the same size and format. Making and
+/// destroying a texture costs the driver an allocation each time, at every
+/// frame of a conversion or an upload. A texture used again is written
+/// after every use queued before it, since wgpu orders the uses of a
+/// texture on its queue. Only textures made here are kept, so a module's
+/// texture a frame owns is never handed out as a plane.
+#[derive(Default)]
+struct Recycled {
+    made: std::collections::HashMap<TextureId, PlaneKey>,
+    free: std::collections::HashMap<PlaneKey, Vec<TextureId>>,
+}
+
+/// How many free textures of one size and format are kept.
+const KEPT: usize = 4;
+
+fn recycled() -> std::sync::MutexGuard<'static, Recycled> {
+    static RECYCLED: OnceLock<Mutex<Recycled>> = OnceLock::new();
+    RECYCLED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Lets go of `texture`, a plane a frame owned: kept for a later plane
+/// where [`create_plane`] made it and fewer than [`KEPT`] of its kind are
+/// free, dropped otherwise.
+pub(super) fn release_plane(global: &Global, texture: TextureId) {
+    {
+        let mut recycled = recycled();
+        if let Some(key) = recycled.made.get(&texture).copied() {
+            let free = recycled.free.entry(key).or_default();
+            if free.len() < KEPT {
+                free.push(texture);
+                return;
+            }
+            recycled.made.remove(&texture);
+        }
+    }
+    global.texture_drop(texture);
+}
+
+/// A texture for one plane of a frame: a free one of the same size and
+/// format where one is kept ([`release_plane`]), else a new one. Every
+/// caller writes each texel before anything reads it.
 pub(super) fn create_plane(
     global: &Global,
     device: &SharedDevice,
@@ -513,6 +561,18 @@ pub(super) fn create_plane(
     format: TextureFormat,
     bytes_per_pixel: u32,
 ) -> Result<Plane> {
+    let key = (width, height, format);
+    let plane = |texture| Plane {
+        texture,
+        aspect: TextureAspect::All,
+        width,
+        height,
+        format,
+        bytes_per_pixel,
+    };
+    if let Some(texture) = recycled().free.get_mut(&key).and_then(Vec::pop) {
+        return Ok(plane(texture));
+    }
     let desc = wgpu_types::TextureDescriptor {
         label: Some(Cow::Borrowed("ffrwd frame")),
         size: Extent3d {
@@ -532,14 +592,8 @@ pub(super) fn create_plane(
         global.texture_drop(texture);
         bail!("a {width}x{height} {format:?} texture: {e}");
     }
-    Ok(Plane {
-        texture,
-        aspect: TextureAspect::All,
-        width,
-        height,
-        format,
-        bytes_per_pixel,
-    })
+    recycled().made.insert(texture, key);
+    Ok(plane(texture))
 }
 
 /// Copies one plane into `buffer`, waits for it, and appends its rows,
@@ -630,7 +684,7 @@ fn copy_out(
 impl Drop for GpuFrame {
     fn drop(&mut self) {
         for texture in &self.owned {
-            self.global.texture_drop(*texture);
+            release_plane(&self.global, *texture);
         }
         #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         if let Some(wrapped) = self
