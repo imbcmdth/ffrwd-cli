@@ -850,8 +850,12 @@ impl Encode {
         // a Metal one, and NVENC on Linux only where they are on a Vulkan
         // one.
         let reads_d3d12 = Encoder::reads_d3d12(codec);
+        // FFRWD_ENCODE_FEED=host keeps NVENC on Linux but feeds it frames
+        // read back to host memory, as 0.31.0 did, to tell the copy from the
+        // device to CUDA apart from the encoder.
+        let host_feed = std::env::var("FFRWD_ENCODE_FEED").is_ok_and(|v| v == "host");
         let fed_on_device = Encoder::reads_videotoolbox(codec)
-            || (cfg!(target_os = "linux") && Encoder::reads_cuda(codec));
+            || (cfg!(target_os = "linux") && Encoder::reads_cuda(codec) && !host_feed);
         let device = if reads_d3d12 || (fed_on_device && on_gpu) {
             on_gpu.then(encoder_device).flatten()
         } else {

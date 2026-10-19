@@ -1641,6 +1641,14 @@ impl RowOutput {
         }
         let mut bytes = Vec::new();
         write_rows(&mut bytes, rows)?;
+        if trace::on() {
+            for row in rows {
+                trace::line(format_args!(
+                    "rows written: {}",
+                    row.chars().take(160).collect::<String>()
+                ));
+            }
+        }
         self.enqueue(bytes)?;
         Ok(())
     }
@@ -1660,6 +1668,10 @@ impl RowOutput {
                     state.bytes >> 20
                 );
             }
+            trace::line(format_args!(
+                "rows written: the rows output waits, {} bytes queued",
+                state.bytes
+            ));
             state = ready
                 .wait(state)
                 .expect("the rows queue lock is not poisoned");

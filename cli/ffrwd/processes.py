@@ -6671,7 +6671,8 @@ class _Partitioner:
             rows_modules=self._rows_modules(sidecar, members),
             lookahead=sidecar.lookahead + self.encode_delays.get(sidecar.id, 0),
             av=bool(self.decodes.get(sidecar.id) or self.encodes.get(sidecar.id))
-            or any(node.filter in (DEVICE_FILTER, DECODE, ENCODE) for node in nodes.values()),
+            or any(node.filter in (DEVICE_FILTER, DECODE, ENCODE) for node in nodes.values())
+            or self._holds_a_port_feed(members),
             graph=Graph(
                 input_paths=[PIPE] * len(read_order),
                 sources={alias: index for index, alias in enumerate(read_order)},
@@ -6850,6 +6851,22 @@ class _Partitioner:
         if not found:
             return ()
         return tuple(tuple(found.get(alias, {}).items()) for alias in order)
+
+    def _holds_a_port_feed(self, members: Sequence[str]) -> bool:
+        """Whether a node of this region holds an input a port serves: its
+        feeder may send the picture coded (a run-time lateral copies an
+        input's own h264), which the sidecar decodes with libavcodec whatever
+        the output's encoder is."""
+        for name in members:
+            shape = self.node_shapes.get(name)
+            if shape is None:
+                continue
+            node = self.g.nodes[name]
+            for port in shape.inputs:
+                hold = port.pairing.hold
+                if hold is not None and hold.port_param is not None and port.name not in node.ports:
+                    return True
+        return False
 
     def _region_listens(
         self, members: Sequence[str], names: Mapping[str, str]

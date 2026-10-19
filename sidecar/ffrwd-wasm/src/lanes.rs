@@ -443,6 +443,15 @@ impl State {
                     if let Item::Frame(frame) = &item {
                         PROFILE.held.count(frame.data.len());
                     }
+                    if let (Item::Message(m), true) = (&item, crate::trace::on()) {
+                        let text = String::from_utf8_lossy(&m.data);
+                        crate::trace::line(format_args!(
+                            "rows in: {} stream {stream} at {}: {}",
+                            lane.name,
+                            m.pts,
+                            text.chars().take(160).collect::<String>()
+                        ));
+                    }
                     match &mut lane.intake {
                         LaneIntake::Assembled(a) => a.arrive(stream, item)?,
                         LaneIntake::Host { events, .. } => {
@@ -993,6 +1002,21 @@ impl State {
                 }
             }
             rows_out.extend(emitted.rows.into_iter().map(|r| (pts, r)));
+            if crate::trace::on() {
+                for (at, row) in &rows_out {
+                    crate::trace::line(format_args!(
+                        "rows out: {} at {at} (base {}/{}): {}: {}",
+                        lane.name,
+                        tick_base.num,
+                        tick_base.den,
+                        match lane.rows.as_ref() {
+                            Some(rows) => format!("on stream {}", rows.out.stream),
+                            None => "no rows stream; it rides its frame or is dropped".to_string(),
+                        },
+                        row.chars().take(160).collect::<String>()
+                    ));
+                }
+            }
             if let Some(rows) = lane.rows.as_mut() {
                 for (at, row) in rows_out {
                     let at = model::rescale(at, tick_base, rows.out.base);
@@ -1272,6 +1296,7 @@ impl Scheduler {
     /// state. False once the run has stopped.
     fn feed(&self, stream: u32, act: impl FnOnce(&mut State) -> Result<()>) -> bool {
         let mut state = self.shared.lock();
+        let mut traced = false;
         loop {
             if state.error.is_some() || state.finished {
                 return false;
@@ -1281,6 +1306,25 @@ impl Scheduler {
                 .all(|s| state.room(s, &state.consumers(s)));
             if room {
                 break;
+            }
+            if !traced && crate::trace::on() {
+                traced = true;
+                let depths: Vec<String> = state
+                    .consumers(stream)
+                    .iter()
+                    .map(|c| match c {
+                        Consumer::Lane(j) => {
+                            let lane = &state.lanes[*j];
+                            format!("{} queue {}", lane.name, lane.queue.len())
+                        }
+                        Consumer::Writer(w, _) => format!("writer {w} {}", state.writers[*w].len()),
+                    })
+                    .collect();
+                crate::trace::line(format_args!(
+                    "room: stream {stream} waits (cap {}): {}",
+                    state.cap,
+                    depths.join(", ")
+                ));
             }
             state = self
                 .shared

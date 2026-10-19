@@ -2257,6 +2257,20 @@ def test_a_node_runs_on_one_worker_only_where_its_shape_says_it_is_impure(
     assert sidecar.impure == ("matte.wasm",)
 
 
+def test_a_node_holding_an_input_a_port_serves_loads_libav_whatever_the_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A feeder may send its picture coded, as a run-time lateral copies an
+    input's own h264, and the sidecar decodes it with libavcodec: the region
+    is told where libav is with an encoder of ffmpeg's out, as with one of
+    its own. A node holding no port feed is not."""
+    query = "COPY (SELECT {}" + _FROM + " WITH (video_codec 'libx264')"
+    (fed,) = _plan(query.format("inset(f.video[1], port => 9100)"), monkeypatch).sidecars
+    assert fed.av
+    (plain,) = _plan(query.format("dim(f.video[1], spot(f.video[1]))"), monkeypatch).sidecars
+    assert not plain.av
+
+
 # -- a port held on the GPU takes the region's edges coded -------------------
 
 
