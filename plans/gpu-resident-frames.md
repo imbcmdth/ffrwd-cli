@@ -2925,12 +2925,12 @@ probe. The real findings from that work:
 ### What is left
 
 - The 1023-task queue and 0.32.0 falling short of real time (2026-10-19).
-  The pace fix shipped in 0.32.1. The rest is on branch
-  `fix/lane-queue-cap`, unmerged until the lane change is wanted for
-  something: the 1023 queue did not keep 0.31.0 from real time, and the
-  hangs seen while testing the branch were the scheduler's waker being set
-  after its workers started, on main too (`fix/waker-before-workers`).
-  The lane was `listen_audio` in
+  The pace fix shipped in 0.32.1; the waker fix (the scheduler's waker
+  set after its workers started, on main too, the cause of the hangs
+  seen while testing) shipped in 0.32.2; the lane change below, held
+  back at first since the queue did not keep 0.31.0 from real time,
+  went in once the CPU profile showed it was the idle broadcast's
+  cost. The lane was `listen_audio` in
   compose's sidecar. Its clock is the programme's sound, an `asplit` copy
   that rides one input with compose's own `a`, and the module declares
   a window of one sample, so each 1024-sample packet settled 1024 ticks.
@@ -2951,6 +2951,24 @@ probe. The real findings from that work:
   query keeps real time (10.15 against 8.02 on 0.32.0). Left for
   foundmeat: `listen_audio` could declare a window of a packet or more,
   since it reads only the times.
+- The Linux route's CPU was measured on 2026-10-20 (perf, strace, gdb on
+  the box): 1.34 cores idle on 0.32.1, 61% of it the kernel, the four
+  workers making about 30,000 context switches a second each because a
+  node clocked a sample a tick (foundmeat's listener on the programme's
+  sound) was cut one task a sample and every dispatch and completion
+  woke every worker. The host's waits on the device cost under 1%, and
+  CUDA's waits already block (libav sets `CU_CTX_SCHED_BLOCKING_SYNC`
+  itself). The lane change (the cut stops at the cap, ticks taken in
+  turns) brought it to 0.99 and keeping the host's plane textures to
+  0.92, the Windows figure; the node's own window of a packet rather
+  than a sample (foundmeat 0.3.0) brought their idle broadcast to 0.46
+  on 0.32.2 alone. Two further commits, the decoder's copy and the
+  encoder's feed submitted on the device after the picture's semaphore
+  with no host wait (branch `fix/linux-route-cpu`, 91c0689 and
+  6a87172), measured within noise and rest on wgpu-core's submit
+  holding its device fence lock for writing, which is not documented;
+  they stay unmerged until a wgpu release documents that or the saving
+  is worth the dependence.
 - The host waits for the decoder's write before each copy is submitted,
   and the decode thread waits with it. A wait on the queue would need a
   submit with wait semaphores, which wgpu-core does not have; a raw submit
