@@ -16525,12 +16525,16 @@ class _Lowerer:
             and all(_lateral_parts(stream.ref) is not None for stream in value.streams)
         }
         # A lateral's port is bound, to the host's own stream, so the shape
-        # is asked with it; what it binds in the network is nothing.
+        # is asked with it; what it binds in the network is nothing. Its
+        # picture's hint carries the size the lateral's body declares, which
+        # the host conforms the feed to.
         bound = [
             Binding(
                 param.name,
                 tuple(
-                    StreamHint(None if param.name in fed else self._stream_rate(stream.ref))
+                    StreamHint(None, self._lateral_size(stream.ref))
+                    if param.name in fed
+                    else StreamHint(self._stream_rate(stream.ref))
                     for stream in streams[param.name].streams
                 ),
             )
@@ -16694,6 +16698,22 @@ class _Lowerer:
         instance = _NodeInstance(ref=ref, shape=shape)
         self._node_refs[key] = instance
         return instance
+
+    def _lateral_size(self, ref: FrameRef) -> tuple[int, int] | None:
+        """The picture size the body of the run-time lateral making `ref`
+        declares for it, where it declares one."""
+        parts = _lateral_parts(ref)
+        if parts is None:
+            return None
+        key, column = parts
+        return next(
+            (
+                (width, height)
+                for named, width, height in self._laterals[key].declared.sizes
+                if named == column
+            ),
+            None,
+        )
 
     def _stream_rate(self, ref: FrameRef) -> Fraction | None:
         """The rate a node's shape is told the stream `ref` runs at."""

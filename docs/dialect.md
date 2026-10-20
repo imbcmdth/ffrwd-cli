@@ -701,7 +701,13 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     conforms it to). An input's is its probe's; a node's picture runs at
     its clock, a rate clock's own, the rate of the input a `rate-of`
     clock names, or its clock input's over its stride. A feed by port, a
-    self-clocked node's output and data have none. Each call carries the
+    self-clocked node's output and data have none. A lateral's picture
+    whose body reads an input's own first picture with a declared size
+    (`f.video[1] AS video` over `input(url, shape => STRUCT(1920 AS
+    width, 1080 AS height, ...)) f`) carries that width and height, and
+    the sidecar conforms the feed to them; without one, the feed is
+    conformed to the size of the input its port follows, or the clock
+    input's. Each call carries the
     list it was asked with (`-bound <name>=<json>`), which the host asks
     the shape with again, so the shape a node runs with is the one the
     query compiled against. A node at a COPY's TO is asked once for its

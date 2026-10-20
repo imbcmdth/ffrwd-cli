@@ -126,6 +126,7 @@ from .parser import (
     is_annotation_argument,
     kwarg_name,
     parse,
+    subscript_index,
 )
 from .project import (
     RESERVED_NAMESPACES,
@@ -201,6 +202,9 @@ class RuntimeLateral:
     as written. `params` are the values bound per message and `written` the
     ones the call wrote itself, as SQL. `needs` are the script's own
     definitions an instance calls, in the order the script wrote them.
+    `sizes` are the picture sizes the body declares: each video column that
+    is an input's own picture with a ``shape`` naming its width and height,
+    as ``(column, width, height)``.
     """
 
     function: str
@@ -212,6 +216,7 @@ class RuntimeLateral:
     columns: tuple[Parameter, ...]
     written: Mapping[str, str]
     needs: tuple[str, ...]
+    sizes: tuple[tuple[str, int, int], ...] = ()
 
 
 # Names a definition may not claim: the dialect's own FROM item, the two
@@ -3689,6 +3694,72 @@ def _runs_per_message(function: _Function) -> bool:
     )
 
 
+def _declared_sizes(function: _Function) -> tuple[tuple[str, int, int], ...]:
+    """The picture size a run-time lateral's body declares for each video
+    column that is an input's own first picture, ``f.video[1] AS video`` over
+    ``input(url, shape => STRUCT(1920 AS width, 1080 AS height, ...)) f``:
+    ``(column, width, height)``. A column made any other way, or a shape
+    whose size is not written as numbers, has none.
+    """
+    body = function.body
+    items: list[exp.Expr] = []
+    found = body.args.get("from_")
+    if isinstance(found, exp.From):
+        items.append(found.this)
+    items += [join.this for join in body.args.get("joins") or []]
+    shapes: dict[str, tuple[int, int]] = {}
+    for item in items:
+        call = item.this if isinstance(item, exp.Table) else None
+        alias = item.args.get("alias") if isinstance(item, exp.Table) else None
+        if not isinstance(call, exp.Anonymous) or str(call.this).lower() != "input":
+            continue
+        if not isinstance(alias, exp.TableAlias) or alias.this is None:
+            continue
+        for argument in call.expressions:
+            if not isinstance(argument, exp.Kwarg) or kwarg_name(argument) != "shape":
+                continue
+            struct = argument.expression
+            if not isinstance(struct, exp.Struct):
+                continue
+            fields: dict[str, object] = {}
+            for entry in struct.expressions:
+                if isinstance(entry, exp.PropertyEQ) and isinstance(entry.expression, exp.Literal):
+                    literal = entry.expression
+                    fields[str(entry.this.name).lower()] = (
+                        None if literal.is_string else literal.to_py()
+                    )
+            width, height = fields.get("width"), fields.get("height")
+            if (
+                isinstance(width, int)
+                and isinstance(height, int)
+                and not isinstance(width, bool)
+                and not isinstance(height, bool)
+                and width > 0
+                and height > 0
+            ):
+                shapes[_ident_name(alias.this)] = (width, height)
+    sizes: list[tuple[str, int, int]] = []
+    for column in function.columns or ():
+        if column.type != _WASM_STREAM:
+            continue
+        for selected in body.expressions:
+            named = selected.alias_or_name if isinstance(selected, exp.Alias) else None
+            if named != column.name:
+                continue
+            read = selected.this
+            if not (
+                isinstance(read, exp.Bracket)
+                and isinstance(read.this, exp.Column)
+                and read.this.name == "video"
+                and subscript_index(read) == 1
+            ):
+                continue
+            size = shapes.get(read.this.table)
+            if size is not None:
+                sizes.append((column.name, *size))
+    return tuple(sizes)
+
+
 def _check_runs_per_message(function: _Function, anchor: exp.Expr) -> None:
     """A run-time lateral's declaration: the streams a feeder takes out, one
     value per parameter after the data stream, and a body that reads no
@@ -5920,6 +5991,7 @@ class _Expander:
             columns=function.columns or (),
             written=written,
             needs=self._needs(function),
+            sizes=_declared_sizes(function),
         )
         line, col = _pos(item)
         columns: dict[str, exp.Expr] = {}

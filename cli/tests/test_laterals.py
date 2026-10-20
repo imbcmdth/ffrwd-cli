@@ -1010,6 +1010,41 @@ def test_a_port_param_taking_one_or_many_is_handed_a_list_for_two_laterals() -> 
     assert _compose_node(plan).args["port"] == ports
 
 
+_CAM = """CREATE FUNCTION cam(launch data_stream, url text)
+RETURNS TABLE(video video_stream) AS $$
+  SELECT c.video[1] AS video
+  FROM input(url, format => 'mpegts', shape => STRUCT(1920 AS width, 1080 AS height, 60 AS fps)) c
+$$ LANGUAGE sql;"""
+
+
+def test_a_laterals_declared_picture_size_is_its_streams_hint_in_port_order() -> None:
+    """The cam's body reads an input whose shape declares 1920x1080, so its
+    stream's hint carries that size; the ad's body scales to what each
+    message binds, so its hint has none. The hints are in the order of the
+    ports the module is handed, which is how the host pairs them."""
+    query = _TWO_ADS.replace("ARRAY[ad.video, lbar.video]", "ARRAY[m.video, ad.video]").replace(
+        "LATERAL play(prog.d) ad, LATERAL play(prog.d) lbar",
+        "LATERAL cam(prog.d) m, LATERAL play(prog.d) ad",
+    )
+    modules = _compose_modules(_ONE_OR_MANY_PORTS)
+    plan = compile_all(
+        _CAM + "\n" + _declared(query).replace("COPY (", _COMPOSE + "\nCOPY (", 1),
+        describe=lambda path: modules[path],
+        shape=_compose_shape,
+    ).plan
+    assert plan is not None
+    compose = _compose_node(plan)
+    by_function = {lateral.function: lateral.connections[0].port for lateral in plan.laterals}
+    assert compose.args["port"] == [by_function["cam"], by_function["play"]]
+    assert json.loads(compose.bound) == [
+        {"input": "v", "streams": [{"rate": {"num": 25, "den": 1}}]},
+        {
+            "input": "inputs",
+            "streams": [{"rate": None, "width": 1920, "height": 1080}, {"rate": None}],
+        },
+    ]
+
+
 def test_a_port_written_by_hand_stays_one_integer_where_a_list_also_fits() -> None:
     query = """COPY (
   SELECT compose(s.video[1], port => 9100.0) FROM input('leaf.nut') s
