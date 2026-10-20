@@ -21,6 +21,9 @@
 //! paired in lockstep, on the GPU only, where the host resizes it), or fed
 //! on the loopback port `port` names (`w=port`, a hold input). A tick that
 //! has a frame of `w` draws the box on that frame rather than on `v`'s.
+//! `w=own` feeds `w` on the port too, with no `like`: it is told the size
+//! the host conforms its feed to, and `out` takes `w`'s size (`like` `w`).
+//! A tick with no frame of `w` writes a transparent frame of that size.
 
 wit_bindgen::generate!({
     path: ["../../wit", "../../wit-gpu", "wit"],
@@ -48,7 +51,7 @@ use wasi::webgpu::webgpu::{
     GpuTextureDescriptor, GpuTextureFormat, GpuTextureUsage,
 };
 
-const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"out":{"type":"string","enum":["gpu","host"]},"size":{"type":"integer","minimum":1},"w":{"type":"string","enum":["pad","port"]},"port":{"type":"integer"}},"additionalProperties":false}"#;
+const SCHEMA: &str = r#"{"type":"object","properties":{"memory":{"type":"string","enum":["gpu","host"]},"out":{"type":"string","enum":["gpu","host"]},"size":{"type":"integer","minimum":1},"w":{"type":"string","enum":["pad","port","own"]},"port":{"type":"integer"}},"additionalProperties":false}"#;
 
 /// The box's colour, rgba.
 const COLOUR: [u8; 4] = [255, 0, 0, 255];
@@ -118,8 +121,8 @@ fn parse(text: &str) -> Result<Params, String> {
     if params.w.as_deref() == Some("pad") && params.memory != "gpu" {
         return Err("w=pad takes memory=gpu, where the host resizes w".to_string());
     }
-    if params.w.as_deref() == Some("port") && params.port.is_none() {
-        return Err("w=port names the port w is fed on with port".to_string());
+    if matches!(params.w.as_deref(), Some("port" | "own")) && params.port.is_none() {
+        return Err("w=port and w=own name the port w is fed on with port".to_string());
     }
     Ok(params)
 }
@@ -130,6 +133,10 @@ struct State {
     w: Option<u32>,
     width: u32,
     height: u32,
+    /// The output's size: `v`'s, or `w`'s with `w=own`.
+    out: (u32, u32),
+    /// `w=own`: a tick with no frame of `w` writes a transparent frame.
+    own: bool,
     size: u32,
     yuv: bool,
     on_gpu: bool,
@@ -260,7 +267,14 @@ fn draw_on_gpu(
         .ok_or("the device is opened at init")?;
     let handed = planes(id, index)?;
     let source = handed.first().ok_or("an rgba frame has one plane")?;
-    let (width, height) = (state.width, state.height);
+    let (width, height) = state.out;
+    if (source.width(), source.height()) != (width, height) {
+        return Err(format!(
+            "frame {index} of stream {id} is a {}x{} texture, and the output is {width}x{height}",
+            source.width(),
+            source.height()
+        ));
+    }
     let extent = |w: u32, h: u32| GpuExtent3D {
         width: w,
         height: Some(h),
@@ -312,6 +326,32 @@ fn draw_on_gpu(
     emit("out", pts, duration, out)
 }
 
+/// Hands the host a transparent frame on `out`, on the GPU, at `pts`.
+fn blank_on_gpu(state: &State, pts: i64, duration: Option<i64>) -> Result<(), String> {
+    let device = state
+        .device
+        .as_ref()
+        .ok_or("the device is opened at init")?;
+    let (width, height) = state.out;
+    let out = device.create_texture(&GpuTextureDescriptor {
+        size: GpuExtent3D {
+            width,
+            height: Some(height),
+            depth_or_array_layers: None,
+        },
+        mip_level_count: None,
+        sample_count: None,
+        dimension: None,
+        format: GpuTextureFormat::Rgba8unorm,
+        usage: GpuTextureUsage::copy_src()
+            | GpuTextureUsage::copy_dst()
+            | GpuTextureUsage::texture_binding(),
+        view_formats: None,
+        label: None,
+    });
+    emit("out", pts, duration, out)
+}
+
 struct Node;
 
 impl Guest for Node {
@@ -351,11 +391,12 @@ impl Guest for Node {
             },
             schema: None,
         };
+        let own = params.w.as_deref() == Some("own");
         let out = OutputPort {
             name: "out".to_string(),
             kind: PortKind::Video,
             format: Some(OutputFormat::Like(LikeInput {
-                port: "v".to_string(),
+                port: if own { "w" } else { "v" }.to_string(),
                 pixel_format: None,
                 sample_format: None,
             })),
@@ -369,8 +410,8 @@ impl Guest for Node {
             let mut w = inputs[0].clone();
             w.name = "w".to_string();
             w.accepts.pixel_formats = vec!["rgba".to_string()];
-            w.accepts.like = Some("v".to_string());
-            if bound == "port" {
+            w.accepts.like = (!own).then(|| "v".to_string());
+            if bound != "pad" {
                 w.required = false;
                 w.pairing = Pairing::Hold(Hold {
                     anchor: Anchor::FirstFrame,
@@ -408,12 +449,17 @@ impl Guest for Node {
                 "a texture handed back is rgba; a yuv420p input takes out=host".to_string(),
             );
         }
+        let own = params.w.as_deref() == Some("own");
         let w = bound.iter().find(|b| b.port == "w");
+        let mut out = (format.width, format.height);
         if let Some(w) = w {
             let Some(OutputFormat::Video(told)) = &w.format else {
                 return Err("w is video".to_string());
             };
-            if yuv || (told.width, told.height) != (format.width, format.height) {
+            if own {
+                out = (told.width, told.height);
+            }
+            if yuv || (!own && (told.width, told.height) != (format.width, format.height)) {
                 return Err(format!(
                     "w is told {}x{} {}, and follows v's {}x{} rgba",
                     told.width, told.height, told.pix_fmt, format.width, format.height
@@ -438,6 +484,8 @@ impl Guest for Node {
                 w: w.map(|w| w.id),
                 width: format.width,
                 height: format.height,
+                out,
+                own,
                 size: params.size,
                 yuv,
                 on_gpu,
@@ -463,6 +511,22 @@ impl Guest for Node {
                     Some((w, held)) if !held.is_empty() => (w, held[held.len() - 1].index),
                     _ => (state.v, frame.index),
                 };
+                let (width, height) = state.out;
+                if state.own && id == state.v {
+                    if state.out_on_gpu {
+                        blank_on_gpu(state, frame.pts, frame.duration)?;
+                    } else {
+                        items.push(Emission {
+                            port: "out".to_string(),
+                            payload: Payload::Frame(RawFrame {
+                                pts: frame.pts,
+                                duration: frame.duration,
+                                data: vec![0; (width * height * 4) as usize],
+                            }),
+                        });
+                    }
+                    continue;
+                }
                 if state.out_on_gpu {
                     draw_on_gpu(state, frame.pts, frame.duration, id, index)?;
                     continue;
@@ -475,9 +539,17 @@ impl Guest for Node {
                     tick.fetch(id, index)
                 };
                 if state.yuv {
-                    draw_yuv(&mut pixels, state.width, state.height, state.size);
+                    draw_yuv(&mut pixels, width, height, state.size);
                 } else {
-                    draw(&mut pixels, state.width, state.height, state.size);
+                    if pixels.len() != (width * height * 4) as usize {
+                        return Err(format!(
+                            "frame {index} of stream {id} is {} bytes, and an rgba frame of the \
+                             output's {width}x{height} is {}",
+                            pixels.len(),
+                            width * height * 4
+                        ));
+                    }
+                    draw(&mut pixels, width, height, state.size);
                 }
                 items.push(Emission {
                     port: "out".to_string(),

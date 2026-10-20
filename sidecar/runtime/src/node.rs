@@ -96,10 +96,14 @@ impl Interval {
 }
 
 /// What the compiler knows of one stream before the run: the frame rate,
-/// or the sample rate over 1.
+/// or the sample rate over 1; and, for a picture fed on a port, the size
+/// the compile declared for it, which the host conforms the feed to. The
+/// size is the host's alone: a module's `shape` and `init` are handed the
+/// rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct StreamHint {
     pub rate: Option<Rational>,
+    pub size: Option<(u32, u32)>,
 }
 
 /// One input a call binds, as `shape` is told it: one hint per stream, in

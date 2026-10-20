@@ -43,6 +43,11 @@ struct BindingJson {
 struct HintJson {
     #[serde(default)]
     rate: Option<RationalJson>,
+    /// A picture fed on a port: the size the compile declared for it.
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -79,17 +84,31 @@ pub fn parse_bound(text: &str) -> Result<Vec<Binding>> {
             }
             Some(streams) => streams
                 .into_iter()
-                .map(|hint| match hint.rate {
-                    Some(RationalJson { num, den }) if num <= 0 || den <= 0 => bail!(
-                        "--bound gives input '{}' the rate {num}/{den}, which is no rate",
-                        binding.input
-                    ),
-                    rate => Ok(StreamHint {
-                        rate: rate.map(|r| Rational {
-                            num: r.num,
-                            den: r.den,
+                .map(|hint| {
+                    let size = match (hint.width, hint.height) {
+                        (None, None) => None,
+                        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+                        (w, h) => bail!(
+                            "--bound gives input '{}' the size {}x{}; a size is a width and a \
+                             height, both above 0",
+                            binding.input,
+                            w.map_or("?".to_string(), |w| w.to_string()),
+                            h.map_or("?".to_string(), |h| h.to_string())
+                        ),
+                    };
+                    match hint.rate {
+                        Some(RationalJson { num, den }) if num <= 0 || den <= 0 => bail!(
+                            "--bound gives input '{}' the rate {num}/{den}, which is no rate",
+                            binding.input
+                        ),
+                        rate => Ok(StreamHint {
+                            rate: rate.map(|r| Rational {
+                                num: r.num,
+                                den: r.den,
+                            }),
+                            size,
                         }),
-                    }),
+                    }
                 })
                 .collect::<Result<_>>()?,
         };

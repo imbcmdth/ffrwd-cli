@@ -187,6 +187,10 @@ fn shape_takes_the_bound_list_as_json_and_hands_each_streams_rate_to_the_module(
             r#"[{"input":"v","streams":[{"rate":{"num":0,"den":1}}]}]"#,
             "which is no rate",
         ),
+        (
+            r#"[{"input":"v","streams":[{"width":640}]}]"#,
+            "the size 640x?; a size is a width and a height",
+        ),
         (r#"[{"input":"v","nope":1}]"#, "unknown field"),
     ] {
         let run = sidecar(&["--shape", &probe, "--bound", bound]);

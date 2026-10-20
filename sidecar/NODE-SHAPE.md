@@ -35,11 +35,15 @@ rows or data-filter interface is refused.
   stream bound to it, in the order the call names them. `rate` is a video
   stream's frame rate or an audio stream's sample rate over 1, `null` (or
   absent) where nothing settles it before the run; `streams` absent is
-  one stream with no rate. Or the comma list of the names alone, each one
+  one stream with no rate. A stream of an input a port serves may also
+  give `width` and `height`, both or neither, the size its feed is
+  conformed to (`NODE-CLI.md`, "Feeds by port"); the module's `shape` is
+  handed the rate alone. Or the comma list of the names alone, each one
   stream with no rate, a name written again one stream more (`v,v,v`
   binds three to `v`). Absent or empty binds none. A name the shape does
   not declare is refused, and so is an input named twice in the JSON, an
-  empty `streams`, a rate that is not positive and a key not listed here.
+  empty `streams`, a rate that is not positive, a width without a height
+  (or the reverse) or either of them 0, and a key not listed here.
   The run is handed the list each call was asked with as `-bound`
   (`NODE-CLI.md`, "The shape a call was planned with"), and asks the
   shape with it again.
@@ -334,7 +338,10 @@ video. A module of the node world alone, or of an older world, has
 An input held on the GPU that follows another input (`accepts.like`) is
 told that input's size at `init`, and the host resizes its frames on the
 device as they arrive, with a bilinear filter; an input in host memory
-bound to a stream is handed it at the stream's size. A frame reaches a
+bound to a stream is handed it at the stream's size. An input fed on a
+port is told the size `-bound` declares for its feed, else that of the
+input it follows, else the clock input's (`NODE-CLI.md`, "Feeds by
+port"), in either memory, and each feed is conformed to that size. A frame reaches a
 port in the port's format and size whichever way it arrived: put on the
 GPU as it reaches the node, left there by a decoder (`AV-EDGE.md`), or
 fed on a port (`NODE-CLI.md`). Each kind of conversion the host makes on
@@ -361,6 +368,8 @@ frame: its stream, its pts, and its feed's start (`feed-start.at` and
 `v` and `out` on the GPU, `{"memory":"host"}` holds neither, and the two
 write the same bytes. `{"w":"pad"}` adds a second input, `w`, that
 follows `v`, and `{"w":"port","port":N}` feeds it on a port.
+`{"w":"own","port":N}` feeds it on a port with no `like`, and `out` takes
+`w`'s size.
 
 A module that runs a model on its frames includes `ffrwd:gpu/gpu-nn-module`
 instead and asks `ffrwd:gpu/nn.frame-tensor` for a frame as the model's

@@ -1937,6 +1937,164 @@ fn a_feed_held_on_the_gpu_is_conformed_on_the_device() {
     assert!(max <= 1 && mean < 0.05, "{max} apart, mean {mean}");
 }
 
+/// A run's pictures, each with its pts, and its stderr.
+type Written = (Vec<(i64, Vec<u8>)>, String);
+
+/// Runs gpu_box with `w=own` and `memory` over a 16x16 programme, its `w`
+/// fed on a port with `feed`-sized pattern pictures and given the size
+/// `declared` by `-bound`, as the compile gives a lateral's declared shape:
+/// the output's pictures and the run's stderr, or None where `memory` is
+/// gpu and the machine has no adapter.
+fn declared_feed_run(memory: &str, feed: (u32, u32), declared: (u32, u32)) -> Option<Written> {
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
+    let module = module();
+    let clock = 16u32;
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        listener.local_addr().expect("its address").port()
+    };
+    let wiring = format!("[v=0:v]gpu_box=memory={memory}:w=own:port={port}:size=3[out=o]");
+    let bound = format!(
+        r#"gpu_box=[{{"input":"v"}},{{"input":"w","streams":[{{"width":{},"height":{}}}]}}]"#,
+        declared.0, declared.1
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffrwd-wasm"))
+        .args(["-gpu", &module, "-f", "nut", "-i", "-", "-m"])
+        .arg(format!("gpu_box={module}"))
+        .args(["-bound", &bound])
+        .args(["-filter_complex", &wiring, "-map", "[o]", "-f", "nut", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ffrwd-wasm");
+    let (listening, stderr_reader) = watch_for_listening(&mut child);
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let programme = std::thread::spawn(move || {
+        let mut stream = Stream::video("rgba", clock, clock, TIME_BASE).expect("rgba");
+        stream.frame_rate = Some((25, 1));
+        let mut muxer = Muxer::new(&mut stdin, &stream).expect("headers");
+        if muxer.write_frame(0, &green(clock, clock)).is_err() {
+            return;
+        }
+        let _ = muxer.flush();
+        let started = listening
+            .recv_timeout(LISTENING_BOUND)
+            .unwrap_or_else(|_| Instant::now());
+        for k in 1..50i64 {
+            let due = started + Duration::from_millis(40 * k as u64);
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+            if muxer.write_frame(k, &green(clock, clock)).is_err() {
+                return;
+            }
+            let _ = muxer.flush();
+        }
+        let _ = muxer.finish();
+    });
+    let feeder = std::thread::spawn(move || {
+        let sent = pattern(feed.0, feed.1);
+        let until = Instant::now() + Duration::from_secs(10);
+        let socket = loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if let Ok(socket) = TcpStream::connect(("127.0.0.1", port)) {
+                break socket;
+            }
+            if Instant::now() > until {
+                return;
+            }
+        };
+        let mut stream = Stream::video("rgba", feed.0, feed.1, TIME_BASE).expect("rgba");
+        stream.frame_rate = Some((25, 1));
+        let Ok(mut muxer) = Muxer::new(socket, &stream) else {
+            return;
+        };
+        for k in 0..25i64 {
+            if muxer.write_frame(k, &sent).is_err() || muxer.flush().is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let _ = muxer.finish();
+    });
+    let output = child.wait_with_output().expect("wait for ffrwd-wasm");
+    let _ = (programme.join(), feeder.join());
+    let stderr = stderr_reader.join().expect("read stderr");
+    if memory == "gpu" && no_gpu(&output) {
+        eprintln!("skipped: this machine has no GPU adapter");
+        return None;
+    }
+    assert!(
+        output.status.success(),
+        "exited {:?}:\n{stderr}",
+        output.status.code()
+    );
+    Some((read_nut(&output.stdout), stderr))
+}
+
+/// The output's pictures the feed reached, every one at `size`: the rest
+/// are transparent.
+fn fed_pictures(pictures: &[(i64, Vec<u8>)], size: (u32, u32), stderr: &str) -> Vec<Vec<u8>> {
+    assert_eq!(pictures.len(), 50, "a picture a programme frame:\n{stderr}");
+    for (pts, picture) in pictures {
+        assert_eq!(
+            picture.len(),
+            (size.0 * size.1 * 4) as usize,
+            "picture {pts} is the feed's declared size"
+        );
+    }
+    let fed: Vec<Vec<u8>> = pictures
+        .iter()
+        .map(|(_, p)| p.clone())
+        .filter(|p| p.iter().any(|&b| b != 0))
+        .collect();
+    assert!(
+        fed.len() >= 10,
+        "the feed shows on {} pictures of 50:\n{stderr}",
+        fed.len()
+    );
+    fed
+}
+
+#[test]
+fn a_port_feed_is_handed_at_the_size_the_compile_declared_not_the_clocks() {
+    let size = (640u32, 360u32);
+    let mut theirs = pattern(size.0, size.1);
+    for y in 0..3usize {
+        for x in 0..3usize {
+            let at = (y * size.0 as usize + x) * 4;
+            theirs[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
+        }
+    }
+    for memory in ["host", "gpu"] {
+        let Some((pictures, stderr)) = declared_feed_run(memory, size, size) else {
+            continue;
+        };
+        assert!(
+            !stderr.contains("conformed to"),
+            "{memory}: a feed at its declared size is not converted:\n{stderr}"
+        );
+        for ours in fed_pictures(&pictures, size, &stderr) {
+            assert!(
+                ours == theirs,
+                "{memory}: a fed picture is the feed's own, with the box"
+            );
+        }
+    }
+
+    // A feed of another size is scaled to the declared one, not the clock's.
+    let small = (320u32, 180u32);
+    let (pictures, stderr) = declared_feed_run("host", small, size).expect("a host run");
+    let conformed =
+        "feed: gpu_box 'w': the feeder's picture is 320x180 rgba, conformed to 640x360 rgba";
+    assert!(stderr.contains(conformed), "{stderr}");
+    for ours in fed_pictures(&pictures, size, &stderr) {
+        assert!(has_the_box(&ours, size.0 as usize, 3));
+    }
+}
+
 #[test]
 fn a_coded_feed_held_on_the_gpu_is_decoded_on_the_device() {
     use std::net::{TcpListener, TcpStream};

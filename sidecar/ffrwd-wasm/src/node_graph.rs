@@ -1950,7 +1950,9 @@ fn listen_on(
     feeds: &mut Vec<FeedSpec>,
     groups: &mut Vec<(Option<String>, usize)>,
 ) -> Result<()> {
-    let format = conformed(name, shape, input, bound)?;
+    let k = bound.iter().filter(|b| b.port == input.name).count();
+    let hint = hint_of(told, &input.name, k);
+    let format = conformed(name, shape, input, bound, &hint)?;
     let id = defs.len() as u32;
     let micros = TimeBase {
         num: 1,
@@ -1979,13 +1981,7 @@ fn listen_on(
         rendition: RenditionMeta::default(),
         row: None,
     };
-    let k = bound.iter().filter(|b| b.port == input.name).count();
-    bound.push(bound_stream(
-        &input.name,
-        id,
-        &def,
-        hint_of(told, &input.name, k),
-    ));
+    bound.push(bound_stream(&input.name, id, &def, hint));
     let timing = input.accepts.wants == Wants::Timing;
     let member = FeedMember {
         id,
@@ -2121,12 +2117,15 @@ fn port_param(
 
 /// The format a port feed is conformed to: the input it follows (`like`),
 /// or the clock input's where that is the same kind, with the port's own
-/// pixel or sample format where it names one.
+/// pixel or sample format where it names one. A picture whose size the
+/// compile declared (`hint.size`) takes that size instead, and needs a
+/// followed input only for its pixel format where the port names none.
 fn conformed(
     name: &str,
     shape: &NodeShape,
     input: &ffrwd_wasm_runtime::node::InputPort,
     bound: &[BoundStream],
+    hint: &StreamHint,
 ) -> Result<StreamFormat> {
     let followed = input.accepts.like.clone().or_else(|| match &shape.clock {
         Clock::Input(clock) => Some(clock.clone()),
@@ -2137,6 +2136,29 @@ fn conformed(
         .and_then(|port| bound.iter().find(|b| &b.port == port))
         .filter(|b| b.format.kind() == input.kind)
         .map(|b| b.format.clone());
+    if let (PortKind::Video, Some((width, height))) = (input.kind, hint.size) {
+        let followed = match &model {
+            Some(StreamFormat::Video(v)) => Some(v),
+            _ => None,
+        };
+        let pix_fmt = match (input.accepts.pixel_formats.first(), followed) {
+            (Some(first), _) => intern(first, KNOWN_PIX_FMTS, "pixel format")?,
+            (None, Some(v)) => v.pix_fmt,
+            (None, None) => bail!(
+                "{name} input '{}' is held on a port, accepts any pixel format and follows no \
+                 bound video input (accepts.like), so the host cannot say what a feed is \
+                 conformed to",
+                input.name
+            ),
+        };
+        return Ok(StreamFormat::Video(VideoFormat {
+            width,
+            height,
+            pix_fmt,
+            frame_len: crate::frame_len_for(pix_fmt, width, height)?,
+            color: followed.and_then(|v| v.color),
+        }));
+    }
     let Some(model) = model else {
         bail!(
             "{name} input '{}' is held on a port and follows no bound {} input (accepts.like), \
@@ -2976,6 +2998,126 @@ mod tests {
         assert_eq!(
             port_params(r#"{"port":9100}"#, &listed, "port", "n", "v").unwrap(),
             vec![9100]
+        );
+    }
+
+    #[test]
+    fn a_port_feed_takes_its_declared_size_else_its_like_else_the_clocks() {
+        use ffrwd_wasm_runtime::node::{Accepts, Anchor, Hold, InputPort};
+        let video = |width, height, pix_fmt| {
+            StreamFormat::Video(VideoFormat {
+                width,
+                height,
+                pix_fmt,
+                frame_len: crate::frame_len_for(pix_fmt, width, height).unwrap(),
+                color: None,
+            })
+        };
+        let stream = |port: &str, format: StreamFormat| BoundStream {
+            port: port.to_string(),
+            id: 0,
+            info: info_for(&format),
+            time_base: TimeBase { num: 1, den: 25 },
+            format,
+            rendition: RenditionMeta::default(),
+            row: None,
+            decode_delay: 0,
+            latency: None,
+            hint: StreamHint::default(),
+        };
+        let port =
+            |name: &str, pairing: Pairing, pixel_formats: &[&str], like: Option<&str>| InputPort {
+                name: name.to_string(),
+                kind: PortKind::Video,
+                required: false,
+                many: false,
+                pairing,
+                rows: RowsUse::Ignore,
+                window: 1,
+                stride: 1,
+                accepts: Accepts {
+                    pixel_formats: pixel_formats.iter().map(|p| p.to_string()).collect(),
+                    like: like.map(str::to_string),
+                    ..Accepts::default()
+                },
+                schema: None,
+            };
+        let held = Pairing::Hold(Hold {
+            anchor: Anchor::FirstFrame,
+            lead: 0.0,
+            linger: None,
+            timeout: None,
+            group: None,
+            port_param: Some("port".to_string()),
+        });
+        let shape = |clock: Clock, w: InputPort| NodeShape {
+            inputs: vec![
+                port("v", Pairing::Lockstep, &[], None),
+                port("u", Pairing::Lockstep, &[], None),
+                w,
+            ],
+            outputs: Vec::new(),
+            clock,
+            pure: true,
+            one_to_one: true,
+            bounded: true,
+            relation: Vec::new(),
+        };
+        let bound = [
+            stream("v", video(16, 16, "rgba")),
+            stream("u", video(320, 180, "yuv420p")),
+        ];
+        let clocked = || Clock::Input("v".to_string());
+        let declared = StreamHint {
+            rate: None,
+            size: Some((640, 360)),
+        };
+        let none = StreamHint::default();
+        let conform = |clock, w: InputPort, hint: &StreamHint| {
+            let shape = shape(clock, w.clone());
+            conformed("n", &shape, &w, &bound, hint)
+        };
+
+        let w = port("w", held.clone(), &["rgba"], None);
+        assert_eq!(
+            conform(clocked(), w.clone(), &declared).unwrap(),
+            video(640, 360, "rgba"),
+            "the declared size"
+        );
+        assert_eq!(
+            conform(clocked(), w, &none).unwrap(),
+            video(16, 16, "rgba"),
+            "nothing declared: the clock's size"
+        );
+
+        let like = port("w", held.clone(), &["rgba"], Some("u"));
+        assert_eq!(
+            conform(clocked(), like.clone(), &none).unwrap(),
+            video(320, 180, "rgba"),
+            "the size of the input it follows"
+        );
+        assert_eq!(
+            conform(clocked(), like, &declared).unwrap(),
+            video(640, 360, "rgba"),
+            "a declared size wins over like"
+        );
+
+        let any = port("w", held.clone(), &[], None);
+        assert_eq!(
+            conform(clocked(), any.clone(), &declared).unwrap(),
+            video(640, 360, "rgba"),
+            "no pixel format of its own: the clock's"
+        );
+        let rate = || Clock::Rate(Rational { num: 25, den: 1 });
+        assert_eq!(
+            conform(rate(), port("w", held, &["yuv420p"], None), &declared).unwrap(),
+            video(640, 360, "yuv420p"),
+            "a declared size needs no input to follow where the port names a pixel format"
+        );
+        let refused = conform(rate(), any, &declared).expect_err("no pixel format anywhere");
+        assert!(
+            refused.to_string().contains("accepts any pixel format"),
+            "{refused:#}"
         );
     }
 

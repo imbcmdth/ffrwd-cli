@@ -119,6 +119,15 @@ chains takes its `-bound` flags in turn: the k-th given for the name goes
 to the k-th chain calling it. A node source binds nothing and carries
 `[]`.
 
+A stream of an input a port serves may also carry `width` and `height`:
+the picture size the compile declared for that feed, which the host
+conforms the feed to (see "Feeds by port"). The module is not handed
+them. The k-th stream of such an input is the one on the k-th port of its
+param's list, so the compiler writes an input's streams in the order of
+its ports there:
+
+    -bound 'compose=[{"input":"v","streams":[{"rate":{"num":60,"den":1}}]},{"input":"inputs","streams":[{"rate":null,"width":1920,"height":1080}]}]'
+
 The list is checked against the pads, and a refusal names the module and
 the input:
 
@@ -256,9 +265,13 @@ or every output's reader has closed, and a reader closing is a clean end.
 ## Feeds by port
 
 A hold input the call gives a port rather than a stream is bound a stream
-of the host's own at `init`, in the port's format: the size and colour of
-the input it follows (`accepts.like`, or the clock input), in the first
-pixel or sample format the port accepts. The host listens on the port
+of the host's own at `init`, in the port's format. A picture takes the
+size `-bound` gives that stream (`width` and `height`, the size the
+compile declared for the feed), else the size of the input it follows
+(`accepts.like`), else the clock input's; sound takes the rate and layout
+of the input it follows or of the clock input. Either is in the first
+pixel or sample format the port accepts, else that input's, with that
+input's colour where there is one. The host listens on the port
 from the moment the run starts, and whatever connects and writes a NUT of
 video and PCM is the input's source for as long as it stays: its picture
 is conformed to that format on the way in (rgba and yuv420p, at any size;
