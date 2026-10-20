@@ -413,7 +413,9 @@ tick that held them.
   while the source is behind and skipping forward when it catches up, and
   an audio input hands the tick's samples re-cut from what arrived, or
   none while the source is behind. A `first-frame` source is primed until
-  `lead` seconds of it are held, or its end, and scheduled `lead` ahead of
+  `lead` seconds of it are held, or its end, or as much of it as the host
+  holds of a source (600 frames or 96 MiB, which is 12 pictures of 1080p
+  rgba), and scheduled `lead` ahead of
   the clock, on the clock's grid; a `shared-clock` source's first frame
   waits for the clock to reach its pts, and one the clock has passed shows
   at once from where the clock is. A port feed arrives in real time, so a

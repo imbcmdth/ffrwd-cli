@@ -64,6 +64,13 @@ use crate::trace::trace_feed;
 pub const MAX_HELD_FRAMES: usize = 600;
 pub const MAX_HELD_BYTES: usize = 96 << 20;
 
+/// Whether `source` holds as many frames or bytes as it may.
+fn full(source: &Source) -> bool {
+    let held = source.members.iter().map(|m| m.queue.len()).sum::<usize>();
+    let bytes = source.members.iter().map(|m| m.bytes).sum::<usize>();
+    held >= MAX_HELD_FRAMES || bytes >= MAX_HELD_BYTES
+}
+
 /// A step in a source's time, or the clock's, that is backwards or further
 /// forward than this is a discontinuity.
 pub const MAX_STEP_SECONDS: f64 = 1.0;
@@ -573,11 +580,10 @@ impl Group {
         let Some(source) = self.sources.back() else {
             return MAX_HELD_FRAMES;
         };
-        let held = source.members.iter().map(|m| m.queue.len()).sum::<usize>();
-        let bytes = source.members.iter().map(|m| m.bytes).sum::<usize>();
-        if held >= MAX_HELD_FRAMES || bytes >= MAX_HELD_BYTES {
+        if full(source) {
             return 0;
         }
+        let held = source.members.iter().map(|m| m.queue.len()).sum::<usize>();
         let waiting = match (&self.feed, self.now) {
             (Some(feed), Some((now, _))) => now < feed.at,
             (None, Some((now, clock_base))) => {
@@ -618,13 +624,15 @@ impl Group {
     }
 
     /// Whether a `first-frame` source holds `lead` seconds of frames, or
-    /// has ended with some.
+    /// has ended with some, or holds all it may: a buffer full short of
+    /// `lead` (large pictures at a high rate) would otherwise wait for
+    /// frames it has no room to take.
     fn primed(&self, source: &Source) -> bool {
         let lead = &source.members[source.lead];
         let (Some(first), Some(last)) = (lead.queue.front(), lead.queue.back()) else {
             return false;
         };
-        if source.closed {
+        if source.closed || full(source) {
             return true;
         }
         last.pts.saturating_sub(first.pts) >= ticks_of(self.hold.lead, lead.base)
@@ -1556,6 +1564,42 @@ mod tests {
         );
         let handed = g.tick(111, Some(112), THIRTIETHS, &grid, true);
         assert_eq!(mark(&handed[0]), Some(11));
+    }
+
+    #[test]
+    fn a_first_frame_port_feed_whose_buffer_fills_short_of_lead_still_comes_up() {
+        let (mut g, lines) = group(
+            hold(Anchor::FirstFrame, 0.3, None, None),
+            vec![video_member(1, MILLIS)],
+            true,
+        );
+        let grid = Grid::exact();
+        // Four pictures fill the buffer, 50 ms of a lead of 300.
+        let picture = Arc::new(vec![7u8; MAX_HELD_BYTES / 4 + 1]);
+        let big = |pts: i64| TickFrame {
+            pts,
+            duration: None,
+            data: Arc::clone(&picture).into(),
+            rows: Vec::new(),
+        };
+        for pts in [0, 16, 33] {
+            g.arrive(0, big(pts));
+        }
+        let handed = g.tick(100, Some(101), THIRTIETHS, &grid, true);
+        assert!(handed[0].feed.is_none(), "room left: still priming");
+        g.arrive(0, big(50));
+        assert_eq!(g.room(), 0, "the buffer is full");
+        let handed = g.tick(101, Some(102), THIRTIETHS, &grid, true);
+        let feed = handed[0]
+            .feed
+            .clone()
+            .expect("a full buffer starts the feed");
+        assert_eq!(feed.start.first_pts, 0);
+        assert!(
+            lines.lock().unwrap()[0].contains("comes up"),
+            "{:?}",
+            lines.lock().unwrap()
+        );
     }
 
     #[test]
