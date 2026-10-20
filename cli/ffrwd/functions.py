@@ -202,9 +202,8 @@ class RuntimeLateral:
     as written. `params` are the values bound per message and `written` the
     ones the call wrote itself, as SQL. `needs` are the script's own
     definitions an instance calls, in the order the script wrote them.
-    `sizes` are the picture sizes the body declares: each video column that
-    is an input's own picture with a ``shape`` naming its width and height,
-    as ``(column, width, height)``.
+    `sizes` are the picture sizes the body makes, where the compile can tell
+    them, as ``(column, width, height)`` (:func:`_declared_sizes`).
     """
 
     function: str
@@ -3694,14 +3693,46 @@ def _runs_per_message(function: _Function) -> bool:
     )
 
 
-def _declared_sizes(function: _Function) -> tuple[tuple[str, int, int], ...]:
-    """The picture size a run-time lateral's body declares for each video
-    column that is an input's own first picture, ``f.video[1] AS video`` over
-    ``input(url, shape => STRUCT(1920 AS width, 1080 AS height, ...)) f``:
-    ``(column, width, height)``. A column made any other way, or a shape
-    whose size is not written as numbers, has none.
+# Filters a lateral's picture may pass through with its size kept, as the
+# compile reads a body for the size its picture leaves at.
+_SIZE_KEEPING = frozenset({"fps", "setpts", "settb", "format", "null", "copy", "fifo"})
+
+
+def _declared_sizes(
+    function: _Function, written: Mapping[str, str]
+) -> tuple[tuple[str, int, int], ...]:
+    """The picture size a run-time lateral's body makes for each video
+    column, where the compile can tell it: ``(column, width, height)``.
+
+    The column is an input's first picture, ``f.video[1]``, whose
+    ``input(..., shape => STRUCT(... AS width, ... AS height, ...))`` gives
+    its size, passed through filters that keep the size (``fps``,
+    ``setpts``, ``format``), or a ``scale`` of it to a width and a height.
+    A value is a number, or a parameter: what the call wrote, else its
+    ``DEFAULT``. A column made any other way has none.
     """
     body = function.body
+    params = {param.name: param for param in function.params}
+
+    def number(node: exp.Expr | None) -> int | None:
+        if isinstance(node, exp.Paren):
+            node = node.this
+        if isinstance(node, exp.Literal) and not node.is_string:
+            value = node.to_py()
+            return value if isinstance(value, int) and value > 0 else None
+        if isinstance(node, exp.Column) and not node.table:
+            name = node.name
+            if name in written:
+                try:
+                    found = float(written[name])
+                except ValueError:
+                    return None
+                return int(found) if found.is_integer() and found > 0 else None
+            param = params.get(name)
+            if param is not None and param.default is not None:
+                return number(param.default)
+        return None
+
     items: list[exp.Expr] = []
     found = body.args.get("from_")
     if isinstance(found, exp.From):
@@ -3721,42 +3752,49 @@ def _declared_sizes(function: _Function) -> tuple[tuple[str, int, int], ...]:
             struct = argument.expression
             if not isinstance(struct, exp.Struct):
                 continue
-            fields: dict[str, object] = {}
-            for entry in struct.expressions:
-                if isinstance(entry, exp.PropertyEQ) and isinstance(entry.expression, exp.Literal):
-                    literal = entry.expression
-                    fields[str(entry.this.name).lower()] = (
-                        None if literal.is_string else literal.to_py()
-                    )
-            width, height = fields.get("width"), fields.get("height")
-            if (
-                isinstance(width, int)
-                and isinstance(height, int)
-                and not isinstance(width, bool)
-                and not isinstance(height, bool)
-                and width > 0
-                and height > 0
-            ):
+            fields = {
+                str(entry.this.name).lower(): entry.expression
+                for entry in struct.expressions
+                if isinstance(entry, exp.PropertyEQ) and isinstance(entry.expression, exp.Expr)
+            }
+            width, height = number(fields.get("width")), number(fields.get("height"))
+            if width is not None and height is not None:
                 shapes[_ident_name(alias.this)] = (width, height)
+
+    def size(node: exp.Expr) -> tuple[int, int] | None:
+        if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
+            node = node.expression
+        if isinstance(node, exp.Bracket):
+            read = node.this
+            if isinstance(read, exp.Column) and read.name == "video" and subscript_index(node) == 1:
+                return shapes.get(read.table)
+            return None
+        if not isinstance(node, exp.Anonymous) or not node.expressions:
+            return None
+        name = str(node.this).lower()
+        source, *rest = node.expressions
+        if name in _SIZE_KEEPING:
+            return size(source)
+        if name != "scale":
+            return None
+        named = {kwarg_name(arg): arg.expression for arg in rest if isinstance(arg, exp.Kwarg)}
+        if set(named) - {"w", "h", "width", "height"}:
+            return None
+        positional = [arg for arg in rest if not isinstance(arg, exp.Kwarg)]
+        width = positional[0] if positional else named.get("w", named.get("width"))
+        height = positional[1] if len(positional) > 1 else named.get("h", named.get("height"))
+        scaled = number(width), number(height)
+        return (scaled[0], scaled[1]) if scaled[0] and scaled[1] else None
+
     sizes: list[tuple[str, int, int]] = []
     for column in function.columns or ():
         if column.type != _WASM_STREAM:
             continue
         for selected in body.expressions:
-            named = selected.alias_or_name if isinstance(selected, exp.Alias) else None
-            if named != column.name:
-                continue
-            read = selected.this
-            if not (
-                isinstance(read, exp.Bracket)
-                and isinstance(read.this, exp.Column)
-                and read.this.name == "video"
-                and subscript_index(read) == 1
-            ):
-                continue
-            size = shapes.get(read.this.table)
-            if size is not None:
-                sizes.append((column.name, *size))
+            if isinstance(selected, exp.Alias) and selected.alias_or_name == column.name:
+                made = size(selected.this)
+                if made is not None:
+                    sizes.append((column.name, *made))
     return tuple(sizes)
 
 
@@ -5991,7 +6029,7 @@ class _Expander:
             columns=function.columns or (),
             written=written,
             needs=self._needs(function),
-            sizes=_declared_sizes(function),
+            sizes=_declared_sizes(function, written),
         )
         line, col = _pos(item)
         columns: dict[str, exp.Expr] = {}

@@ -73,14 +73,14 @@ from.
   of one ends with an upload. Only 8-bit and 10-bit 4:2:0 pictures, and
   8-bit 4:4:4 HEVC on CUDA, stay on the card; 4:2:2, 10-bit 4:4:4 and an
   input whose pixel format the probe does not report run on the CPU.
-- **A lateral's picture size is known only where its body declares it.**
-  A node input fed on a port by a run-time lateral is conformed to the
-  size the lateral's body declares (`f.video[1]` of an `input(...)` whose
-  `shape` gives `width` and `height`). A body that reads a probed file, or
-  scales its picture, declares none, and its feed is conformed to the size
-  of the input the port follows, or the clock input's, which for a small
-  clock is a blur. Declare the `shape` in the body to keep the picture's
-  own size.
+- **A lateral's picture size is known only where its body says it.** A
+  node input fed on a port by a run-time lateral is conformed to the size
+  the lateral's body makes: its input's declared `shape`, or a `scale` to
+  numbers or to parameters with a value the call writes or a `DEFAULT`.
+  A body that reads a probed file, scales to a value each message binds
+  with no `DEFAULT`, or passes its picture through other filters says
+  none, and its feed is conformed to the size of the input the port
+  follows, or the clock input's, which for a small clock is a blur.
 - **The sidecar has no device filters on macOS.** Its bundled
   libavfilter carries none for VideoToolbox, so a filter between two
   modules holding their pictures on the GPU runs in ffmpeg there, and the

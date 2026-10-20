@@ -702,12 +702,16 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     its clock, a rate clock's own, the rate of the input a `rate-of`
     clock names, or its clock input's over its stride. A feed by port, a
     self-clocked node's output and data have none. A lateral's picture
-    whose body reads an input's own first picture with a declared size
-    (`f.video[1] AS video` over `input(url, shape => STRUCT(1920 AS
-    width, 1080 AS height, ...)) f`) carries that width and height, and
-    the sidecar conforms the feed to them; without one, the feed is
-    conformed to the size of the input its port follows, or the clock
-    input's. Each call carries the
+    carries the width and height its body makes, where the compile can
+    tell them, and the sidecar conforms the feed to them: an input's own
+    first picture whose `shape` gives its size (`f.video[1] AS video`
+    over `input(url, shape => STRUCT(1920 AS width, 1080 AS height,
+    ...)) f`), through `fps`, `setpts` or `format`, or a `scale` of it to
+    a width and a height, each a number or a parameter the call writes or
+    gives a `DEFAULT` (`fps(scale(f.video[1], width, height), rate)`). A
+    message binding another size has its picture conformed to that one.
+    Without a size, the feed is conformed to the size of the input its
+    port follows, or the clock input's. Each call carries the
     list it was asked with (`-bound <name>=<json>`), which the host asks
     the shape with again, so the shape a node runs with is the one the
     query compiled against. A node at a COPY's TO is asked once for its

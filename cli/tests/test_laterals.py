@@ -1045,6 +1045,60 @@ def test_a_laterals_declared_picture_size_is_its_streams_hint_in_port_order() ->
     ]
 
 
+# foundmeat's feeds: the main feed's picture and sound as they come, a
+# cam's scaled to the size its parameters give, its sound beside it.
+_FEEDS = """CREATE FUNCTION main_feed(launch data_stream, url text)
+RETURNS TABLE(video video_stream, audio audio_stream) AS $$
+  SELECT f.video[1] AS video, f.audio[1] AS audio
+  FROM input(url, format => 'mpegts', shape => STRUCT(1920 AS width, 1080 AS height,
+             60 AS fps, 'h264' AS video_codec, 48000 AS rate, 2 AS channels)) f
+$$ LANGUAGE sql;
+CREATE FUNCTION cam_feed(launch data_stream, url text,
+                         width number DEFAULT 800, height number DEFAULT 450,
+                         rate number DEFAULT 30)
+RETURNS TABLE(video video_stream, audio audio_stream) AS $$
+  SELECT fps(scale(f.video[1], width, height), rate) AS video, f.audio[1] AS audio
+  FROM input(url, format => 'mpegts', shape => STRUCT(width AS width, height AS height,
+             rate AS fps, 'h264' AS video_codec, 48000 AS rate, 2 AS channels)) f
+$$ LANGUAGE sql;"""
+_THREE_FEEDS = """COPY (
+  WITH prog AS (SELECT s.video[1] AS v, s.data[1] AS d FROM input('leaf.nut') s)
+  SELECT compose(prog.v, ARRAY[m.video, c1.video, c2.video],
+                 audio => ARRAY[m.audio, c1.audio, c2.audio])
+  FROM prog, LATERAL main_feed(prog.d) m, LATERAL cam_feed(prog.d) c1,
+       LATERAL cam_feed(prog.d, width => 640, height => 360) c2
+) TO 'out.nut'"""
+
+
+def test_a_lateral_that_scales_is_hinted_the_size_it_scales_to_beside_its_sound() -> None:
+    """Each feed brings its picture and its sound on one connection. The
+    main feed's picture is hinted the size its shape declares; a cam's, the
+    size its body scales to: its parameters' defaults, or what the call
+    wrote. The sound of each is hinted nothing."""
+    modules = _compose_modules({"type": "array", "items": {"type": "integer"}})
+    plan = compile_all(
+        _FEEDS + "\n" + _COMPOSE_AUDIO + "\n" + _THREE_FEEDS,
+        describe=lambda path: modules[path],
+        shape=_compose_audio_shape,
+    ).plan
+    assert plan is not None
+    compose = _compose_node(plan)
+    ports = [lateral.connections[0].port for lateral in plan.laterals]
+    assert compose.args["port"] == ports
+    unknown = {"rate": None}
+    assert json.loads(compose.bound)[1:] == [
+        {
+            "input": "inputs",
+            "streams": [
+                {"rate": None, "width": 1920, "height": 1080},
+                {"rate": None, "width": 800, "height": 450},
+                {"rate": None, "width": 640, "height": 360},
+            ],
+        },
+        {"input": "audio", "streams": [unknown, unknown, unknown]},
+    ]
+
+
 def test_a_port_written_by_hand_stays_one_integer_where_a_list_also_fits() -> None:
     query = """COPY (
   SELECT compose(s.video[1], port => 9100.0) FROM input('leaf.nut') s
