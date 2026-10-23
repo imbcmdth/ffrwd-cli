@@ -29,6 +29,8 @@ use wasmtime::component::{Component, Linker};
 
 pub mod adapters;
 #[cfg(feature = "gpu")]
+mod commands;
+#[cfg(feature = "gpu")]
 mod convert;
 #[cfg(all(feature = "gpu", windows))]
 pub mod d3d12;

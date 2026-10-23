@@ -37,6 +37,7 @@ use wgpu_core::id::TextureId;
 use wgpu_hal::api::Metal;
 use wgpu_types::{Extent3d, TextureAspect, TextureFormat};
 
+use super::commands::Commands;
 use super::frames::{GpuFrame, Layout, Plane, Target, Yuv};
 use super::{shared, shared_device};
 use crate::av::{self, DeviceFrame};
@@ -374,14 +375,8 @@ impl EncoderFeed {
                 targets.push(texture);
                 kept.push(cv);
             }
-            let (encoder, err) = global.device_create_command_encoder(
-                device.device,
-                &wgpu_types::CommandEncoderDescriptor { label: None },
-                None,
-            );
-            if let Some(e) = err {
-                bail!("a command encoder for the copy: {e}");
-            }
+            let commands = Commands::open(global, device, "the copy")?;
+            let encoder = commands.encoder();
             for ((plane, ..), target) in specs.iter().zip(&targets) {
                 global
                     .command_encoder_copy_texture_to_texture(
@@ -406,17 +401,7 @@ impl EncoderFeed {
                     )
                     .map_err(|e| anyhow!("copying a plane into the encoder's picture: {e}"))?;
             }
-            let (commands, err) = global.command_encoder_finish(
-                encoder,
-                &wgpu_types::CommandBufferDescriptor { label: None },
-                None,
-            );
-            if let Some((_, e)) = err {
-                bail!("finishing the copy's commands: {e}");
-            }
-            let index = global
-                .queue_submit(*device.queue, &[commands])
-                .map_err(|(_, e)| anyhow!("submitting the copy: {e}"))?;
+            let index = commands.submit(*device.queue)?;
             global
                 .device_poll(
                     device.device,

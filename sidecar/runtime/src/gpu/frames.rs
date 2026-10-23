@@ -44,6 +44,7 @@ use wgpu_core::global::Global;
 use wgpu_core::id::TextureId;
 use wgpu_types::{Extent3d, TextureAspect, TextureFormat};
 
+use super::commands::Commands;
 use super::convert;
 #[cfg(windows)]
 use super::d3d12 as platform;
@@ -607,14 +608,8 @@ fn copy_out(
     bytes_per_row: u32,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let (encoder, err) = global.device_create_command_encoder(
-        device.device,
-        &wgpu_types::CommandEncoderDescriptor { label: None },
-        None,
-    );
-    if let Some(e) = err {
-        bail!("a command encoder for a readback: {e}");
-    }
+    let commands = Commands::open(global, device, "a readback")?;
+    let encoder = commands.encoder();
     global
         .command_encoder_copy_texture_to_buffer(
             encoder,
@@ -635,17 +630,7 @@ fn copy_out(
             &plane.size(),
         )
         .map_err(|e| anyhow!("copying a plane out: {e}"))?;
-    let (commands, err) = global.command_encoder_finish(
-        encoder,
-        &wgpu_types::CommandBufferDescriptor { label: None },
-        None,
-    );
-    if let Some((_, e)) = err {
-        bail!("finishing a readback's commands: {e}");
-    }
-    global
-        .queue_submit(*device.queue, &[commands])
-        .map_err(|(_, e)| anyhow!("submitting a readback: {e}"))?;
+    commands.submit(*device.queue)?;
 
     let (sender, receiver) = mpsc::channel();
     let op = wgpu_core::resource::BufferMapOperation {

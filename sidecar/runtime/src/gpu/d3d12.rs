@@ -46,6 +46,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Direct3D12::ID3D12Fence as SyncObject;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use super::commands::Commands;
 use super::frames::{GpuFrame, Layout, Plane, Target, Yuv};
 use super::{shared, shared_device};
 use crate::av::{self, DeviceFrame};
@@ -412,14 +413,8 @@ impl Wrapped {
             kept,
         } = self;
         let result = (move || -> Result<()> {
-            let (encoder, err) = global.device_create_command_encoder(
-                device.device,
-                &wgpu_types::CommandEncoderDescriptor { label: None },
-                None,
-            );
-            if let Some(e) = err {
-                bail!("{e}");
-            }
+            let commands = Commands::open(global, device, "returning the picture")?;
+            let encoder = commands.encoder();
             global
                 .command_encoder_transition_resources(
                     encoder,
@@ -431,17 +426,7 @@ impl Wrapped {
                     }),
                 )
                 .map_err(|e| anyhow!("{e}"))?;
-            let (commands, err) = global.command_encoder_finish(
-                encoder,
-                &wgpu_types::CommandBufferDescriptor { label: None },
-                None,
-            );
-            if let Some((_, e)) = err {
-                bail!("{e}");
-            }
-            global
-                .queue_submit(*device.queue, &[commands])
-                .map_err(|(_, e)| anyhow!("{e}"))?;
+            commands.submit(*device.queue)?;
             let raw = picture
                 .d3d12()
                 .ok_or_else(|| anyhow!("not a D3D12 picture"))?;
@@ -1059,14 +1044,8 @@ impl FilterFeed {
 /// already submitted that uses them, for D3D12 commands of the host's own
 /// to read next.
 fn hand_over(global: &Global, device: &SharedDevice, textures: &[TextureId]) -> Result<()> {
-    let (encoder, err) = global.device_create_command_encoder(
-        device.device,
-        &wgpu_types::CommandEncoderDescriptor { label: None },
-        None,
-    );
-    if let Some(e) = err {
-        bail!("a command encoder for the copy: {e}");
-    }
+    let commands = Commands::open(global, device, "the copy")?;
+    let encoder = commands.encoder();
     global
         .command_encoder_transition_resources(
             encoder,
@@ -1080,17 +1059,7 @@ fn hand_over(global: &Global, device: &SharedDevice, textures: &[TextureId]) -> 
                 }),
         )
         .map_err(|e| anyhow!("{e}"))?;
-    let (commands, err) = global.command_encoder_finish(
-        encoder,
-        &wgpu_types::CommandBufferDescriptor { label: None },
-        None,
-    );
-    if let Some((_, e)) = err {
-        bail!("{e}");
-    }
-    global
-        .queue_submit(*device.queue, &[commands])
-        .map_err(|(_, e)| anyhow!("{e}"))?;
+    commands.submit(*device.queue)?;
     Ok(())
 }
 

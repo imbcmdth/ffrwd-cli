@@ -43,6 +43,7 @@ use wgpu_core::id::{BindGroupId, BindGroupLayoutId, BufferId, TextureViewId};
 use wgpu_core::id::{PipelineLayoutId, RenderPipelineId, ShaderModuleId};
 use wgpu_types::TextureFormat;
 
+use super::commands::Commands;
 use super::frames::{create_plane, release_plane, Plane};
 use crate::profile::PROFILE;
 
@@ -762,14 +763,8 @@ fn render(
             recorded.push((pipeline, group));
         }
 
-        let (encoder, err) = global.device_create_command_encoder(
-            device.device,
-            &wgpu_types::CommandEncoderDescriptor { label: None },
-            None,
-        );
-        if let Some(e) = err {
-            bail!("a command encoder for {what}: {e}");
-        }
+        let commands = Commands::open(global, device, what)?;
+        let encoder = commands.encoder();
         for (pass, (pipeline, group)) in passes.iter().zip(recorded) {
             let attachments = pass
                 .targets
@@ -811,17 +806,7 @@ fn render(
                 .render_pass_end(&mut rpass)
                 .map_err(|e| anyhow!("ending {what}: {e}"))?;
         }
-        let (commands, err) = global.command_encoder_finish(
-            encoder,
-            &wgpu_types::CommandBufferDescriptor { label: None },
-            None,
-        );
-        if let Some((_, e)) = err {
-            bail!("finishing {what}: {e}");
-        }
-        global
-            .queue_submit(*device.queue, &[commands])
-            .map_err(|(_, e)| anyhow!("submitting {what}: {e}"))?;
+        commands.submit(*device.queue)?;
         Ok(())
     })();
     for group in groups {

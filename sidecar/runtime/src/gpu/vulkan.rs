@@ -62,6 +62,7 @@ use wgpu_core::id::{AdapterId, DeviceId, QueueId, TextureId};
 use wgpu_hal::api::Vulkan;
 use wgpu_types::{Extent3d, TextureAspect, TextureFormat};
 
+use super::commands::Commands;
 use super::frames::{GpuFrame, Layout, Plane, Target, Yuv};
 use super::{shared, shared_device};
 use crate::av::{self, DeviceFrame};
@@ -607,37 +608,6 @@ fn host_wait(device: &ash::Device, semaphore: vk::Semaphore, value: u64) -> Resu
     unsafe { device.wait_semaphores(&info, u64::MAX) }.context("waiting on a picture's semaphore")
 }
 
-/// A command encoder of the device, for commands of the host's own.
-fn command_encoder(
-    global: &Global,
-    device: &SharedDevice,
-) -> Result<wgpu_core::id::CommandEncoderId> {
-    let (encoder, err) = global.device_create_command_encoder(
-        device.device,
-        &wgpu_types::CommandEncoderDescriptor { label: None },
-        None,
-    );
-    if let Some(e) = err {
-        bail!("a command encoder: {e}");
-    }
-    Ok(encoder)
-}
-
-fn finish(
-    global: &Global,
-    encoder: wgpu_core::id::CommandEncoderId,
-) -> Result<wgpu_core::id::CommandBufferId> {
-    let (commands, err) = global.command_encoder_finish(
-        encoder,
-        &wgpu_types::CommandBufferDescriptor { label: None },
-        None,
-    );
-    if let Some((_, e)) = err {
-        bail!("finishing commands: {e}");
-    }
-    Ok(commands)
-}
-
 /// The raw image of a texture of the device.
 fn raw_image(global: &Global, texture: TextureId) -> Result<vk::Image> {
     // SAFETY: the texture is alive while the caller holds it; the handle is
@@ -917,10 +887,10 @@ fn copy_picture(
     host_wait(&opened.device, semaphore, image.value)?;
 
     // The targets in the layout the copy writes, by wgpu.
-    let first = command_encoder(global, device)?;
+    let mut first = Commands::open(global, device, "the copy's transition")?;
     global
         .command_encoder_transition_resources(
-            first,
+            first.encoder(),
             std::iter::empty(),
             [y.texture, uv.texture]
                 .into_iter()
@@ -931,15 +901,16 @@ fn copy_picture(
                 }),
         )
         .map_err(|e| anyhow!("{e}"))?;
-    let first = finish(global, first)?;
+    first.finish()?;
 
     let (y_image, uv_image) = (
         raw_image(global, y.texture)?,
         raw_image(global, uv.texture)?,
     );
-    let second = command_encoder(global, device)?;
+    let second = Commands::open(global, device, "the copy")?;
+    let recording = second.encoder();
     let recorded = unsafe {
-        global.command_encoder_as_hal_mut::<Vulkan, _, _>(second, |encoder| -> Result<()> {
+        global.command_encoder_as_hal_mut::<Vulkan, _, _>(recording, |encoder| -> Result<()> {
             let encoder = encoder.ok_or_else(|| anyhow!("the command encoder is not open"))?;
             let commands = encoder.raw_handle();
             let barrier = [vk::ImageMemoryBarrier2::default()
@@ -1003,15 +974,8 @@ fn copy_picture(
             Ok(())
         })
     };
-    if let Err(e) = recorded {
-        global.command_encoder_drop(second);
-        global.command_buffer_drop(first);
-        return Err(e);
-    }
-    let second = finish(global, second)?;
-    let submission = global
-        .queue_submit(*device.queue, &[first, second])
-        .map_err(|(_, e)| anyhow!("submitting the copy: {e}"))?;
+    recorded?;
+    let submission = Commands::submit_all(*device.queue, vec![first, second])?;
     let next = image.value + 1;
     lock.used(
         0,
@@ -1089,11 +1053,11 @@ impl EncoderFeed {
             for (image, plane) in images.iter().zip([y, uv]) {
                 targets.push(wrap_target(global, device, image.image, plane)?);
             }
-            let encoder = command_encoder(global, device)?;
+            let commands = Commands::open(global, device, "the copy")?;
             for (plane, target) in [y, uv].iter().zip(&targets) {
                 global
                     .command_encoder_copy_texture_to_texture(
-                        encoder,
+                        commands.encoder(),
                         &wgpu_types::TexelCopyTextureInfo {
                             texture: plane.texture,
                             mip_level: 0,
@@ -1114,10 +1078,7 @@ impl EncoderFeed {
                     )
                     .map_err(|e| anyhow!("copying a plane into the encoder's picture: {e}"))?;
             }
-            let commands = finish(global, encoder)?;
-            global
-                .queue_submit(*device.queue, &[commands])
-                .map_err(|(_, e)| anyhow!("submitting the copy: {e}"))
+            commands.submit(*device.queue)
         })();
         for texture in targets {
             global.texture_drop(texture);

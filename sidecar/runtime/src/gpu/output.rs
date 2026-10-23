@@ -18,6 +18,7 @@ use wgpu_core::global::Global;
 use wgpu_core::id::{BindGroupId, BindGroupLayoutId, BufferId, ComputePipelineId, TextureId};
 use wgpu_types::{BufferUsages, Extent3d, TextureFormat, TextureUsages};
 
+use super::commands::Commands;
 use super::tensor::{pooled_buffer, read_buffer, PooledBuffer};
 use super::{shared, shared_device};
 use crate::profile::PROFILE;
@@ -321,14 +322,8 @@ impl OutputTexture {
             .as_ref()
             .ok_or_else(|| anyhow!("the output has no buffer to copy from"))?;
         let pipes = pipeline(global, device)?;
-        let (encoder, err) = global.device_create_command_encoder(
-            device.device,
-            &wgpu_types::CommandEncoderDescriptor { label: None },
-            None,
-        );
-        if let Some(e) = err {
-            bail!("a command encoder for the output pass: {e}");
-        }
+        let commands = Commands::open(global, device, "the output pass")?;
+        let encoder = commands.encoder();
         let (mut pass, err) = global.command_encoder_begin_compute_pass(
             encoder,
             &wgpu_core::command::ComputePassDescriptor {
@@ -356,17 +351,7 @@ impl OutputTexture {
         global
             .compute_pass_end(&mut pass)
             .map_err(|e| anyhow!("ending the output pass: {e}"))?;
-        let (commands, err) = global.command_encoder_finish(
-            encoder,
-            &wgpu_types::CommandBufferDescriptor { label: None },
-            None,
-        );
-        if let Some((_, e)) = err {
-            bail!("finishing the output pass: {e}");
-        }
-        global
-            .queue_submit(*device.queue, &[commands])
-            .map_err(|(_, e)| anyhow!("submitting the output pass: {e}"))?;
+        commands.submit(*device.queue)?;
         Ok(())
     }
 

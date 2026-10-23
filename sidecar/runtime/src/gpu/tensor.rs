@@ -47,6 +47,7 @@ use wgpu_core::global::Global;
 use wgpu_core::id::{BindGroupLayoutId, BufferId, ComputePipelineId, TextureViewId};
 use wgpu_types::BufferUsages;
 
+use super::commands::Commands;
 use super::convert::{Matrix, Yuv};
 use super::frames::Plane;
 use crate::profile::PROFILE;
@@ -1200,14 +1201,8 @@ pub(super) fn make(
         if let Some(e) = err {
             bail!("the pass's bind group: {e}");
         }
-        let (encoder, err) = global.device_create_command_encoder(
-            device.device,
-            &wgpu_types::CommandEncoderDescriptor { label: None },
-            None,
-        );
-        if let Some(e) = err {
-            bail!("a command encoder for the pass: {e}");
-        }
+        let commands = Commands::open(global, device, "the pass")?;
+        let encoder = commands.encoder();
         let (mut pass, err) = global.command_encoder_begin_compute_pass(
             encoder,
             &wgpu_core::command::ComputePassDescriptor {
@@ -1235,17 +1230,7 @@ pub(super) fn make(
         global
             .compute_pass_end(&mut pass)
             .map_err(|e| anyhow!("ending the pass: {e}"))?;
-        let (commands, err) = global.command_encoder_finish(
-            encoder,
-            &wgpu_types::CommandBufferDescriptor { label: None },
-            None,
-        );
-        if let Some((_, e)) = err {
-            bail!("finishing the pass: {e}");
-        }
-        global
-            .queue_submit(*device.queue, &[commands])
-            .map_err(|(_, e)| anyhow!("submitting the pass: {e}"))?;
+        commands.submit(*device.queue)?;
         Ok(())
     })();
     if let Some(group) = group {
@@ -1299,14 +1284,8 @@ pub fn join(parts: &[Arc<DeviceTensor>], shared: bool) -> Result<DeviceTensor> {
     let (global, device) = (&first.global, &first.device);
     let len: u64 = parts.iter().map(|p| p.byte_len()).sum();
     let buffer = pool(shared).take(global, device, len, shared)?;
-    let (encoder, err) = global.device_create_command_encoder(
-        device.device,
-        &wgpu_types::CommandEncoderDescriptor { label: None },
-        None,
-    );
-    if let Some(e) = err {
-        bail!("a command encoder for a join: {e}");
-    }
+    let commands = Commands::open(global, device, "a join")?;
+    let encoder = commands.encoder();
     let mut at = 0;
     for part in parts {
         global
@@ -1321,17 +1300,7 @@ pub fn join(parts: &[Arc<DeviceTensor>], shared: bool) -> Result<DeviceTensor> {
             .map_err(|e| anyhow!("copying a part of a join: {e}"))?;
         at += part.byte_len();
     }
-    let (commands, err) = global.command_encoder_finish(
-        encoder,
-        &wgpu_types::CommandBufferDescriptor { label: None },
-        None,
-    );
-    if let Some((_, e)) = err {
-        bail!("finishing a join's commands: {e}");
-    }
-    global
-        .queue_submit(*device.queue, &[commands])
-        .map_err(|(_, e)| anyhow!("submitting a join: {e}"))?;
+    commands.submit(*device.queue)?;
     #[cfg(windows)]
     let written_at = if shared {
         Some(super::d3d12::SharedSync::get()?.signal(global, device)?)
@@ -1372,28 +1341,12 @@ pub(crate) fn read_buffer(
         if let Some(e) = err {
             bail!("a {len}-byte readback buffer: {e}");
         }
-        let (encoder, err) = global.device_create_command_encoder(
-            device.device,
-            &wgpu_types::CommandEncoderDescriptor { label: None },
-            None,
-        );
-        if let Some(e) = err {
-            bail!("a command encoder for a readback: {e}");
-        }
+        let commands = Commands::open(global, device, "a readback")?;
+        let encoder = commands.encoder();
         global
             .command_encoder_copy_buffer_to_buffer(encoder, buffer, 0, staging, 0, Some(len))
             .map_err(|e| anyhow!("copying a tensor out: {e}"))?;
-        let (commands, err) = global.command_encoder_finish(
-            encoder,
-            &wgpu_types::CommandBufferDescriptor { label: None },
-            None,
-        );
-        if let Some((_, e)) = err {
-            bail!("finishing a readback's commands: {e}");
-        }
-        global
-            .queue_submit(*device.queue, &[commands])
-            .map_err(|(_, e)| anyhow!("submitting a readback: {e}"))?;
+        commands.submit(*device.queue)?;
         let (sender, receiver) = mpsc::channel();
         let op = wgpu_core::resource::BufferMapOperation {
             host: wgpu_core::device::HostMap::Read,
