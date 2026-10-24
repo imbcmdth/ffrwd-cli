@@ -420,15 +420,18 @@ tick that held them.
   waits for the clock to reach its pts, and one the clock has passed shows
   at once from where the clock is. A port feed arrives in real time, so a
   `first-frame` port feed that comes up while the node is not keeping up
-  with its clock (an input clock whose ticks over the last quarter second
-  were not cut at its own pace, as when its source queued while the run
-  started and is being caught up on) is fixed for the time being only.
+  with its clock (an input clock read for less than three seconds, or
+  whose ticks over the last three seconds were not cut at its own pace
+  to within 0.05 s, as when its source queued while the run started and
+  is being caught up on, even at 5% faster than real time) is fixed for
+  the time being only.
   Fixed for good then, it would be early by however far behind the clock
   was, and once the clock had caught up its sound would be asked for
   before it arrived, and be silent, and its pictures shown late. On the
-  first tick the clock is kept up with, the feed moves later, once, by as
-  many whole ticks as lay its newest frame `lead` ahead of that tick, and
-  by no more than the clock gained on the wall since it was fixed. The
+  first tick the clock is kept up with, the feed moves later, once, by
+  what the clock gained on the wall since the feed was fixed, to the
+  nearest tick of the clock's grid, so it keeps the whole margin its
+  feeder sent ahead; a gain of 0.05 s or less moves nothing. The
   picture and the sound move together, so they stay in sync: the picture
   repeats and the sound is silent for that long, once, near the feed's
   start, and the line `the feed is laid ... later` (a `later` row) says by

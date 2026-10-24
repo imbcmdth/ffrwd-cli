@@ -960,14 +960,15 @@ fn a_feed_that_comes_up_while_the_programme_is_behind_is_laid_later_once_and_its
     // started; the feeder connects a second in, while the programme is
     // half a second behind, at lead 0.1s. Fixed then and never again,
     // every tick once the programme has caught up asks for sound that
-    // arrives later, and the feed's sound is silent.
+    // arrives later, and the feed's sound is silent. The host moves it once
+    // the programme has kept pace with the wall for a span, three seconds.
     let _serial = serial();
-    let mut program = Program::new(30, 7.0);
+    let mut program = Program::new(30, 10.0);
     program.slow_start = Some((1.2, 0.5));
     let chain = switch_chain("lead=0.1");
     let (mut run, port) = start("behind", &program, "1", &["shape_switch"], &chain);
     wait_for_port(&mut run, port);
-    let fed = feed(port, Feeder::new(25, 4.0), Duration::from_secs(1));
+    let fed = feed(port, Feeder::new(25, 7.0), Duration::from_secs(1));
     let out = finish(run);
     fed.join().expect("the feeder");
 
@@ -977,17 +978,36 @@ fn a_feed_that_comes_up_while_the_programme_is_behind_is_laid_later_once_and_its
         .filter(|l| l.contains("the feed is laid"))
         .collect();
     assert_eq!(later.len(), 1, "laid later once:\n{}", out.stderr);
+    // "the feed is laid {by}s later at {when}s: ..."
+    let number = |after: &str| -> f64 {
+        let rest = later[0].split(after).nth(1).expect("the line names it");
+        rest.split('s')
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("seconds")
+    };
+    let (by, when) = (number(" laid "), number(" later at "));
+    assert!(
+        (0.4..0.7).contains(&by),
+        "laid later by what the programme was behind when the feed came up: {}",
+        later[0]
+    );
     let (at, _, _) = first_start(&out);
     let insertions = out.insertions();
     assert_eq!(insertions.len(), 1, "{insertions:?}\n{}", out.stderr);
     let (_, last) = insertions[0];
-    // A second in, well past the move, to half a second before the end:
-    // every sample is the feeder's own, one after another, and the
+    // From a few ticks past the move's repeat to half a second before the
+    // end: every sample is the feeder's own, one after another, and the
     // picture each tick shows is the one its sound is from, to within a
     // frame of the feeder's.
-    let from = at + 30;
+    let from = ((when + by) * 30.0).ceil() as i64 + 3;
     let to = last - 15;
-    assert!(to > from + 30, "the feed showed from {at} to {last}");
+    assert!(
+        to > from + 30,
+        "the feed showed from {at} to {last}, moved at {when}s"
+    );
     for tick in from..=to {
         let first = out.sample(tick * 1600);
         assert!(
