@@ -1313,7 +1313,8 @@ def _sidecar_writes(
     own order, which is its catalog order, a packet filter's pads in the same
     order it reads them, and then its rows documents. Everything else hands
     its frames on over one output: its stdout where the edge chains, named
-    here only where it does not, the pipe the relay serves."""
+    here only where it does not, the pipe the relay serves. A destination the
+    process writes itself takes its own slot among the streams."""
     several = (
         process.packet_source
         or process.packet_filter
@@ -1324,6 +1325,12 @@ def _sidecar_writes(
         streams = [write[edge] for edge in outgoing]
     else:
         streams = [write[edge] for edge in outgoing if write[edge] != STDOUT]
+    placed = dict(process.destinations)
+    piped = iter(streams)
+    streams = [
+        placed[slot] if slot in placed else next(piped)
+        for slot in range(len(streams) + len(placed))
+    ]
     return streams + _rows_writes(process, plan, write)
 
 

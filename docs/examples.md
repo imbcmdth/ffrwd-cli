@@ -2183,3 +2183,44 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex '[0:v:0]split=1[out1]' -map
   'colour_probe=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},'\
 '{"input":"seen","streams":[{"rate":null}]}]' -map '[out0]' -f ndjson colours.ndjson
 ```
+
+## 172. Send a module's NUT straight to a TCP address
+
+A `tcp://` or `udp://` destination with `format 'nut'` is written by the sidecar itself when every stream going there leaves one module region as it is. The sidecar dials the address and writes the NUT it would otherwise hand an ffmpeg, and no ffmpeg runs for that destination. Both of `matte`'s outputs ride the one NUT, in the order the SELECT names them:
+
+```pgsql
+CREATE FUNCTION matte(v video_stream, every number DEFAULT 30)
+RETURNS STRUCT(mask video_stream,
+               spots STRUCT(start_t number, id number,
+                            x number, y number, w number, h number)[])
+  AS '../sidecar/modules/target/wasm32-wasip2/release/matte.wasm', 'matte'
+  LANGUAGE wasm;
+
+CREATE FUNCTION dim(v video_stream, boxes STRUCT(x number, y number, w number, h number)[],
+                    amount number DEFAULT 0.5)
+RETURNS video_stream
+  AS '../sidecar/modules/target/wasm32-wasip2/release/dim.wasm', 'dim'
+  LANGUAGE wasm;
+
+COPY (
+  WITH m AS (SELECT f.video[1] AS v, (matte(f.video[1])).*
+             FROM input('tests/fixtures/testsrc.mp4') f)
+  SELECT dim(m.v, m.spots), m.mask
+  FROM m
+) TO 'tcp://127.0.0.1:9000' WITH (format 'nut')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut \
+  pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"color": [{"range": "pc", "primaries": "unknown", "trc": "unknown",'\
+' "space": "gbr"}]}' -m matte=../sidecar/modules/target/wasm32-wasip2/release/matte.wasm \
+  -m dim=../sidecar/modules/target/wasm32-wasip2/release/dim.wasm -filter_complex \
+  '[v=0:v]matte=every=30[mask=out1][spots=n11];[v=0:v][boxes=n11]dim=amount=0.5[v=out0]' \
+  -bound 'matte=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -bound \
+  'dim=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"boxes",'\
+'"streams":[{"rate":null}]}]' -map '[out0]' -map '[out1]' -f nut tcp://127.0.0.1:9000
+```
+
+The sidecar writes the destination itself only when an ffmpeg would have nothing to do there. An encoder, a filter, a trim, a container other than nut, a muxer option, or a URL option the sidecar does not take (`tcp://...?listen=1`) puts an ffmpeg in front of the destination to write it. `udp://` takes `pkt_size`, as ffmpeg's udp protocol does, and sends each write as datagrams of at most that many bytes, 1472 when the URL names none. The sidecar flushes each batch as it writes it, and a peer that closes the connection ends the output, the same as a reader closing a pipe.

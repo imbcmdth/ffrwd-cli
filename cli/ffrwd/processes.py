@@ -112,6 +112,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import Literal
+from urllib.parse import parse_qsl, urlsplit
 
 from .av import DECODABLE, ENCODE_OPTIONS, HOSTED_ENCODERS, encoded_colour
 from .errors import ErrorCode, FfrwdError
@@ -231,6 +232,18 @@ _CODED_CLOCK: tuple[tuple[str, object], ...] = (
     ("avoid_negative_ts", "disabled"),
     ("output_ts_offset", CODED_CLOCK_OFFSET),
 )
+
+# The URL schemes a sidecar writes NUT to itself, and the options each takes
+# in the URL's query, in ffmpeg's spelling.
+_SIDECAR_SCHEMES: dict[str, frozenset[str]] = {
+    "tcp": frozenset(),
+    "udp": frozenset({"pkt_size"}),
+}
+# The largest payload one UDP datagram over IPv4 carries.
+_UDP_PKT_MAX = 65507
+# The codec options a destination the sidecar writes may name, each as copy:
+# the sidecar writes every stream as it left the region.
+_DIRECT_CODECS = ("video_codec", "audio_codec", "subtitle_codec")
 
 # ffprobe reports no pixel format, so the wire format is one the compiler
 # picks and the producing ffmpeg is told to write.
@@ -1374,6 +1387,10 @@ class SidecarProcess:
     # told of its stream, by its node: its colorimetry in the flags' names,
     # and the pixel format its pictures are made in (`pix_fmt`).
     call_codecs: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = ()
+    # The destinations this region writes itself, each by its slot among the
+    # region's stream outputs: a tcp:// or udp:// NUT an ffmpeg would only
+    # have copied the region's streams into. Every other slot is a pipe.
+    destinations: tuple[tuple[int, str], ...] = ()
 
     @property
     def nodes(self) -> tuple[str, ...]:
@@ -1479,6 +1496,8 @@ class SidecarProcess:
             }
         if self.call_codecs:
             written["call_codecs"] = {name: dict(color) for name, color in self.call_codecs}
+        if self.destinations:
+            written["destinations"] = [[slot, path] for slot, path in self.destinations]
         if self.network and self.graph is not None:
             written["graph"] = self.graph.to_dict()
         return written
@@ -1564,6 +1583,11 @@ class SidecarProcess:
                 (str(name), tuple((str(k), str(v)) for k, v in color.items()))
                 for name, color in _read_object(d, "call_codecs").items()
                 if isinstance(color, dict)
+            ),
+            destinations=tuple(
+                (one[0], str(one[1]))
+                for one in _read_list(d, "destinations")
+                if isinstance(one, list) and len(one) == 2 and isinstance(one[0], int)
             ),
         )
 
@@ -1946,6 +1970,172 @@ def _codec_of(graph: Graph, members: Sequence[str]) -> str:
     if any(name in graph.decoders for name in members):
         return "decode"
     return ""
+
+
+def sidecar_writes_url(path: str) -> bool:
+    """True when the sidecar writes `path` itself: ``tcp://host:port``, which
+    it dials, or ``udp://host:port`` with at most a ``pkt_size`` of 1 to
+    65507 bytes. Anything else, a listening ``tcp://`` among them, is
+    ffmpeg's to write."""
+    try:
+        parts = urlsplit(path)
+        port = parts.port
+    except ValueError:
+        return False
+    allowed = _SIDECAR_SCHEMES.get(parts.scheme)
+    if allowed is None or not parts.hostname or port is None:
+        return False
+    if parts.username or parts.password or parts.fragment or parts.path not in ("", "/"):
+        return False
+    for name, value in parse_qsl(parts.query, keep_blank_values=True):
+        if name not in allowed or not value.isdigit():
+            return False
+        if not 1 <= int(value) <= _UDP_PKT_MAX:
+            return False
+    return True
+
+
+def _written_directly(unit: SinkUnit) -> bool:
+    """True when `unit` is a NUT the sidecar may write itself: a URL it
+    writes, and nothing for an ffmpeg to do on the way there."""
+    if unit.path is None or not sidecar_writes_url(unit.path):
+        return False
+    if unit.window is not None or unit.tags or unit.attachments:
+        return False
+    if unit.chapters is not None or unit.metadata is not None:
+        return False
+    if any(output.metadata or output.disposition is not None for output in unit.outputs):
+        return False
+    for name, value in unit.options.items():
+        if name == "format":
+            if str(value).lower() != NUT:
+                return False
+        elif name not in _DIRECT_CODECS or value != COPY_CODEC:
+            return False
+    return "format" in unit.options
+
+
+def _plain_wire(wire: StreamFormat) -> bool:
+    """True when `wire` is a stream an ffmpeg copies onward as it is: NUT, no
+    encoder options, at its own size."""
+    if wire.container != NUT:
+        return False
+    if isinstance(wire, VideoFormat):
+        return not wire.options and wire.geometry is None
+    if isinstance(wire, AudioFormat):
+        return not wire.options
+    return True
+
+
+def _direct_write(
+    plan: ProcessPlan,
+    process: FfmpegProcess,
+    keeps_clock: Callable[[StreamEdge, ProcessPlan], bool],
+) -> tuple[str, int, str] | None:
+    """The sidecar, its output slot and the URL, where `process` only copies
+    one NUT a sidecar writes into a destination that sidecar may write
+    itself; None where the ffmpeg has anything to do.
+
+    The ffmpeg reads one pipe and nothing else, filters nothing, trims
+    nothing and writes the pipe's streams, in their order, to the one
+    destination. Its stream copy keeps the clock as it came, which is what
+    its ``-copyts`` says, and nothing else in the plan is joined to it.
+    """
+    graph = process.graph
+    if graph.nodes or graph.input_trims or graph.input_options:
+        return None
+    if len(graph.sinks) != 1 or not _written_directly(graph.sinks[0]):
+        return None
+    if graph.input_paths != [PIPE] or len(graph.sources) != 1:
+        return None
+    incoming = [edge for edge in plan.stream_edges if edge.target == process.id]
+    if not incoming or len({pipe_key(edge) for edge in incoming}) != 1:
+        return None
+    if any(edge.source == process.id for edge in plan.stream_edges):
+        return None
+    if any(
+        process.id in (edge.source, edge.target)
+        for edge in plan.edges
+        if not isinstance(edge, StreamEdge)
+    ):
+        return None
+    if any(lateral.writer == process.id for lateral in plan.laterals):
+        return None
+    writer = plan.process(incoming[0].source)
+    if not isinstance(writer, SidecarProcess):
+        return None
+    if writer.sink or writer.packet_sink or writer.packet_filter or writer.data_filter:
+        return None
+    if any(
+        edge.annotations or not _plain_wire(edge.format) or not keeps_clock(edge, plan)
+        for edge in incoming
+    ):
+        return None
+    alias = next(iter(graph.sources))
+    counted: dict[str, int] = {}
+    carried: list[FrameRef] = []
+    for edge in incoming:
+        marker = _marker(edge.format)
+        carried.append(f"src:{alias}:{marker}:{counted.get(marker, 0)}")
+        counted[marker] = counted.get(marker, 0) + 1
+    if [output.ref for output in graph.sinks[0].outputs] != carried:
+        return None
+    pipes = once_per_pipe([edge for edge in plan.stream_edges if edge.source == writer.id])
+    slot = [pipe_key(edge) for edge in pipes].index(pipe_key(incoming[0]))
+    path = graph.sinks[0].path
+    assert path is not None  # what `_written_directly` checked
+    return writer.id, slot, path
+
+
+def written_by_sidecars(plan: ProcessPlan) -> ProcessPlan:
+    """`plan` with each ffmpeg that only copies a sidecar's NUT into a
+    ``tcp://`` or ``udp://`` destination taken out, the sidecar writing that
+    destination itself (:func:`_direct_write`). Every other process and edge
+    is as it was."""
+    from .execute import keeps_clock  # execute builds on this module
+
+    taken: dict[str, list[tuple[int, str]]] = {}
+    dropped: set[str] = set()
+    for copier in plan.ffmpeg:
+        found = _direct_write(plan, copier, keeps_clock)
+        if found is None:
+            continue
+        writer, slot, path = found
+        taken.setdefault(writer, []).append((slot, path))
+        dropped.add(copier.id)
+    if not dropped:
+        return plan
+    processes: list[Process] = []
+    for process in plan.processes:
+        if process.id in dropped:
+            continue
+        if isinstance(process, SidecarProcess) and process.id in taken:
+            process = _with_destinations(process, taken[process.id])
+        processes.append(process)
+    return replace(
+        plan,
+        processes=tuple(processes),
+        edges=tuple(
+            edge
+            for edge in plan.edges
+            if not (isinstance(edge, StreamEdge) and edge.target in dropped)
+        ),
+    )
+
+
+def _with_destinations(
+    sidecar: SidecarProcess, found: Sequence[tuple[int, str]]
+) -> SidecarProcess:
+    """`sidecar` writing each URL in `found` at its slot: its graph's sink
+    there names the URL rather than a pipe."""
+    graph = sidecar.graph
+    if graph is not None:
+        sinks = list(graph.sinks)
+        for slot, path in found:
+            if slot < len(sinks) and sinks[slot].path == PIPE:
+                sinks[slot] = replace(sinks[slot], path=path)
+        graph = replace(graph, sinks=sinks)
+    return replace(sidecar, graph=graph, destinations=tuple(sorted(found)))
 
 
 def encoded(wire: StreamFormat) -> bool:
@@ -4864,13 +5054,15 @@ class _Partitioner:
         self._order_data_outputs()
         processes: list[Process] = [self._materialize(p) for p in self.pending]
         processes.extend(self._materialize_region(sidecar) for sidecar in self.sidecars)
-        return ProcessPlan(
-            processes=tuple(processes),
-            edges=(*self.edges, *self.rows, *self.documents, *self._feeder_edges()),
-            laterals=tuple(
-                replace(lateral, writer=self._tap_writer(lateral))
-                for lateral in self.g.laterals
-            ),
+        return written_by_sidecars(
+            ProcessPlan(
+                processes=tuple(processes),
+                edges=(*self.edges, *self.rows, *self.documents, *self._feeder_edges()),
+                laterals=tuple(
+                    replace(lateral, writer=self._tap_writer(lateral))
+                    for lateral in self.g.laterals
+                ),
+            )
         )
 
     def _tap_writer(self, lateral: Lateral) -> str:

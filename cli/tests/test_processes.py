@@ -3113,3 +3113,155 @@ def test_a_filtered_picture_beside_a_coded_one_stays_raw_with_its_colour() -> No
     assert written[written.index("-output_ts_offset") + 1] == str(CODED_CLOCK_OFFSET)
     network = sidecar[sidecar.index("-filter_complex") + 1]
     assert network.startswith("[0:v]decode=format=rgba[decode0];[v=decode0][over=0:v:1]compose")
+
+
+# ---------------------------------------------------------------- network destinations
+
+
+def test_the_urls_a_sidecar_writes_itself() -> None:
+    """ffmpeg's own spelling: a host and a port, and for udp a pkt_size."""
+    cases = {
+        "tcp://127.0.0.1:9000": True,
+        "tcp://[::1]:9000/": True,
+        "udp://127.0.0.1:9000": True,
+        "udp://127.0.0.1:9000?pkt_size=500": True,
+        "tcp://127.0.0.1:9000?listen=1": False,
+        "tcp://127.0.0.1:9000?pkt_size=500": False,
+        "udp://127.0.0.1:9000?ttl=4": False,
+        "udp://127.0.0.1:9000?pkt_size=0": False,
+        "udp://127.0.0.1:9000?pkt_size=65508": False,
+        "tcp://127.0.0.1": False,
+        "tcp://127.0.0.1:9000/feed": False,
+        "srt://127.0.0.1:9000": False,
+        "file:out.nut": False,
+        "out.nut": False,
+    }
+    assert {url: processes.sidecar_writes_url(url) for url in cases} == cases
+
+
+_TCP = "tcp://127.0.0.1:9000"
+_NUT = {"format": "nut"}
+
+
+def _region_into(path: str, options: dict[str, object], *, filtered: bool = False) -> Graph:
+    """One external node's picture, through a `hue` where `filtered`, into
+    one destination."""
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    g.nodes["e0"] = Node(
+        id="e0", filter="denoise", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    last = "e0"
+    if filtered:
+        g.nodes["n0"] = Node(
+            id="n0", filter="hue", args={"h": 30}, inputs=["e0"], outputs=["video"]
+        )
+        last = "n0"
+    g.sinks = [SinkUnit(outputs=[_out(last)], path=path, options=dict(options))]
+    return g
+
+
+def _sidecar_argv(plan: ProcessPlan) -> list[str]:
+    return plan_argv(plan, sidecar_argv=wasm.shown_argv)[plan.sidecars[0].id]
+
+
+def test_a_region_writes_a_tcp_destination_itself() -> None:
+    """The ffmpeg that would only copy the region's NUT onto the URL is gone:
+    the sidecar writes the URL where it wrote its stdout."""
+    plan = partition(_region_into(_TCP, _NUT), external=external_ids("e0"))
+    (feeder,) = plan.ffmpeg
+    assert [(e.source, e.target) for e in plan.stream_edges] == [(feeder.id, "sidecar0")]
+    assert plan.sidecars[0].destinations == ((0, _TCP),)
+    assert _sidecar_argv(plan)[-3:] == ["-f", NUT, _TCP]
+
+
+_PICTURE_AND_SOUND: dict[str, object] = {
+    "inputs": [_port("v", "lockstep", "rgba")],
+    "outputs": [
+        {"name": "v", "kind": "video", "latency": 0},
+        {"name": "s", "kind": "audio", "latency": 0},
+    ],
+    "clock": {"kind": "input", "port": "v"},
+    "pure": True,
+    "one_to_one": True,
+    "bounded": True,
+    "relation": [],
+}
+
+
+def test_a_node_region_writes_its_picture_and_sound_as_one_nut_to_a_url() -> None:
+    """Both of a node's outputs to one destination ride one NUT, in the
+    SELECT's order, and the plan keeps that through its JSON."""
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    g.nodes["c0"] = Node(
+        id="c0",
+        filter="voice",
+        args={},
+        inputs=["src:a:v:0"],
+        outputs=["video", "audio"],
+        ports=["v"],
+        out_ports=["v", "s"],
+    )
+    g.node_shapes["c0"] = _PICTURE_AND_SOUND
+    url = "udp://127.0.0.1:9000?pkt_size=1316"
+    g.sinks = [
+        SinkUnit(outputs=[_out("c0:0"), _out("c0:1", "audio")], path=url, options=dict(_NUT))
+    ]
+    plan = partition(g, external=external_ids("c0"))
+    assert [e.target for e in plan.stream_edges] == ["sidecar0"]
+    argv = _sidecar_argv(plan)
+    tail = argv[argv.index("-map") :]
+    assert tail[:2] == ["-map", "[out0]"] and tail[2:4] == ["-map", "[out1]"]
+    assert tail[4:] == ["-f", NUT, url]
+    assert _sidecar_argv(ProcessPlan.from_dict(plan.to_dict())) == argv
+
+
+def test_a_source_track_goes_to_a_url_from_the_source_itself() -> None:
+    g = Graph(input_paths=[], sources={})
+    g.module_sources["s"] = _module_source()
+    g.sinks = [SinkUnit(outputs=[_out("src:s:a:0", "audio")], path=_TCP, options=dict(_NUT))]
+    plan = partition(g)
+    assert plan.ffmpeg == () and plan.stream_edges == ()
+    assert _sidecar_argv(plan)[-5:] == ["-track", "1", "-f", NUT, _TCP]
+
+
+def _two_tracks_into(path: str, options: dict[str, object]) -> Graph:
+    g = _source_sink_graph()
+    g.sinks[0].path, g.sinks[0].options = path, dict(options)
+    return g
+
+
+@pytest.mark.parametrize(
+    ("graph", "external"),
+    [
+        (_region_into(_TCP, {**_NUT, "video_codec": "libx264"}), ("e0",)),
+        (_region_into(_TCP, {"format": "mpegts"}), ("e0",)),
+        (_region_into(_TCP, {}), ("e0",)),
+        (_region_into(_TCP, {**_NUT, "frames": 10}), ("e0",)),
+        (_region_into("file:out.nut", _NUT), ("e0",)),
+        (_region_into("out.nut", _NUT), ("e0",)),
+        (_region_into(f"{_TCP}?listen=1", _NUT), ("e0",)),
+        (_region_into(_TCP, _NUT, filtered=True), ("e0",)),
+        (_two_tracks_into(_TCP, _NUT), ()),
+    ],
+    ids=[
+        "an-encoder",
+        "another-container",
+        "no-container",
+        "a-muxer-option",
+        "a-file-url",
+        "a-file",
+        "a-listening-url",
+        "an-ffmpeg-filter",
+        "two-pipes-into-one-nut",
+    ],
+)
+def test_an_ffmpeg_writes_the_destination_when_it_has_work_there(
+    graph: Graph, external: tuple[str, ...]
+) -> None:
+    """The destination keeps its ffmpeg, which reads what the sidecar wrote
+    and writes the destination, exactly as without a URL to write."""
+    path = graph.sinks[0].path
+    plan = partition(graph, external=external_ids(*external))
+    assert all(not sidecar.destinations for sidecar in plan.sidecars)
+    writer = next(p for p in plan.ffmpeg if p.graph.sinks[0].path == path)
+    assert any(e.target == writer.id for e in plan.stream_edges)

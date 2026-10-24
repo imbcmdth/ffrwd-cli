@@ -304,6 +304,13 @@ impl Ending {
 /// rest of the second.
 static PARKED: Mutex<Vec<OutputWriter>> = Mutex::new(Vec::new());
 
+/// Closes the parked outputs, as the process goes. A connection left for the
+/// exit to close is reset on Windows rather than ended, and its reader may
+/// lose what it had not read yet.
+pub fn close_parked() {
+    PARKED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// Starts the thread that writes `target` to `path`. `wake` is called each
 /// time something leaves the queue, without the queue's lock held.
 pub fn spawn_writer(

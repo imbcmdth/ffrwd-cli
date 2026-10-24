@@ -37,6 +37,8 @@ ffrwd-frame = { git = "https://github.com/imbcmdth/ffrwd-frame", tag = "v0.1.1" 
 fast_image_resize = { version = "6", default-features = false, features = ["std"] }
 # The receive buffer a port feed's connection is given.
 socket2 = "0.6"
+# Reads a tcp:// or udp:// output's address and options.
+url = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

@@ -589,7 +589,42 @@ fn tag_row(row: &str, arg: &str) -> Result<String> {
 enum OutputPath {
     Stdout,
     File(String),
+    /// `tcp://host:port`: dialled as a client, the output written down the
+    /// connection.
+    Tcp(NetAddress),
+    /// `udp://host:port`: the output sent as datagrams of at most `pkt_size`
+    /// bytes.
+    Udp {
+        address: NetAddress,
+        pkt_size: usize,
+    },
 }
+
+/// Where a network output goes, and the URL as it was written.
+#[derive(Clone)]
+struct NetAddress {
+    url: url::Url,
+    spelling: String,
+}
+
+impl NetAddress {
+    /// The socket addresses the URL's host and port resolve to.
+    fn resolve(&self) -> Result<Vec<std::net::SocketAddr>> {
+        let found = self
+            .url
+            .socket_addrs(|| None)
+            .with_context(|| format!("output {}: resolving its host", self.spelling))?;
+        if found.is_empty() {
+            bail!("output {}: its host resolves to no address", self.spelling);
+        }
+        Ok(found)
+    }
+}
+
+/// ffmpeg's udp protocol's default `pkt_size`.
+const UDP_PKT_SIZE: usize = 1472;
+/// The largest payload one UDP datagram over IPv4 carries.
+const UDP_PKT_MAX: usize = 65507;
 
 /// `pipe:0` and `-` mean stdin; any other `pipe:N` is an error naming what
 /// is actually supported. Anything else is opened as an ordinary path -
@@ -605,7 +640,8 @@ fn resolve_input_path(raw: &str) -> Result<InputPath> {
     Ok(InputPath::File(raw.to_string()))
 }
 
-/// `pipe:1` and `-` mean stdout; any other `pipe:N` is an error.
+/// `pipe:1` and `-` mean stdout; any other `pipe:N` is an error. A
+/// `scheme://` path is a network output.
 fn resolve_output_path(raw: &str) -> Result<OutputPath> {
     if raw == "-" || raw == "pipe:1" {
         return Ok(OutputPath::Stdout);
@@ -613,7 +649,71 @@ fn resolve_output_path(raw: &str) -> Result<OutputPath> {
     if let Some(n) = raw.strip_prefix("pipe:") {
         bail!("output pipe:{n}: only stdout (pipe:1) is supported on output");
     }
+    if raw.contains("://") {
+        return resolve_network_output(raw);
+    }
     Ok(OutputPath::File(raw.to_string()))
+}
+
+/// `tcp://host:port`, or `udp://host:port` with an optional `?pkt_size=N` in
+/// ffmpeg's spelling.
+fn resolve_network_output(raw: &str) -> Result<OutputPath> {
+    let url = url::Url::parse(raw).map_err(|e| {
+        anyhow!("output {raw}: not a URL ({e}); write tcp://host:port or udp://host:port")
+    })?;
+    let scheme = url.scheme().to_string();
+    if scheme != "tcp" && scheme != "udp" {
+        bail!(
+            "output {raw}: the sidecar writes tcp:// and udp:// addresses, not {scheme}://; \
+             write to a pipe and let ffmpeg write {scheme}://"
+        );
+    }
+    let Some(host) = url.host_str().filter(|host| !host.is_empty()) else {
+        bail!("output {raw}: names no host; write {scheme}://host:port");
+    };
+    let Some(port) = url.port() else {
+        bail!("output {raw}: names no port; write {scheme}://{host}:port");
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.fragment().is_some()
+    {
+        bail!(
+            "output {raw}: a {scheme}:// output is a host, a port and options; write \
+             {scheme}://{host}:{port}"
+        );
+    }
+    let mut pkt_size = UDP_PKT_SIZE;
+    for (name, value) in url.query_pairs() {
+        match (scheme.as_str(), name.as_ref()) {
+            ("udp", "pkt_size") => {
+                pkt_size = value
+                    .parse()
+                    .ok()
+                    .filter(|size| (1..=UDP_PKT_MAX).contains(size))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "output {raw}: pkt_size {value} is not a size; give it 1 to \
+                             {UDP_PKT_MAX} bytes"
+                        )
+                    })?;
+            }
+            ("udp", _) => bail!("output {raw}: unknown option {name}; udp:// takes pkt_size only"),
+            _ => bail!(
+                "output {raw}: unknown option {name}; tcp:// takes none, and the sidecar dials \
+                 the address rather than listening on it"
+            ),
+        }
+    }
+    let address = NetAddress {
+        url,
+        spelling: raw.to_string(),
+    };
+    Ok(match scheme.as_str() {
+        "udp" => OutputPath::Udp { address, pkt_size },
+        _ => OutputPath::Tcp(address),
+    })
 }
 
 fn require_edge_format(format: Option<String>, who: &str) -> Result<()> {
@@ -1396,6 +1496,12 @@ impl Read for InputReader {
 enum OutputWriter {
     Stdout(io::Stdout),
     File(File),
+    Tcp(std::net::TcpStream),
+    Udp {
+        socket: std::net::UdpSocket,
+        target: std::net::SocketAddr,
+        pkt_size: usize,
+    },
 }
 
 impl Write for OutputWriter {
@@ -1403,14 +1509,53 @@ impl Write for OutputWriter {
         match self {
             OutputWriter::Stdout(w) => w.write(buf),
             OutputWriter::File(w) => w.write(buf),
+            OutputWriter::Tcp(w) => w.write(buf).map_err(peer_left),
+            OutputWriter::Udp {
+                socket,
+                target,
+                pkt_size,
+            } => send_datagrams(socket, *target, *pkt_size, buf),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             OutputWriter::Stdout(w) => w.flush(),
             OutputWriter::File(w) => w.flush(),
+            OutputWriter::Tcp(w) => w.flush().map_err(peer_left),
+            OutputWriter::Udp { .. } => Ok(()),
         }
     }
+}
+
+/// A peer that closed or reset the connection, as the broken pipe a reader
+/// leaving a pipe makes: the output ended, the same way.
+fn peer_left(e: io::Error) -> io::Error {
+    match e.kind() {
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => {
+            io::Error::new(io::ErrorKind::BrokenPipe, e)
+        }
+        _ => e,
+    }
+}
+
+/// `buf` as the fewest datagrams of at most `pkt_size` bytes, none empty.
+/// Hands back what was sent; a send that fails after the first datagram
+/// leaves its error for the next write.
+fn send_datagrams(
+    socket: &std::net::UdpSocket,
+    target: std::net::SocketAddr,
+    pkt_size: usize,
+    buf: &[u8],
+) -> io::Result<usize> {
+    let mut sent = 0;
+    for datagram in buf.chunks(pkt_size) {
+        match socket.send_to(datagram, target) {
+            Ok(_) => sent += datagram.len(),
+            Err(e) if sent == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(sent)
 }
 
 /// The demuxed input, and the muxed frame output, as they are actually built.
@@ -1484,7 +1629,8 @@ fn is_named_pipe(path: &str) -> bool {
 
 /// Outputs always create/truncate; `-y` is accepted for compatibility but
 /// changes nothing. A named pipe is opened for writing instead: creating one
-/// is not a thing to do to a pipe that is already there.
+/// is not a thing to do to a pipe that is already there. A `tcp://` output
+/// connects to its address, and a `udp://` one binds a socket to send from.
 fn open_output(path: &OutputPath) -> Result<OutputWriter> {
     let writer = match path {
         OutputPath::Stdout => OutputWriter::Stdout(io::stdout()),
@@ -1496,26 +1642,60 @@ fn open_output(path: &OutputPath) -> Result<OutputWriter> {
         OutputPath::File(p) => File::create(p)
             .map(OutputWriter::File)
             .with_context(|| format!("opening output {p}"))?,
+        OutputPath::Tcp(address) => OutputWriter::Tcp(connect_tcp(address)?),
+        OutputPath::Udp { address, pkt_size } => {
+            let target = address.resolve()?[0];
+            let local: std::net::SocketAddr = if target.is_ipv6() {
+                (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+            } else {
+                (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+            };
+            let socket = std::net::UdpSocket::bind(local).with_context(|| {
+                format!("output {}: binding a socket to send from", address.spelling)
+            })?;
+            OutputWriter::Udp {
+                socket,
+                target,
+                pkt_size: *pkt_size,
+            }
+        }
     };
     match &writer {
         OutputWriter::Stdout(stdout) => widen_pipe(stdout),
         OutputWriter::File(file) => widen_pipe(file),
+        OutputWriter::Tcp(_) | OutputWriter::Udp { .. } => {}
     }
     Ok(writer)
 }
 
+/// A connection to the first of `address`'s addresses that accepts one, with
+/// Nagle's delay off so each flushed batch leaves as it is written.
+fn connect_tcp(address: &NetAddress) -> Result<std::net::TcpStream> {
+    let socket = std::net::TcpStream::connect(&address.resolve()?[..]).with_context(|| {
+        format!(
+            "output {}: nothing accepted the connection; start the listener before the \
+             run, or fix the address",
+            address.spelling
+        )
+    })?;
+    socket
+        .set_nodelay(true)
+        .with_context(|| format!("output {}: turning off Nagle's delay", address.spelling))?;
+    Ok(socket)
+}
+
 /// Whether this output is a PIPE rather than a regular file: stdout, a
-/// named pipe, a POSIX fifo. Something is reading a pipe as the bytes
-/// arrive, so every batch written to one is flushed as it is written; a
-/// regular file has no such reader, and its writes may sit in the buffer
-/// until the stream ends.
+/// named pipe, a POSIX fifo, a network address. Something is reading a pipe
+/// as the bytes arrive, so every batch written to one is flushed as it is
+/// written; a regular file has no such reader, and its writes may sit in the
+/// buffer until the stream ends.
 ///
 /// The path is stated after `open_output` has created it, so a regular file
 /// answers as one. An output that cannot be stated at all is taken for a
 /// pipe, which costs a flush and never costs latency.
 fn output_is_pipe(path: &OutputPath) -> bool {
     match path {
-        OutputPath::Stdout => true,
+        OutputPath::Stdout | OutputPath::Tcp(_) | OutputPath::Udp { .. } => true,
         OutputPath::File(p) if is_named_pipe(p) => true,
         OutputPath::File(p) => !std::fs::metadata(p).is_ok_and(|m| m.is_file()),
     }
@@ -4501,6 +4681,7 @@ fn main() {
 /// beyond that is C's `atexit` handlers and stdio buffers, which no output
 /// is written through.
 fn exit(code: i32) -> ! {
+    edges::close_parked();
     #[cfg(target_os = "macos")]
     if nn::runtime_loaded() {
         use std::io::Write;
@@ -5444,5 +5625,158 @@ mod source_track_tests {
             .expect_err("a track is written once")
             .to_string();
         assert!(err.contains("already written"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod network_output_tests {
+    use std::io::{self, Write};
+    use std::net::{TcpListener, UdpSocket};
+    use std::time::Duration;
+
+    use super::{open_output, resolve_output_path, send_datagrams, OutputPath, UDP_PKT_SIZE};
+
+    /// What `resolve_output_path` refused `raw` with.
+    fn refusal(raw: &str) -> String {
+        match resolve_output_path(raw) {
+            Ok(_) => panic!("expected {raw} to be refused"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_tcp_url_is_a_tcp_output() {
+        match resolve_output_path("tcp://127.0.0.1:9000").expect("parses") {
+            OutputPath::Tcp(address) => {
+                assert_eq!(address.spelling, "tcp://127.0.0.1:9000");
+                assert_eq!(address.url.port(), Some(9000));
+            }
+            _ => panic!("not a tcp output"),
+        }
+    }
+
+    #[test]
+    fn a_udp_url_takes_ffmpegs_default_packet_size_or_the_one_it_names() {
+        let size = |raw: &str| match resolve_output_path(raw).expect("parses") {
+            OutputPath::Udp { pkt_size, .. } => pkt_size,
+            _ => panic!("not a udp output"),
+        };
+        assert_eq!(size("udp://127.0.0.1:9000"), UDP_PKT_SIZE);
+        assert_eq!(size("udp://[::1]:9000?pkt_size=500"), 500);
+    }
+
+    #[test]
+    fn a_path_without_a_scheme_is_still_a_file() {
+        assert!(matches!(
+            resolve_output_path("out.nut").expect("parses"),
+            OutputPath::File(_)
+        ));
+        assert!(matches!(
+            resolve_output_path("-").expect("parses"),
+            OutputPath::Stdout
+        ));
+    }
+
+    /// Each refusal names the URL and what to write instead.
+    #[test]
+    fn a_url_the_sidecar_cannot_write_is_refused_by_name() {
+        let cases = [
+            ("tcp://127.0.0.1:9000?listen=1", "tcp:// takes none"),
+            ("udp://127.0.0.1:9000?ttl=4", "udp:// takes pkt_size only"),
+            (
+                "udp://127.0.0.1:9000?pkt_size=0",
+                "give it 1 to 65507 bytes",
+            ),
+            (
+                "udp://127.0.0.1:9000?pkt_size=70000",
+                "give it 1 to 65507 bytes",
+            ),
+            (
+                "udp://127.0.0.1:9000?pkt_size=big",
+                "give it 1 to 65507 bytes",
+            ),
+            (
+                "tcp://127.0.0.1",
+                "names no port; write tcp://127.0.0.1:port",
+            ),
+            ("tcp://:9000", "write tcp://host:port"),
+            ("tcp://127.0.0.1:9000/feed", "write tcp://127.0.0.1:9000"),
+            ("tcp://[::1:9000", "not a URL"),
+            ("srt://127.0.0.1:9000", "not srt://"),
+        ];
+        for (raw, said) in cases {
+            let err = refusal(raw);
+            assert!(err.starts_with(&format!("output {raw}: ")), "{err}");
+            assert!(err.contains(said), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_write_leaves_as_the_fewest_datagrams_none_larger_than_the_packet_size() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let target = receiver.local_addr().expect("address");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let bytes: Vec<u8> = (0..2500u32).map(|i| i as u8).collect();
+        assert_eq!(
+            send_datagrams(&sender, target, 1000, &bytes).expect("sends"),
+            2500
+        );
+        assert_eq!(
+            send_datagrams(&sender, target, 1000, &[]).expect("sends"),
+            0
+        );
+        send_datagrams(&sender, target, 1000, b"end").expect("sends");
+        let mut received = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let size = receiver.recv(&mut buf).expect("a datagram");
+            if &buf[..size] == b"end" {
+                break;
+            }
+            received.push(buf[..size].to_vec());
+        }
+        let sizes: Vec<usize> = received.iter().map(Vec::len).collect();
+        assert_eq!(sizes, vec![1000, 1000, 500]);
+        assert_eq!(received.concat(), bytes);
+    }
+
+    #[test]
+    fn a_tcp_address_nothing_listens_on_is_refused_by_name() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port();
+        let raw = format!("tcp://127.0.0.1:{port}");
+        let path = resolve_output_path(&raw).expect("parses");
+        let err = match open_output(&path) {
+            Ok(_) => panic!("connected to a port nothing listens on"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(err.starts_with(&format!("output {raw}: ")), "{err}");
+        assert!(err.contains("start the listener"), "{err}");
+    }
+
+    /// A reader closing its end of the connection reads as a reader leaving a
+    /// pipe: a broken pipe, which every writer takes for the output ending.
+    #[test]
+    fn a_peer_that_closes_is_a_broken_pipe() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let raw = format!("tcp://{}", listener.local_addr().expect("address"));
+        let mut writer = open_output(&resolve_output_path(&raw).expect("parses")).expect("opens");
+        drop(listener.accept().expect("accepts"));
+        let chunk = vec![0u8; 64 << 10];
+        let mut failed = None;
+        for _ in 0..200 {
+            if let Err(e) = writer.write_all(&chunk) {
+                failed = Some(e);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let err = failed.expect("a write fails once the peer is gone");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
     }
 }
