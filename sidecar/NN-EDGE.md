@@ -23,6 +23,9 @@ interface is linked only for the components whose type declares it.
     -nn-runtime <dir>       where ONNX Runtime is, else FFRWD_NN_RUNTIME
     -nn-target <provider>   where sessions run, else FFRWD_NN_TARGET; cpu is
                             the default
+    -nn-threads <n>         intra-op threads each session runs on, else
+                            FFRWD_NN_THREADS; ONNX Runtime's default pool
+                            when neither says
     -nn-exclude <name>=<provider>
                             keep one model off a provider, repeatable;
                             the bare <provider> keeps every model off it
@@ -180,6 +183,16 @@ performs like `cpu`, check the cuDNN version before anything else.
 refused before anything loads. The target is `-nn-target`, else
 `FFRWD_NN_TARGET`; argv wins, and a variable that names no target is refused
 rather than quietly taken as the default.
+
+The intra-op threads are `-nn-threads`, else `FFRWD_NN_THREADS`, a whole
+number of one or more; anything else is refused. Unset, a session gets ONNX
+Runtime's default pool, one thread a core, whose threads spin for some
+tens of milliseconds after every run. A small model run many times a second
+then keeps every core busy between runs: a 160 ms speech step took eight
+cores of a twelve-thread machine on the default pool and a third of one core
+on one thread, at the same speed. One thread is no pool, so nothing spins.
+Pinning the process does not help: ONNX Runtime pins its pool threads to
+cores of its own choosing.
 
 The compiler fills that directory and names it. A query reaching a module that
 runs a model provisions one before spawning anything; `ffrwd setup nn` does

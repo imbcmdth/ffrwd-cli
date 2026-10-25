@@ -153,6 +153,7 @@ fn configured() -> &'static Result<(PathBuf, PathBuf), String> {
             runtime_dir: Some(dir),
             target,
             exclude: Vec::new(),
+            intra_threads: None,
         })
         .map_err(|e| format!("loading the segment graph: {e}"))?;
         Ok((build_module("segment"), build_module("mask_select")))

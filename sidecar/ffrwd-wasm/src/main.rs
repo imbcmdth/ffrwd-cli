@@ -814,6 +814,7 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
     if let Some(target) = nn::Target::from_env()? {
         config.target = target;
     }
+    config.intra_threads = nn::threads_from_env()?;
 
     while let Some(arg) = it.next() {
         let mut next = |name: &str| -> Result<String> {
@@ -830,6 +831,13 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
             }
             "-nn-runtime" => config.runtime_dir = Some(next("-nn-runtime")?.into()),
             "-nn-target" => config.target = nn::Target::parse(&next("-nn-target")?)?,
+            "-nn-threads" => {
+                let raw = next("-nn-threads")?;
+                match nn::parse_threads(&raw) {
+                    Some(threads) => config.intra_threads = Some(threads),
+                    None => bail!("-nn-threads {raw}: a whole number of threads, 1 or more"),
+                }
+            }
             "-nn-exclude" => {
                 let exclusion = nn::parse_exclude(&next("-nn-exclude")?)?;
                 if !config.exclude.contains(&exclusion) {

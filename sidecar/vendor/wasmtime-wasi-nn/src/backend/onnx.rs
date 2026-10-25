@@ -12,7 +12,9 @@
 //! ([`crate::DeviceOutput`]) the same way, and the embedder can register a
 //! provider on a session itself ([`OnnxBackend::with_registrar`]), which is
 //! how a session is given a CUDA stream or a D3D12 device of the
-//! embedder's. Everything else here is upstream's.
+//! embedder's, and the embedder can name how many intra-op threads every
+//! session runs on ([`OnnxBackend::with_intra_threads`]). Everything else
+//! here is upstream's.
 
 use super::{
     BackendError, BackendExecutionContext, BackendFromDir, BackendGraph, BackendInner, NamedTensor,
@@ -127,6 +129,9 @@ pub struct OnnxBackend {
     registrars: Vec<(Provider, Registrar)>,
     /// What the next graph loaded is called on stderr.
     next_name: String,
+    /// The intra-op threads every session runs on; ONNX Runtime's default
+    /// when None.
+    intra_threads: Option<usize>,
 }
 
 impl Default for OnnxBackend {
@@ -135,6 +140,7 @@ impl Default for OnnxBackend {
             gpu_providers: platform_gpu_providers(),
             registrars: Vec::new(),
             next_name: String::new(),
+            intra_threads: None,
         }
     }
 }
@@ -151,7 +157,18 @@ impl OnnxBackend {
             gpu_providers,
             registrars: Vec::new(),
             next_name: String::new(),
+            intra_threads: None,
         }
+    }
+
+    /// Builds every session on `threads` intra-op threads rather than ONNX
+    /// Runtime's default, a pool as wide as the machine whose threads keep
+    /// spinning after each run returns. One thread is no pool at all, which
+    /// is what a small model run many times a second wants: a 160 ms speech
+    /// chunk took 8% of a core on one thread and eight cores on the default.
+    pub fn with_intra_threads(mut self, threads: Option<usize>) -> Self {
+        self.intra_threads = threads;
+        self
     }
 
     /// Has `provider` registered on every session by `registrar` rather than
@@ -190,11 +207,16 @@ impl BackendInner for OnnxBackend {
         let mut refused: Vec<(Provider, String)> = Vec::new();
         for provider in session_providers(target, &self.gpu_providers) {
             if let Some(registrar) = self.registrar(provider) {
-                if let Some(graph) = specialized(provider, registrar, builders[0], &self.next_name)?
-                {
+                if let Some(graph) = specialized(
+                    provider,
+                    registrar,
+                    builders[0],
+                    &self.next_name,
+                    self.intra_threads,
+                )? {
                     return Ok(graph);
                 }
-                let mut builder = Session::builder()?;
+                let mut builder = session_builder(self.intra_threads)?;
                 if let Err(e) = registrar(&mut builder) {
                     tracing::debug!(
                         "{} execution provider did not register: {e}",
@@ -221,18 +243,19 @@ impl BackendInner for OnnxBackend {
                 refused.push((provider, "not enabled in this build".to_string()));
                 continue;
             };
-            let builder =
-                match Session::builder()?.with_execution_providers([dispatch.error_on_failure()]) {
-                    Ok(builder) => builder,
-                    Err(e) => {
-                        tracing::debug!(
-                            "{} execution provider did not register: {e}",
-                            provider.name()
-                        );
-                        refused.push((provider, e.to_string()));
-                        continue;
-                    }
-                };
+            let builder = match session_builder(self.intra_threads)?
+                .with_execution_providers([dispatch.error_on_failure()])
+            {
+                Ok(builder) => builder,
+                Err(e) => {
+                    tracing::debug!(
+                        "{} execution provider did not register: {e}",
+                        provider.name()
+                    );
+                    refused.push((provider, e.to_string()));
+                    continue;
+                }
+            };
             tracing::debug!("Using {} execution provider", provider.name());
             let session = builder
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
@@ -283,6 +306,7 @@ fn specialized(
     registrar: &Registrar,
     model: &[u8],
     name: &str,
+    intra_threads: Option<usize>,
 ) -> Result<Option<Graph>, BackendError> {
     if !by_shape(provider) {
         return Ok(None);
@@ -320,11 +344,22 @@ fn specialized(
             provider,
             registrar: registrar.clone(),
             free,
+            intra_threads,
             sessions: Mutex::new(Vec::new()),
             fallen: Mutex::new(None),
         })),
     });
     Ok(Some(box_.into()))
+}
+
+/// A session builder on `intra_threads` intra-op threads, or on ONNX
+/// Runtime's default with None.
+fn session_builder(intra_threads: Option<usize>) -> ort::Result<SessionBuilder> {
+    let builder = Session::builder()?;
+    match intra_threads {
+        Some(threads) => builder.with_intra_threads(threads),
+        None => Ok(builder),
+    }
 }
 
 /// A model's sessions, one for each shape its inputs arrived in, or, once
@@ -339,6 +374,8 @@ struct ByShape {
     /// Each free dimension of the inputs: the input, the dimension, and its
     /// name.
     free: Vec<(usize, usize, String)>,
+    /// The intra-op threads its sessions run on.
+    intra_threads: Option<usize>,
     /// The sizes the free dimensions took, and the session built for them.
     sessions: Mutex<Vec<(Vec<i64>, Arc<Mutex<Session>>)>>,
     /// The session every shape runs on once a session for a shape could not
@@ -370,7 +407,7 @@ impl ByShape {
         if let Some((_, session)) = sessions.iter().find(|(made, _)| *made == sizes) {
             return Ok((session.clone(), false));
         }
-        let mut builder = Session::builder()?;
+        let mut builder = session_builder(self.intra_threads)?;
         (self.registrar)(&mut builder).map_err(|e| {
             BackendError::BackendAccess(wasmtime::format_err!("the provider did not register: {e}"))
         })?;
@@ -409,7 +446,7 @@ impl ByShape {
             ))
         })?;
         let session = Arc::new(Mutex::new(
-            Session::builder()?
+            session_builder(self.intra_threads)?
                 .with_execution_providers([dispatch.error_on_failure()])?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
                 .commit_from_memory(&self.model)?,

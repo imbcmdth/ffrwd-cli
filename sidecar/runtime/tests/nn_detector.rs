@@ -123,6 +123,7 @@ fn a_real_detector_runs_through_the_sidecar() {
         runtime_dir: Some(dir),
         target,
         exclude: Vec::new(),
+        intra_threads: None,
     })
     .expect("loading the detector");
 

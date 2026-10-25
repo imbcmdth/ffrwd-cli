@@ -118,6 +118,7 @@ fn configured() -> &'static Result<PathBuf, String> {
             runtime_dir: Some(dir),
             target,
             exclude: Vec::new(),
+            intra_threads: None,
         })
         .map_err(|e| format!("loading the depth graph: {e}"))?;
         Ok(build_module())

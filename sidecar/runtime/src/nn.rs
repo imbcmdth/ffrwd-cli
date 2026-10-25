@@ -36,6 +36,33 @@ pub const RUNTIME_DIR_VAR: &str = "FFRWD_NN_RUNTIME";
 /// The environment variable naming the target when the command line does not.
 pub const TARGET_VAR: &str = "FFRWD_NN_TARGET";
 
+/// The environment variable naming each session's intra-op threads when the
+/// command line does not.
+pub const THREADS_VAR: &str = "FFRWD_NN_THREADS";
+
+/// What `-nn-threads` and its variable say: a whole number of threads, one or
+/// more. A set value that is not one is refused, since a misspelling would
+/// otherwise leave every core spinning in silence.
+pub fn parse_threads(raw: &str) -> Option<usize> {
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|threads| *threads > 0)
+}
+
+/// The intra-op threads the environment names, for a run whose argv does
+/// not; None when the variable is unset.
+pub fn threads_from_env() -> Result<Option<usize>> {
+    let Some(raw) = std::env::var_os(THREADS_VAR) else {
+        return Ok(None);
+    };
+    let raw = raw.to_string_lossy().to_string();
+    match parse_threads(&raw) {
+        Some(threads) => Ok(Some(threads)),
+        None => bail!("{THREADS_VAR}={raw}: a whole number of threads, 1 or more"),
+    }
+}
+
 /// Where the runtime comes from, named in every refusal that wants one.
 const FETCH_HINT: &str = "run `ffrwd setup nn` to download one";
 
@@ -301,6 +328,9 @@ pub struct Config {
     /// every bound model excludes, and a model that excludes the provider
     /// the walk took runs on the CPU. Ignored for a target named outright.
     pub exclude: Vec<Exclusion>,
+    /// The intra-op threads every session runs on (`-nn-threads`); ONNX
+    /// Runtime's default when None.
+    pub intra_threads: Option<usize>,
 }
 
 impl Config {
@@ -427,6 +457,8 @@ struct Models {
     bindings: Vec<ModelSpec>,
     names: Vec<String>,
     provider: Provider,
+    /// The intra-op threads each session runs on (`-nn-threads`).
+    intra_threads: Option<usize>,
     /// The provider each model's session engaged, by its binding's key.
     placed: HashMap<String, Provider>,
     /// The CUDA runtime the CUDA provider loads, where the walk took CUDA
@@ -508,8 +540,8 @@ pub fn require_configured(module_path: &str) -> Result<()> {
 
 /// The ONNX backend, told which provider a `gpu` session should ask for. The
 /// crate's own `backend::list()` builds one that always means CUDA.
-fn onnx_backend(provider: Provider) -> OnnxBackend {
-    OnnxBackend::with_gpu_providers(vec![provider])
+fn onnx_backend(provider: Provider, intra_threads: Option<usize>) -> OnnxBackend {
+    OnnxBackend::with_gpu_providers(vec![provider]).with_intra_threads(intra_threads)
 }
 
 /// The stream every CUDA session is built on, where one was made: the
@@ -666,7 +698,10 @@ pub fn store_ctx(module_path: &str) -> (WasiNnCtx, Scope) {
         .filter_map(|(name, key)| Some((name.clone(), models.registry.0.get(key)?.clone())))
         .collect();
     let ctx = WasiNnCtx::new(
-        vec![Backend::from(onnx_backend(models.provider))],
+        vec![Backend::from(onnx_backend(
+            models.provider,
+            models.intra_threads,
+        ))],
         Registry::from(ModelRegistry(Arc::new(graphs))),
     );
     (ctx, Scope(scope))
@@ -1056,7 +1091,7 @@ pub fn configure(config: &Config) -> Result<()> {
         _ => None,
     };
     let onnx = registered(
-        onnx_backend(provider),
+        onnx_backend(provider, config.intra_threads),
         provider,
         cuda_runtime.as_deref(),
         directml_lib.as_deref(),
@@ -1131,6 +1166,7 @@ pub fn configure(config: &Config) -> Result<()> {
             bindings: config.models.clone(),
             names,
             provider,
+            intra_threads: config.intra_threads,
             placed,
             cuda_runtime,
         })
@@ -1172,6 +1208,16 @@ mod tests {
             runtime_dir: None,
             target: Target::Gpu,
             exclude,
+            intra_threads: None,
+        }
+    }
+
+    #[test]
+    fn threads_are_a_whole_number_of_one_or_more() {
+        assert_eq!(parse_threads("1"), Some(1));
+        assert_eq!(parse_threads(" 4 "), Some(4));
+        for refused in ["0", "-1", "1.5", "one", ""] {
+            assert_eq!(parse_threads(refused), None, "{refused:?}");
         }
     }
 
