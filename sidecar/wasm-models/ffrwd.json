@@ -1,0 +1,15 @@
+{
+  "name": "ffrwd/models",
+  "version": "0.1.0",
+  "description": "The ffrwd:models wit package a node module includes beside ffrwd:av to read the files its manifest pins as bytes: this version's number is the package's. Assets only - no exports, no recipes, no module.",
+  "license": "MIT",
+  "files": [
+    "wit/"
+  ],
+  "keywords": [
+    "wit",
+    "wasm",
+    "sdk",
+    "models"
+  ]
+}

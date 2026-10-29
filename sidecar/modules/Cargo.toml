@@ -24,6 +24,7 @@ members = [
     "transcribe",
     "nn-probe",
     "nn-frames",
+    "models-probe",
     "gpu-probe",
     "gpu-box",
     "depth",

@@ -53,7 +53,7 @@ use ffrwd_wasm_runtime::profile::PROFILE;
 use ffrwd_wasm_runtime::runtime::{
     self, AudioFormat, Filter, Format, Frame, Media, StreamInfo, TimeBase, VideoFormat,
 };
-use ffrwd_wasm_runtime::{av, nn};
+use ffrwd_wasm_runtime::{av, models, nn};
 use serde::{Deserialize, Serialize};
 
 use network::{Binding, Network};
@@ -851,6 +851,39 @@ fn take_nn_args(argv: Vec<String>) -> Result<(nn::Config, Vec<String>)> {
     config.check_bindings()?;
     config.check_exclude()?;
     Ok((config, rest))
+}
+
+/// Takes the file bindings out of the argv and leaves the rest.
+///
+/// `-model <name>=<path>` binds a file a module reads as bytes through
+/// `ffrwd:models/files`; `-model-for <module>` follows the `-model` it
+/// narrows to that module, and may be repeated for several. Read before the
+/// argv is dispatched, the way the inference options are.
+fn take_model_args(argv: Vec<String>) -> Result<(Vec<models::ModelFile>, Vec<String>)> {
+    let mut files: Vec<models::ModelFile> = Vec::new();
+    let mut rest = Vec::with_capacity(argv.len());
+    let mut it = argv.into_iter();
+    while let Some(arg) = it.next() {
+        let mut next = |name: &str| -> Result<String> {
+            it.next().ok_or_else(|| anyhow!("{name} requires a value"))
+        };
+        match arg.as_str() {
+            "-model" => files.push(models::parse(&next("-model")?)?),
+            "-model-for" => {
+                let module = next("-model-for")?;
+                match files.last_mut() {
+                    Some(file) => file.modules.push(module.into()),
+                    None => bail!(
+                        "-model-for {module} with no -model before it: -model-for follows \
+                         the -model it narrows"
+                    ),
+                }
+            }
+            _ => rest.push(arg),
+        }
+    }
+    models::check_bindings(&files)?;
+    Ok((files, rest))
 }
 
 /// Takes `-av-runtime <dir>` out of the argv and leaves the rest: the
@@ -3749,6 +3782,9 @@ struct Description {
     /// Whether the component imports `wasi:webgpu`, and so needs a `-gpu`
     /// grant to run at all. Read off its imports. Always present.
     gpu: bool,
+    /// Whether the component imports `ffrwd:models/files`, and so reads the
+    /// files bound with `-model`. Read off its imports. Always present.
+    models: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     functions: Vec<FunctionDescription>,
     /// The older spelling of `reads_rows`, present only when it is true.
@@ -4049,6 +4085,8 @@ fn describe_module(module_path: &str) -> Result<String> {
         tcp: ffrwd_wasm_runtime::runtime::imports_wasi_tcp(module_path)
             .with_context(|| format!("describing {module_path}"))?,
         gpu: ffrwd_wasm_runtime::runtime::imports_wasi_webgpu(module_path)
+            .with_context(|| format!("describing {module_path}"))?,
+        models: ffrwd_wasm_runtime::runtime::imports_models(module_path)
             .with_context(|| format!("describing {module_path}"))?,
         functions: Vec::new(),
         meta: false,
@@ -4545,6 +4583,18 @@ fn main() {
     // and ahead of them: a DirectML session is built on the process's
     // device where a module is granted one.
     let raw_args = match take_grant_args(raw_args) {
+        Ok(rest) => rest,
+        Err(e) => {
+            eprintln!("ffrwd-wasm: {e:#}");
+            exit(2);
+        }
+    };
+
+    // Files are bound before anything is instantiated, like models.
+    let raw_args = match take_model_args(raw_args).and_then(|(files, rest)| {
+        models::configure(files)?;
+        Ok(rest)
+    }) {
         Ok(rest) => rest,
         Err(e) => {
             eprintln!("ffrwd-wasm: {e:#}");
@@ -5459,6 +5509,160 @@ mod grant_args_tests {
         let argv = strings(&["--invoke", "module.wasm", "fn", "{}"]);
         let rest = take_grant_args(argv.clone()).expect("parses");
         assert_eq!(rest, argv);
+    }
+}
+
+#[cfg(test)]
+mod model_args_tests {
+    use super::take_model_args;
+    use std::path::PathBuf;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A file that exists, for a binding to name: this crate's manifest.
+    fn present() -> String {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml").to_string()
+    }
+
+    fn refused(args: &[String]) -> String {
+        take_model_args(args.to_vec()).unwrap_err().to_string()
+    }
+
+    /// Bindings come out in argv order, each with the modules its
+    /// `-model-for`s name, and the rest of the argv is left as it was.
+    #[test]
+    fn bindings_are_taken_out_in_order_with_their_modules() {
+        let file = present();
+        let w = format!("w.bin={file}");
+        let c = format!("c.json={file}");
+        let argv = strings(&[
+            "-model",
+            &w,
+            "-model-for",
+            "a.wasm",
+            "-model-for",
+            "b.wasm",
+            "-model",
+            &c,
+            "--invoke",
+            "a.wasm",
+            "fn",
+            "{}",
+        ]);
+        let (files, rest) = take_model_args(argv).expect("parses");
+        assert_eq!(rest, strings(&["--invoke", "a.wasm", "fn", "{}"]));
+        let read: Vec<(&str, PathBuf, Vec<PathBuf>)> = files
+            .iter()
+            .map(|f| (f.name.as_str(), f.path.clone(), f.modules.clone()))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                (
+                    "w.bin",
+                    PathBuf::from(&file),
+                    vec![PathBuf::from("a.wasm"), PathBuf::from("b.wasm")]
+                ),
+                ("c.json", PathBuf::from(&file), vec![]),
+            ]
+        );
+    }
+
+    /// One name bound for two modules apart, and once more for every
+    /// module, is accepted.
+    #[test]
+    fn a_name_bound_for_modules_apart_is_accepted() {
+        let w = format!("w.bin={}", present());
+        let argv = strings(&[
+            "-model",
+            &w,
+            "-model-for",
+            "a.wasm",
+            "-model",
+            &w,
+            "-model-for",
+            "b.wasm",
+            "-model",
+            &w,
+        ]);
+        let (files, rest) = take_model_args(argv).expect("parses");
+        assert_eq!(files.len(), 3);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn refusals_name_the_flag_the_name_and_the_path() {
+        let file = present();
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let w = format!("w.bin={file}");
+        let d = format!("d={dir}");
+        let cases: Vec<(Vec<String>, String)> = vec![
+            (
+                strings(&["-model", "w.bin"]),
+                "-model w.bin: a file is bound as -model name=path".to_string(),
+            ),
+            (
+                strings(&["-model", "w.bin="]),
+                "-model w.bin=: the name 'w.bin' is bound to no path".to_string(),
+            ),
+            (
+                strings(&["-model", "nope=missing.bin"]),
+                "-model nope=missing.bin: 'nope' is bound to missing.bin, which does not exist"
+                    .to_string(),
+            ),
+            (
+                strings(&["-model", &d]),
+                format!("-model {d}: 'd' is bound to {dir}, which is not a file"),
+            ),
+            (
+                strings(&["-model", &w, "-model", &w]),
+                "-model w.bin: bound twice".to_string(),
+            ),
+            (
+                strings(&[
+                    "-model",
+                    &w,
+                    "-model-for",
+                    "a.wasm",
+                    "-model",
+                    &w,
+                    "-model-for",
+                    "a.wasm",
+                ]),
+                "-model w.bin: bound twice for a.wasm".to_string(),
+            ),
+            (
+                strings(&["-model-for", "a.wasm", "-model", &w]),
+                "-model-for a.wasm with no -model before it: -model-for follows the -model it \
+                 narrows"
+                    .to_string(),
+            ),
+            (strings(&["-model"]), "-model requires a value".to_string()),
+            (
+                strings(&["-model", &w, "-model-for"]),
+                "-model-for requires a value".to_string(),
+            ),
+        ];
+        for (argv, said) in cases {
+            assert_eq!(refused(&argv), said, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_one_path_segment_is_refused() {
+        let file = present();
+        for name in ["", ".", "..", "a/w.bin", "a\\w.bin"] {
+            let raw = format!("{name}={file}");
+            assert_eq!(
+                refused(&strings(&["-model", &raw])),
+                format!(
+                    "-model {raw}: '{name}' is not a file name; a name is one path segment, \
+                     with no / or \\, and not . or .."
+                ),
+            );
+        }
     }
 }
 

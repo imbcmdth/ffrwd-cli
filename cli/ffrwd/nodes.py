@@ -424,6 +424,7 @@ class _Agent:
                 wanted.append(process.module)
                 wanted += [binding.path for binding in process.modules]
                 wanted += [binding.path for binding in process.models]
+                wanted += [file.path for file in process.model_files]
         # A host node (a leaky, a row filter) is named, not loaded from a
         # file: only what names a path is looked for.
         return sorted(

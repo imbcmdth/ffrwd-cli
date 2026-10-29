@@ -1,0 +1,30 @@
+// ffrwd:models 0.1.0: the files a module's manifest pins, read as bytes.
+//
+// A companion to the node world (`ffrwd:av@0.19.1`), beside which a module
+// includes it. A module that runs its model through `wasi:nn` never sees
+// the file: the host builds the session and the module loads it by name.
+// A module that runs its model itself, in its own code on the sidecar's
+// device, needs the weights as bytes instead. This interface hands over
+// exactly the files bound with `-model <name>=<path>`, which the compiler
+// writes from the manifest's `models` pins of the module's export, and
+// nothing else: the module still has no directory, no path and no file
+// but those.
+
+package ffrwd:models@0.1.0;
+
+interface files {
+  /// The bytes of one pinned file, by the name it is pinned under: the
+  /// last segment of the pin's `file`, as the hub names it. Err names a
+  /// file no `-model` bound for this module. The bytes are read on each
+  /// call, so a module keeps what it needs rather than calling twice.
+  read: func(name: string) -> result<list<u8>, string>;
+
+  /// The names `read` answers for, in the order they were bound.
+  names: func() -> list<string>;
+}
+
+/// A module that reads its pinned files includes this world beside the
+/// node world.
+world models-module {
+  import files;
+}

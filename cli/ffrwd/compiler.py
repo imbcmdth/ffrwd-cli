@@ -66,6 +66,7 @@ from .processes import (
     AudioFormat,
     Cuts,
     ModelBinding,
+    ModelFile,
     ModuleShape,
     ProcessPlan,
     check_spellable,
@@ -413,7 +414,16 @@ def _pinned_models(packages: PackageSet | None) -> dict[tuple[str, str], ModelPi
     file beside the module -- so this is the only way to find its pin again,
     and with it the providers the pin denies. Empty with no package set.
     """
-    found: dict[tuple[str, str], ModelPin] = {}
+    return {key: pins[0] for key, pins in _pinned_files(packages).items()}
+
+
+def _pinned_files(
+    packages: PackageSet | None,
+) -> dict[tuple[str, str], tuple[ModelPin, ...]]:
+    """Every pin behind every (module path, export name) `packages` names, in
+    manifest order; the first package naming a pair wins. Empty with no
+    package set."""
+    found: dict[tuple[str, str], tuple[ModelPin, ...]] = {}
     if packages is None:
         return found
     seen: set[int] = set()
@@ -425,7 +435,7 @@ def _pinned_models(packages: PackageSet | None) -> dict[tuple[str, str], ModelPi
             for declared in package_modules(package):
                 pins = package.models.get(declared.export)
                 if pins:
-                    found.setdefault((declared.module, declared.export), pins[0])
+                    found.setdefault((declared.module, declared.export), pins)
     return found
 
 
@@ -456,6 +466,33 @@ def _nn_models(
                 described, declared.module, not_on=not_on
             )
     return models
+
+
+def _model_files(
+    hosted: Mapping[str, WasmFunction],
+    describes: Mapping[str, Described],
+    packages: PackageSet | None = None,
+) -> dict[str, tuple[ModelFile, ...]]:
+    """The files each hosted module reads as bytes, keyed by module path.
+
+    Every module whose describe says it imports ``ffrwd:models/files`` is
+    given every file its export's ``models`` entry pins, in manifest order,
+    each found where install landed it. A missing file, or a module whose
+    package pins none, is a rejection here rather than a failed read at run
+    time.
+    """
+    pinned = _pinned_files(packages)
+    files: dict[str, tuple[ModelFile, ...]] = {}
+    for declared in hosted.values():
+        described = describes.get(declared.module)
+        if described is None or not described.models or declared.module in files:
+            continue
+        with _at(declared):
+            pins = pinned.get((declared.module, declared.export), ())
+            files[declared.module] = wasm.model_files(
+                declared.module, declared.export, [pin.filename for pin in pins]
+            )
+    return files
 
 
 def _effect_grants(
@@ -760,6 +797,7 @@ def compile_all(
                 shapes=_module_shapes(stream_wasm, describes),
                 audio_wires=_audio_wires(stream_wasm, describes),
                 models=_nn_models(hosted | _source_wasm(res), describes, packages),
+                model_files=_model_files(hosted | _source_wasm(res), describes, packages),
                 effects=_effect_grants(stream_wasm | _source_wasm(res), describes),
                 anchors=res.input_anchors,
                 coded={d.module for d in stream_wasm.values() if d.edges == CODED_EDGES},

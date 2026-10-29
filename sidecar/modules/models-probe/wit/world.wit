@@ -1,0 +1,10 @@
+package ffrwd:models-probe;
+
+/// A module that reads its pinned files as bytes and says what it read. It
+/// exports the value interface, so a caller reaches it without a stream,
+/// and imports `ffrwd:models/files`: the files bound with `-model`, and no
+/// filesystem.
+world models-probe {
+  include ffrwd:av/values-module@0.19.1;
+  include ffrwd:models/models-module@0.1.0;
+}

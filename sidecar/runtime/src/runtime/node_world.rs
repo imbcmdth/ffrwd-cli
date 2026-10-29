@@ -286,7 +286,7 @@ struct Instantiated {
 fn instantiate_node(module_path: &str, purpose: Purpose) -> Result<Instantiated> {
     let component = compile(module_path)?;
     check_node_export(&component, module_path)?;
-    let (linker, nn, nn_scope, gpu) = link(&component, module_path, purpose)?;
+    let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
     let policy = egress::net_policy()?;
     let wasi = wasi_ctx(granted(module_path)?, policy);
     let mut store = Store::new(
@@ -296,6 +296,7 @@ fn instantiate_node(module_path: &str, purpose: Purpose) -> Result<Instantiated>
             table: ResourceTable::new(),
             nn,
             nn_scope,
+            models,
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,

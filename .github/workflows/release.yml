@@ -188,12 +188,18 @@ jobs:
           GPU_DEPS = "sidecar/wit-gpu/deps"
           gpu_manifest = json.loads((GPU_ROOT / "ffrwd.json").read_text())
 
+          # `ffrwd/models` is the companion a module includes to read the
+          # files its manifest pins as bytes; one wit file, no deps.
+          MODELS_ROOT = pathlib.Path("sidecar/wasm-models")
+          models_manifest = json.loads((MODELS_ROOT / "ffrwd.json").read_text())
+
           def publish(root, wit, request, deps=DEPS):
               staged = root / "wit"
               shutil.rmtree(staged, ignore_errors=True)
               staged.mkdir()
               shutil.copyfile(wit, staged / pathlib.Path(wit).name)
-              shutil.copytree(deps, staged / "deps")
+              if deps is not None:
+                  shutil.copytree(deps, staged / "deps")
 
               archive = store.pack(root)
               digest = hashlib.sha256(archive).hexdigest()
@@ -229,6 +235,7 @@ jobs:
 
           publish(ROOT, "sidecar/wit/av.wit", f"{WIT_PACKAGE}@{WORLD_VERSION}")
           publish(GPU_ROOT, "sidecar/wit-gpu/gpu.wit", f"{gpu_manifest['name']}@{gpu_manifest['version']}", GPU_DEPS)
+          publish(MODELS_ROOT, "sidecar/wit-models/models.wit", f"{models_manifest['name']}@{models_manifest['version']}", None)
           EOF
 
 

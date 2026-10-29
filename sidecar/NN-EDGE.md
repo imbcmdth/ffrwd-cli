@@ -143,6 +143,44 @@ binding before it has one.
 
     "reads_rows": false, "forwards_rows": true, "inputs": 1, "nn": true
 
+## Files a module reads itself
+
+A module that runs its model in its own code, rather than through a
+`wasi:nn` session the host builds, needs the weights as bytes. It imports
+`ffrwd:models/files@0.1.0` (`sidecar/wit-models/models.wit`) and the host
+hands over exactly the files bound on the command line:
+
+    -model <name>=<path>    bind a file under a name, repeatable
+    -model-for <module>     bind the -model before it for this module alone,
+                            repeatable
+
+`<name>` is one path segment - no `/` or `\`, not `.` or `..` - and the
+file must exist when the argv is read; the run is refused otherwise, before
+anything is instantiated. `-model-for` narrows a binding the way `-nn-for`
+does: a module's own binding of a name wins over one bound for every
+module, and a name bound twice for one module is refused. The flags are
+read before dispatch, so `--describe`, `--invoke` and the frame loop all
+see them.
+
+The module calls `files.read(name)` and gets the whole file, read on each
+call, or an Err naming what is bound for it:
+
+    no file named 'v.bin' is bound for this module; the files bound for it are w.bin
+    no file named 'v.bin' is bound for this module; no file is bound for it
+
+`files.names()` lists the bound names in argv order. The module still has
+no directory and no path: the path behind a name never reaches it, and a
+read that fails on the host says `'<name>' could not be read` and no more.
+The interface is linked only for components whose type imports it.
+
+`--describe` carries `"models"`, always present, read off the imports like
+`"nn"`: whether the component reads its files this way. The compiler
+writes one `-model` per file the module's package pins for its export,
+named by the pin's file name (`docs/dialect.md`, "Models").
+`modules/models-probe` is the test module: `--invoke models_probe.wasm
+read '{"name":"w.bin"}'` answers the length and sha256 of what it read
+beside the names bound for it.
+
 ## Where the model comes from
 
 A module's fetch script leaves the graph in its own `model/` directory and

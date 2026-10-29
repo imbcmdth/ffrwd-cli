@@ -89,6 +89,13 @@ carried by `ffrwd/gpu` (`sidecar/wasm-gpu/README.md`), which imports
 `ffrwd:av@0.19.1`, and a module including both is a node module with two
 ports it reads and writes as textures.
 
+## Pinned files as bytes
+
+A node module that runs its model in its own code includes
+`ffrwd:models/models-module@0.1.0`, carried by `ffrwd/models`
+(`sidecar/wasm-models/README.md`), and reads the files its manifest pins
+through `files.read`. This package is unchanged by it too.
+
 ## Versions
 
 A new world version is published here as a new package version, and

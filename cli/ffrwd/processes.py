@@ -181,6 +181,7 @@ __all__ = [
     "FileFormat",
     "IsExternal",
     "ModelBinding",
+    "ModelFile",
     "ModuleBinding",
     "ModuleShape",
     "PadMeta",
@@ -1155,6 +1156,32 @@ class ModelBinding:
 
 
 @dataclass(frozen=True)
+class ModelFile:
+    """One ``-model <name>=<path>`` and its ``-model-for <module>``: a file one
+    module reads as bytes through ``ffrwd:models/files``.
+
+    `name` is what the module reads it by, the last segment of the pin's
+    ``file``; `path` is where install landed it; `module` is the path of the
+    module it is bound for, and no other.
+    """
+
+    name: str
+    path: str
+    module: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {"name": self.name, "path": self.path, "module": self.module}
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> ModelFile:
+        return cls(
+            name=_read_text(d, "name"),
+            path=_read_text(d, "path"),
+            module=_read_text(d, "module"),
+        )
+
+
+@dataclass(frozen=True)
 class EffectGrant:
     """One ``-http <path>``, ``-udp <path>`` and so on: an effect one module is allowed.
 
@@ -1305,6 +1332,8 @@ class SidecarProcess:
     graph: Graph | None = None
     modules: tuple[ModuleBinding, ...] = ()
     models: tuple[ModelBinding, ...] = ()
+    # The files the region's modules read as bytes, one ``-model`` each.
+    model_files: tuple[ModelFile, ...] = ()
     grants: tuple[EffectGrant, ...] = ()
     lookahead: int = 0
     rows: tuple[RowsDocument, ...] = ()
@@ -1440,6 +1469,8 @@ class SidecarProcess:
         }
         if self.models:
             written["models"] = [binding.to_dict() for binding in self.models]
+        if self.model_files:
+            written["model_files"] = [file.to_dict() for file in self.model_files]
         if self.grants:
             written["grants"] = [grant.to_dict() for grant in self.grants]
         if self.reads_rows:
@@ -1519,6 +1550,7 @@ class SidecarProcess:
             graph=None if graph is None else Graph.from_dict(_read_object(d, "graph")),
             modules=tuple(ModuleBinding.from_dict(one) for one in _read_objects(d, "modules")),
             models=tuple(ModelBinding.from_dict(one) for one in _read_objects(d, "models")),
+            model_files=tuple(ModelFile.from_dict(one) for one in _read_objects(d, "model_files")),
             grants=tuple(EffectGrant.from_dict(one) for one in _read_objects(d, "grants")),
             lookahead=_read_whole(d, "lookahead", 0),
             rows=tuple(RowsDocument.from_dict(one) for one in _read_objects(d, "rows")),
@@ -2471,6 +2503,7 @@ class _Partitioner:
         coded: Collection[str] = (),
         decoded: Mapping[str, tuple[str, ...]] | None = None,
         cuts: Cuts | None = None,
+        model_files: Mapping[str, tuple[ModelFile, ...]] | None = None,
     ) -> None:
         self.g = g
         # The pixel formats each codec package's decoder may write.
@@ -2506,6 +2539,7 @@ class _Partitioner:
         self.shapes = shapes or {}
         self.audio_wires = audio_wires or {}
         self.models = models or {}
+        self.model_files = model_files or {}
         self.effects = dict(effects or {})
         self.anchors = anchors or {}
         self.live = frozenset(
@@ -4865,6 +4899,7 @@ class _Partitioner:
                 outputs=tuple(kind for _, kind in self._region_writes(members)),
                 modules=bindings,
                 models=self._region_models(members),
+                model_files=self._region_model_files(members),
                 grants=self._region_grants(members),
                 lookahead=self._lookahead(members),
                 rows=self._region_rows(members, bindings),
@@ -5559,6 +5594,18 @@ class _Partitioner:
                         else (),
                     )
                 )
+        return tuple(found)
+
+    def _region_model_files(self, members: Sequence[str]) -> tuple[ModelFile, ...]:
+        """The ``-model`` bindings this region's modules need, in graph order."""
+        found: list[ModelFile] = []
+        seen: set[str] = set()
+        for name in members:
+            module = self.g.nodes[name].filter
+            if module in seen:
+                continue
+            seen.add(module)
+            found += self.model_files.get(module, ())
         return tuple(found)
 
     def _region_grants(self, members: Sequence[str]) -> tuple[EffectGrant, ...]:
@@ -7292,6 +7339,7 @@ def partition(
     coded: Collection[str] = (),
     decoded: Mapping[str, tuple[str, ...]] | None = None,
     cuts: Cuts | None = None,
+    model_files: Mapping[str, tuple[ModelFile, ...]] | None = None,
 ) -> ProcessPlan:
     """Partition a logical graph into the processes that run it.
 
@@ -7320,6 +7368,10 @@ def partition(
     `models` is keyed the same way and is the model each module runs, which
     the sidecar is told to load before anything is instantiated. A module that
     runs none is absent and binds nothing.
+
+    `model_files` is keyed the same way and is the files each module reads
+    as bytes, each bound for that module alone. A module that reads none is
+    absent.
 
     `effects` is keyed the same way and is what each module needs granted --
     ``http``, ``udp``, ``tcp``, ``gpu`` -- which the sidecar denies without the
@@ -7362,14 +7414,14 @@ def partition(
 
     partitioner = _Partitioner(
         g, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors,
-        coded=coded, decoded=decoded, cuts=cuts,
+        coded=coded, decoded=decoded, cuts=cuts, model_files=model_files,
     )
     reads = partitioner.timing_reads()
     if reads:
         shrunk, small = partitioner.shrunk(reads)
         partitioner = _Partitioner(
             shrunk, external, probes, pix_fmts, shapes, audio_wires, models, effects, anchors,
-            small, coded=coded, decoded=decoded, cuts=cuts,
+            small, coded=coded, decoded=decoded, cuts=cuts, model_files=model_files,
         )
     plan = partitioner.run()
     plan = startup.arrange(plan)

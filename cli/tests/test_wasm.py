@@ -29,6 +29,7 @@ from ffrwd import wasm
 from ffrwd.compiler import (
     Compiled,
     _effect_grants,
+    _model_files,
     _nn_models,
     _pinned_models,
     _source_wasm,
@@ -38,7 +39,7 @@ from ffrwd.compiler import (
 from ffrwd.errors import ErrorCode, FfrwdError
 from ffrwd.execute import CHAIN, PIPELINE, PipeEdge, plan_argv, render_plan
 from ffrwd.functions import Parameter, WasmFunction, package_modules
-from ffrwd.ir import ROWFILTER, Graph, RowsSink
+from ffrwd.ir import ROWFILTER, Graph, Node, Output, RowsSink, SinkUnit
 from ffrwd.lower import lower, lower_table
 from ffrwd.parser import ModuleExport, Resolved, parse, resolve
 from ffrwd.probe import CueMeta, ProbeResult, StreamMeta
@@ -49,6 +50,7 @@ from ffrwd.processes import (
     EffectGrant,
     FfmpegProcess,
     ModelBinding,
+    ModelFile,
     ModuleShape,
     PadMeta,
     ProcessPlan,
@@ -56,6 +58,8 @@ from ffrwd.processes import (
     SidecarProcess,
     StreamEdge,
     VideoFormat,
+    external_ids,
+    partition,
 )
 from ffrwd.project import PackageSet, discover, read_manifest
 from ffrwd.registry import Registry, load_reference
@@ -1026,6 +1030,126 @@ def test_invoke_of_an_nn_module_refuses_a_missing_model(
         f"the module '{module}' runs a model, and '{expected_path}' is not there"
     )
     assert error.hint is not None and "ffrwd install" in error.hint
+
+
+def _pinning_package(
+    tmp_path: Path, pins: list[dict[str, object]] | None
+) -> tuple[WasmFunction, PackageSet]:
+    """A package whose one export, ``depth``, is a module that pins `pins`
+    under ``models``, or pins nothing when `pins` is None."""
+    root = tmp_path / "pkg"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "lib.sql").write_text(
+        "CREATE FUNCTION depth(v video_stream) RETURNS video_stream\n"
+        "  AS 'depth.wasm', 'depth' LANGUAGE wasm;\n",
+        encoding="utf-8",
+    )
+    (root / "depth.wasm").write_bytes(b"\0asm")
+    manifest: dict[str, object] = {
+        "name": "vision/depth",
+        "version": "1.0.0",
+        "lib": {"depth": "src/lib.sql"},
+    }
+    if pins is not None:
+        manifest["models"] = {"depth": pins}
+    (root / "ffrwd.json").write_text(json.dumps(manifest), encoding="utf-8")
+    package = read_manifest(root / "ffrwd.json")
+    packages = PackageSet(
+        root=tmp_path,
+        packages={package.name: package},
+        versions={package.name: {package.version: package}},
+    )
+    return package_modules(package)[0], packages
+
+
+def _pin(file: str) -> dict[str, object]:
+    return {"repo": "vision/depth", "revision": "v1", "file": file, "sha256": "a" * 64}
+
+
+TWO_PINS = [_pin("onnx/model.onnx"), _pin("onnx/model.onnx_data")]
+
+
+def test_a_module_reading_its_files_binds_every_pin_where_install_landed_it(
+    tmp_path: Path,
+) -> None:
+    """One ``-model`` per pin in manifest order, each named by its pin's file
+    name and bound for the module alone: the first where a model always lands
+    (``<export>.onnx``), every later one beside the module under its own
+    name. A module that also runs a model through wasi:nn gets its ``-nn``
+    too, and the region round-trips."""
+    declared, packages = _pinning_package(tmp_path, TWO_PINS)
+    module = declared.module
+    first = wasm.model_path(module, "depth")
+    later = module[: -len("depth.wasm")] + "model.onnx_data"
+    Path(first).write_bytes(b"graph")
+    Path(later).write_bytes(b"weights")
+    described = Described(world="ffrwd:av@0.19.1", name="depth", nn=True, models=True)
+    hosted = {module: declared}
+    describes = {module: described}
+
+    files = _model_files(hosted, describes, packages)
+    assert files == {
+        module: (
+            ModelFile(name="model.onnx", path=first, module=module),
+            ModelFile(name="model.onnx_data", path=later, module=module),
+        )
+    }
+
+    g = Graph(input_paths=["x.mp4"], sources={"a": 0})
+    g.nodes["m0"] = Node(id="m0", filter=module, args={}, inputs=["src:a:v:0"], outputs=["video"])
+    g.sinks = [
+        SinkUnit(outputs=[Output(ref="m0", type="video", name=None, metadata={})], path="o.mkv")
+    ]
+    plan = partition(
+        g,
+        external=external_ids("m0"),
+        models=_nn_models(hosted, describes, packages),
+        model_files=files,
+    )
+    (sidecar,) = plan.sidecars
+    assert SidecarProcess.from_dict(sidecar.to_dict()).model_files == sidecar.model_files
+    argv = wasm.shown_argv(sidecar)
+    at = argv.index("-model")
+    assert argv[at : at + 8] == [
+        "-model", f"model.onnx={first}", "-model-for", module,
+        "-model", f"model.onnx_data={later}", "-model-for", module,
+    ]  # fmt: skip
+    assert argv[argv.index("-nn") + 1] == f"depth={first}"
+
+
+def test_a_module_reading_no_files_gets_no_model_flags(tmp_path: Path) -> None:
+    declared, packages = _pinning_package(tmp_path, TWO_PINS)
+    described = Described(world="ffrwd:av@0.19.1", name="depth")
+    assert _model_files({declared.module: declared}, {declared.module: described}, packages) == {}
+    assert wasm._described(MODULE, {"world": "ffrwd:av@0.19.1", "name": "p", "models": True}).models
+    assert not wasm._described(MODULE, {"world": "ffrwd:av@0.19.1", "name": "p"}).models
+
+
+@pytest.mark.parametrize(
+    ("pins", "landed", "message"),
+    [
+        (
+            TWO_PINS,
+            ("depth.onnx",),
+            "the module '{module}' reads the pinned file 'model.onnx_data', and "
+            "'{root}model.onnx_data' is not there",
+        ),
+        (None, (), "the module '{module}' reads pinned files, and its package pins none"),
+    ],
+)
+def test_a_module_reading_files_it_cannot_be_given_is_refused(
+    tmp_path: Path, pins: list[dict[str, object]] | None, landed: tuple[str, ...], message: str
+) -> None:
+    declared, packages = _pinning_package(tmp_path, pins)
+    module = declared.module
+    root = module[: -len("depth.wasm")]
+    for name in landed:
+        Path(root + name).write_bytes(b"")
+    described = Described(world="ffrwd:av@0.19.1", name="depth", models=True)
+    with pytest.raises(FfrwdError) as caught:
+        _model_files({module: declared}, {module: described}, packages)
+    assert caught.value.message == f"function 'depth': {message.format(module=module, root=root)}"
+    assert caught.value.hint is not None
 
 
 def test_the_plan_renders_as_one_shell_pipeline() -> None:

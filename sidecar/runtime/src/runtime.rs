@@ -87,6 +87,7 @@ use wasmtime_wasi_nn::wit::{WasiNnCtx, WasiNnView};
 
 use crate::egress::{self, NetPolicy};
 use crate::gpu::{self, StoreGpu};
+use crate::models;
 use crate::nn;
 use crate::profile::PROFILE;
 
@@ -1875,6 +1876,9 @@ struct Host {
     /// The binding each model name this module asks for resolves to.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     nn_scope: nn::Scope,
+    /// The files `ffrwd:models/files` reads for this module; none for a
+    /// module that does not import it.
+    models: models::Files,
     http: WasiHttpCtx,
     hooks: egress::Hooks,
     /// The wgpu instance `wasi:webgpu` calls reach: the process's own for a
@@ -1953,6 +1957,26 @@ pub(crate) mod gpu_ext {
         },
         imports: { default: trappable },
     });
+}
+
+/// `ffrwd:models@0.1.0`, the companion of the node world for a module that
+/// reads its pinned files as bytes: `files` it imports.
+pub(crate) mod models_ext {
+    wasmtime::component::bindgen!({
+        path: "../wit-models",
+        world: "models-module",
+        imports: { default: trappable },
+    });
+}
+
+impl models_ext::ffrwd::models::files::Host for Host {
+    fn read(&mut self, name: String) -> wasmtime::Result<Result<Vec<u8>, String>> {
+        Ok(self.models.read(&name))
+    }
+
+    fn names(&mut self) -> wasmtime::Result<Vec<String>> {
+        Ok(self.models.names())
+    }
 }
 
 /// The export a module makes beside `node` to say which ports are on the
@@ -2451,9 +2475,9 @@ enum Purpose {
     Run,
 }
 
-/// Adds WASI to a linker, and wasi-nn, wasi:http and wasi:webgpu as well
-/// when the component asks for them. A module that does not import an
-/// interface gets an unchanged host.
+/// Adds WASI to a linker, and wasi-nn, wasi:http, wasi:webgpu and
+/// `ffrwd:models/files` as well when the component asks for them. A module
+/// that does not import an interface gets an unchanged host.
 ///
 /// A run is where the grants are enforced: a module importing `wasi:http`
 /// without its `-http`, or `wasi:webgpu` without its `-gpu`, is refused
@@ -2465,7 +2489,7 @@ fn link(
     component: &Component,
     module_path: &str,
     purpose: Purpose,
-) -> Result<(Linker<Host>, WasiNnCtx, nn::Scope, StoreGpu)> {
+) -> Result<(Linker<Host>, WasiNnCtx, nn::Scope, StoreGpu, models::Files)> {
     let wants_nn = imports_nn(component);
     if wants_nn && purpose == Purpose::Run {
         nn::require_configured(module_path)?;
@@ -2552,6 +2576,11 @@ fn link(
     if wants_gpu {
         gpu::add_to_linker(&mut linker, component)?;
     }
+    let wants_models = imports_interface(component, models::IMPORT);
+    if wants_models {
+        models_ext::ffrwd::models::files::add_to_linker::<_, HasSelf<_>>(&mut linker, |h| h)
+            .map_err(wasm_err)?;
+    }
     #[cfg(feature = "gpu")]
     if imports_interface(component, GPU_FRAMES_IMPORT) {
         gpu_ext::ffrwd::gpu::frames::add_to_linker::<_, HasSelf<_>>(&mut linker, |h| h)
@@ -2571,7 +2600,12 @@ fn link(
     // Only a run hands a granted module the process's GPU; a describe gets
     // the instance with no backends even when the argv granted one.
     let gpu = StoreGpu::new(wants_gpu && gpu_granted && purpose == Purpose::Run);
-    Ok((linker, nn, nn_scope, gpu))
+    let files = if wants_models {
+        models::Files::bound_for(module_path)
+    } else {
+        models::Files::default()
+    };
+    Ok((linker, nn, nn_scope, gpu, files))
 }
 
 fn engine() -> &'static Engine {
@@ -2730,6 +2764,13 @@ pub fn imports_wasi_udp(module_path: &str) -> Result<bool> {
 pub fn imports_wasi_tcp(module_path: &str) -> Result<bool> {
     let component = compile(module_path)?;
     Ok(imports_interface(&component, TCP_IMPORT_PREFIX))
+}
+
+/// Whether the component at `module_path` reads its bound files through
+/// `ffrwd:models/files`. Read off its imports.
+pub fn imports_models(module_path: &str) -> Result<bool> {
+    let component = compile(module_path)?;
+    Ok(imports_interface(&component, models::IMPORT))
 }
 
 /// Whether the component at `module_path` asks the host for a GPU through
@@ -3650,7 +3691,7 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
     let component = compile(module_path)?;
     check_frame_export(&component, module_path)?;
 
-    let (linker, nn, nn_scope, gpu) = link(&component, module_path, purpose)?;
+    let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
     let policy = egress::net_policy()?;
     let wasi = wasi_ctx(granted(module_path)?, policy);
@@ -3661,6 +3702,7 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
             table: ResourceTable::new(),
             nn,
             nn_scope,
+            models,
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
@@ -4102,7 +4144,7 @@ fn instantiate_values(
     let component = compile(module_path)?;
     check_values_export(&component, module_path)?;
 
-    let (linker, nn, nn_scope, gpu) = link(&component, module_path, purpose)?;
+    let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
     let policy = egress::net_policy()?;
     let wasi = wasi_ctx(granted(module_path)?, policy);
@@ -4113,6 +4155,7 @@ fn instantiate_values(
             table: ResourceTable::new(),
             nn,
             nn_scope,
+            models,
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
@@ -4727,7 +4770,7 @@ fn instantiate_packet(
     let component = compile(module_path)?;
     check_packet_export(&component, module_path)?;
 
-    let (linker, nn, nn_scope, gpu) = link(&component, module_path, purpose)?;
+    let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
     let policy = egress::net_policy()?;
     let wasi = wasi_ctx(granted(module_path)?, policy);
@@ -4738,6 +4781,7 @@ fn instantiate_packet(
             table: ResourceTable::new(),
             nn,
             nn_scope,
+            models,
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
@@ -5195,7 +5239,7 @@ fn instantiate_packet_filter(
     let component = compile(module_path)?;
     check_packet_filter_export(&component, module_path)?;
 
-    let (linker, nn, nn_scope, gpu) = link(&component, module_path, purpose)?;
+    let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
     let policy = egress::net_policy()?;
     let wasi = wasi_ctx(granted(module_path)?, policy);
@@ -5206,6 +5250,7 @@ fn instantiate_packet_filter(
             table: ResourceTable::new(),
             nn,
             nn_scope,
+            models,
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
@@ -5949,7 +5994,7 @@ fn instantiate_packet_source(
     let component = compile(module_path)?;
     check_packet_source_export(&component, module_path)?;
 
-    let (linker, nn, nn_scope, gpu) = link(&component, module_path, purpose)?;
+    let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
     let policy = egress::net_policy()?;
     let wasi = wasi_ctx(granted(module_path)?, policy);
@@ -5960,6 +6005,7 @@ fn instantiate_packet_source(
             table: ResourceTable::new(),
             nn,
             nn_scope,
+            models,
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
@@ -6321,7 +6367,7 @@ fn instantiate_data_filter(
     let component = compile(module_path)?;
     check_data_filter_export(&component, module_path)?;
 
-    let (linker, nn, nn_scope, gpu) = link(&component, module_path, purpose)?;
+    let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
     let policy = egress::net_policy()?;
     let wasi = wasi_ctx(granted(module_path)?, policy);
@@ -6332,6 +6378,7 @@ fn instantiate_data_filter(
             table: ResourceTable::new(),
             nn,
             nn_scope,
+            models,
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
@@ -6849,7 +6896,7 @@ fn instantiate_codec(
         );
     }
 
-    let (linker, nn, nn_scope, gpu) = link(&component, module_path, purpose)?;
+    let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
     let policy = egress::net_policy()?;
     let wasi = wasi_ctx(granted(module_path)?, policy);
@@ -6860,6 +6907,7 @@ fn instantiate_codec(
             table: ResourceTable::new(),
             nn,
             nn_scope,
+            models,
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
@@ -7534,7 +7582,7 @@ fn instantiate_rows_module(
     let component = compile(module_path)?;
     check_rows_module_export(&component, module_path)?;
 
-    let (linker, nn, nn_scope, gpu) = link(&component, module_path, purpose)?;
+    let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
     let policy = egress::net_policy()?;
     let wasi = wasi_ctx(granted(module_path)?, policy);
@@ -7545,6 +7593,7 @@ fn instantiate_rows_module(
             table: ResourceTable::new(),
             nn,
             nn_scope,
+            models,
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu,
@@ -8421,6 +8470,7 @@ mod socket_grant_test {
             table: ResourceTable::new(),
             nn: nn::empty_ctx(),
             nn_scope: nn::Scope::default(),
+            models: models::Files::default(),
             http: WasiHttpCtx::new(),
             hooks: egress::Hooks::new(policy),
             gpu: StoreGpu::new(false),
@@ -8520,7 +8570,8 @@ mod udp_grant_test {
     fn run_component(path: &Path, policy: NetPolicy) -> Result<()> {
         let module_path = path.display().to_string();
         let component = Component::from_file(engine(), path).map_err(wasm_err)?;
-        let (linker, nn, nn_scope, gpu) = link(&component, &module_path, Purpose::Describe)?;
+        let (linker, nn, nn_scope, gpu, models) =
+            link(&component, &module_path, Purpose::Describe)?;
         let mut store = Store::new(
             engine(),
             Host {
@@ -8528,6 +8579,7 @@ mod udp_grant_test {
                 table: ResourceTable::new(),
                 nn,
                 nn_scope,
+                models,
                 http: WasiHttpCtx::new(),
                 hooks: egress::Hooks::new(policy),
                 gpu,

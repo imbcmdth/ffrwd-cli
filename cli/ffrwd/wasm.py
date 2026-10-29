@@ -69,6 +69,7 @@ from .processes import (
     AudioFormat,
     EffectGrant,
     ModelBinding,
+    ModelFile,
     ModuleShape,
     PadMeta,
     RowsDocument,
@@ -124,6 +125,7 @@ __all__ = [
     "invoke",
     "language_tag",
     "model_binding",
+    "model_files",
     "model_path",
     "copy_argv",
     "opens_device",
@@ -388,6 +390,11 @@ _NN_EXCLUDE_FLAG = "-nn-exclude"
 # A module the ``-nn`` before it binds its model for, and no other.
 _NN_FOR_FLAG = "-nn-for"
 
+# A file a module reads as bytes through ffrwd:models/files, by name, and the
+# module the ``-model`` before it is bound for.
+_MODEL_FLAG = "-model"
+_MODEL_FOR_FLAG = "-model-for"
+
 # The sidecar's worker-thread cap. Unwritten, the sidecar sizes its own pool.
 _JOBS_FLAG = "-jobs"
 _PROFILE_FLAG = "-profile"
@@ -631,6 +638,9 @@ class Described:
     udp: bool = False
     tcp: bool = False
     gpu: bool = False
+    # Whether the module imports ffrwd:models/files, and so reads the files
+    # its package pins as bytes, one ``-model`` each.
+    models: bool = False
     video_codecs: tuple[str, ...] | None = None
     audio_codecs: tuple[str, ...] = ()
     video_streams: SinkArity = "one"
@@ -849,6 +859,7 @@ def _described(path: str, payload: object) -> Described:
         udp=payload.get("udp") is True,
         tcp=payload.get("tcp") is True,
         gpu=payload.get("gpu") is True,
+        models=payload.get("models") is True,
         # Present only for a packet sink; its ABSENCE is what marks every
         # other module, so an absent key stays None rather than ().
         video_codecs=_strings(payload["video_codecs"])
@@ -1103,6 +1114,9 @@ def invoke(
     if described is not None:
         if described.nn:
             argv += _nn_args((model_binding(described, path),), nn.spawn_args())
+        # A module reading its pinned files gets no -model here: a value
+        # call has the module's path and describe, not the manifest pinning
+        # its files, so `read` answers it with the host's refusal.
         argv += _grant_args(described, path)
     argv += [_INVOKE_FLAG, path, function, payload]
     budget = timeout_seconds()
@@ -1984,6 +1998,15 @@ def _nn_args(models: Sequence[ModelBinding], runtime: Sequence[str]) -> list[str
     return argv
 
 
+def _model_file_args(files: Sequence[ModelFile]) -> list[str]:
+    """One ``-model name=path`` per file, each followed by the ``-model-for
+    <module>`` it is bound for."""
+    argv: list[str] = []
+    for file in files:
+        argv += [_MODEL_FLAG, f"{file.name}={file.path}", _MODEL_FOR_FLAG, file.module]
+    return argv
+
+
 def _argv(
     binary: str,
     process: SidecarProcess,
@@ -2121,6 +2144,7 @@ def _argv(
     if process.reads_rows:
         argv += [_ANNOTATIONS_FLAG, ANNOTATIONS_IN]
     argv += _nn_args(process.models, runtime)
+    argv += _model_file_args(process.model_files)
     argv += list(av_runtime)
     for grant in process.grants:
         argv += [_GRANT_FLAGS[grant.effect], grant.module]
@@ -2506,6 +2530,38 @@ def model_binding(
             "what its manifest pins",
         )
     return ModelBinding(name=described.name, path=path, not_on=tuple(not_on))
+
+
+def model_files(module: str, export: str, names: Sequence[str]) -> tuple[ModelFile, ...]:
+    """The ``-model`` entries `module` needs, one per file its export pins, or
+    a rejection.
+
+    `names` is each pin's file name, in manifest order. Each file is bound by
+    that name and found where install landed it: the first as
+    :func:`model_path`, every later one beside the module under its own name.
+    The paths are written into the argv at compile time, so each file has to
+    be there now. A module with no pins is refused: it reads pinned files,
+    and nothing would bind one.
+    """
+    if not names:
+        raise _reject(
+            f"the module '{module}' reads pinned files, and its package pins none",
+            hint=f"a module that reads its files is given the ones its package's "
+            f"manifest pins under \"models\" for '{export}'",
+        )
+    cut = max(module.rfind("/"), module.rfind("\\"))
+    found: list[ModelFile] = []
+    for number, name in enumerate(names):
+        path = model_path(module, export) if number == 0 else f"{module[: cut + 1]}{name}"
+        if not Path(path).is_file():
+            raise _reject(
+                f"the module '{module}' reads the pinned file '{name}', and '{path}' is not there",
+                hint="a module that reads its pinned files expects them beside its "
+                "wasm file; `ffrwd install` in the package fetches what its "
+                "manifest pins",
+            )
+        found.append(ModelFile(name=name, path=path, module=module))
+    return tuple(found)
 
 
 def rows_fields(described: Described) -> tuple[tuple[str, str], ...] | None:

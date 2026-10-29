@@ -848,8 +848,9 @@ listing: an `http://` or `https://` URL, at most 300 characters,
 trimmed - empty after trimming is the same as omitting the key.
 
 `capabilities` is what the host must grant this package's modules:
-`nn` to run a model, `http` to make HTTP requests, `udp` to open UDP
-sockets, `tcp` to open TCP ones. Anything else is refused, naming the
+`nn` to run a model, `gpu` to hold frames on the sidecar's device,
+`http` to make HTTP requests, `udp` to open UDP sockets, `tcp` to open
+TCP ones. Anything else is refused, naming the
 list. These are grants, not wasi imports - clocks
 and random are ambient, and a module having them declares nothing.
 Absent means the same as empty. `publish` derives the set from what
@@ -941,6 +942,18 @@ a module's host build and its GPU build, share one binding where they
 load one file, kept off every provider either pin names. Where the files
 differ, each file is bound for the modules loading it alone, with
 `-nn-for <module>` after its `-nn`.
+
+A module that runs its model in its own code imports
+`ffrwd:models/files` instead of `wasi:nn` and is handed its pins as
+bytes: `ffrwd compile` writes every entry of its export's `models` list
+as `-model <name>=<path>` followed by `-model-for <module>`, `<name>`
+being the entry's file name as the hub spells it (`model_small.bin`),
+and the module reads each by that name. The entries land as above - the
+first as `<export>.onnx`, the rest under their own names - and a module
+whose describe says it reads files while its package pins none, or
+whose pinned file is not beside it, is refused at compile time.
+`sidecar/NN-EDGE.md`, "Files a module reads itself", has the sidecar's
+side.
 
 A query calls into an installed package one of two ways, always
 written in full:
