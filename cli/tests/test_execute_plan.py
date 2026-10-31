@@ -1733,9 +1733,12 @@ def test_a_child_in_this_processs_own_group_is_ended_alone(
     assert child.terminated
 
 
-def test_a_child_in_a_session_of_its_own_has_its_group_ended(
+def test_a_child_in_a_session_of_its_own_has_its_group_ended_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The child is in the group that was signalled, so it is not signalled
+    again: ffmpeg exits at once on a second SIGTERM and leaves its trailer
+    unwritten."""
     monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
     signalled: list[int] = []
     monkeypatch.setattr(
@@ -1747,13 +1750,44 @@ def test_a_child_in_a_session_of_its_own_has_its_group_ended(
 
     class _Child:
         pid = 99
+        terminated = False
 
         def terminate(self) -> None:
-            pass
+            self.terminated = True
 
-    _EXECUTE._end_tree(cast(Any, _Child()))
+    child = _Child()
+    _EXECUTE._end_tree(cast(Any, child))
 
     assert signalled == [7]
+    assert not child.terminated
+
+
+def test_a_child_whose_group_cannot_be_signalled_is_still_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group that is gone by the time it is signalled leaves the child
+    itself to end, as before."""
+    monkeypatch.setattr(_EXECUTE.sys, "platform", "linux")
+
+    def _gone(group: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(
+        _EXECUTE.os, "getpgid", lambda pid: 7 if pid == 99 else 4242, raising=False
+    )
+    monkeypatch.setattr(_EXECUTE.os, "killpg", _gone, raising=False)
+
+    class _Child:
+        pid = 99
+        terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    child = _Child()
+    _EXECUTE._end_tree(cast(Any, child))
+
+    assert child.terminated
 
 
 def test_a_watched_command_runs_in_a_session_of_its_own_off_windows(

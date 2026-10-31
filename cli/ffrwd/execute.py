@@ -3319,6 +3319,10 @@ def _end_tree(proc: subprocess.Popen[bytes]) -> None:
             # the group would end this process and its shell with it.
             if group != os.getpgid(0):
                 os.killpg(group, signal.SIGTERM)
+                # The child is in that group, so it has its signal. A second
+                # SIGTERM makes ffmpeg exit at once, before it has written
+                # its trailer, and leaves a recording with no duration.
+                return
     with contextlib.suppress(OSError):
         proc.terminate()
 
