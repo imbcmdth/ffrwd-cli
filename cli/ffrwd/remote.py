@@ -15,6 +15,15 @@ listing row omits, its log tail included. A failed or cancelled job's tail
 also prints on its own, right under the error: from ``--wait`` when the job
 it is following lands there, and from ``--watch`` once its loop stops.
 
+A live job's runner reports a ``status`` in its heartbeats: one ``feeds``
+entry per input an encoder sends to, with the ingest host, ports and key,
+and one ``outputs`` entry per output the cluster delivers, with its kind,
+state and where it delivers. ``ffrwd jobs <id>`` prints both above the log
+tail, :func:`wait_for_send_to` prints the feeds' addresses right after a
+live submit, and ``--wait`` prints each output's address as it appears. A
+live job's outputs are those addresses, so ``--fetch`` fetches nothing from
+one and says so.
+
 Every refusal this module makes is decided BEFORE anything reaches the
 network, and every one is a typed :class:`~ffrwd.errors.FfrwdError` with a
 hint; the server's own refusals (``{error, hint}`` bodies with honest
@@ -114,6 +123,7 @@ __all__ = [
     "jobs_command",
     "submit_run",
     "wait_for_run",
+    "wait_for_send_to",
 ]
 
 # The submit payload format this client writes. The endpoint refuses any
@@ -134,6 +144,11 @@ MAX_PACKAGE_BYTES = 32 * 1024 * 1024
 
 # How often --watch redraws.
 WATCH_SECONDS = 3.0
+
+# How long a fresh live submit is given to report where to send, polled at
+# --watch's pace. A runner claims the job and reports its feeds well inside
+# this in practice.
+_SEND_TO_WAIT_SECONDS = 60.0
 
 _CHUNK_BYTES = 1 << 20
 
@@ -435,11 +450,12 @@ class Submitted:
 
     `remaining` is the server's own object, verbatim -- None on a server that
     predates the free allotment, in which case the caller prints nothing
-    about it.
+    about it. `live` is whether the job was submitted as a live one.
     """
 
     job_id: str
     remaining: dict[str, object] | None
+    live: bool = False
 
 
 def submit_run(
@@ -540,7 +556,7 @@ def submit_run(
     if detail is not None:
         detail("queueing the job")
     _call(ready_url, headers=_bearer(token), data=b"{}", timeout=_DATA_PLANE_TIMEOUT)
-    return Submitted(job_id=job_id, remaining=_remaining(answer))
+    return Submitted(job_id=job_id, remaining=_remaining(answer), live=live)
 
 
 def _inputs(text: str) -> tuple[list[dict[str, object]], list[tuple[int, str]]]:
@@ -1271,21 +1287,31 @@ def _ago(when: datetime | None, now: datetime) -> str:
     return f"{seconds // 86400}d ago"
 
 
+def _state_word(row: dict[str, object]) -> str:
+    """The state a row is shown in: its own, or ``stopping`` for a live job
+    that was asked to stop and has not ended yet."""
+    state = _text(row, "state")
+    if state in _ACTIVE_STATES and _text(row, "stop_requested_at"):
+        return "stopping"
+    return state
+
+
 def _listing_table(rows: list[dict[str, object]], now: datetime) -> TableResult:
     shown: list[list[CellValue]] = []
     for row in rows:
         shown.append(
             [
                 _text(row, "id")[:8],
-                _text(row, "state"),
+                _state_word(row),
                 _text(row, "recipe") or "sql",
                 bool(row.get("gpu")),
+                bool(row.get("live")),
                 _runtime(_seconds(row, "duration_cpu_s"), _seconds(row, "duration_gpu_s")),
                 _ago(_parse_when(row.get("created_at")), now),
             ]
         )
     return TableResult(
-        columns=["id", "state", "recipe", "gpu", "runtime", "created"], rows=shown
+        columns=["id", "state", "recipe", "gpu", "live", "runtime", "created"], rows=shown
     )
 
 
@@ -1366,7 +1392,9 @@ def _show_job(token: str, written: str, *, as_json: bool) -> int:
 
 def _print_job_detail(detail: dict[str, object], now: datetime) -> None:
     """The listing's own row rendering for one job, plus what a listing
-    never carries: its error/hint pair, its outputs, and its log tail."""
+    never carries: its error/hint pair, a live job's status (where each
+    input is sent and where each output delivers), its outputs, and its
+    log tail."""
     print(render_table(_listing_table([detail], now)))
     if _text(detail, "state") in ("failed", "cancelled"):
         error = _text(detail, "error")
@@ -1375,6 +1403,8 @@ def _print_job_detail(detail: dict[str, object], now: datetime) -> None:
             print(f"error: {error}")
         if hint:
             print(f"hint: {hint}")
+    for line in _status_lines(detail):
+        print(line)
     outputs = detail.get("outputs")
     if isinstance(outputs, list):
         for one in outputs:
@@ -1391,6 +1421,215 @@ def _print_job_detail(detail: dict[str, object], now: datetime) -> None:
     block = _tail_block(detail)
     if block is not None:
         print(block)
+
+
+# --------------------------------------------------------------------------
+# a live job's status
+# --------------------------------------------------------------------------
+
+# The port each ingest protocol is reached on when the address needs none
+# spelled: the protocol's own default.
+_DEFAULT_PORTS = {"rtmp": 1935, "rtmps": 443}
+
+
+def _status_entries(detail: dict[str, object], key: str) -> list[dict[str, object]]:
+    """The objects under ``status.<key>``: the feeds or the outputs a live
+    job's runner reported. Empty for a job with no status, and for a
+    runner that reports something else under it."""
+    status = detail.get("status")
+    if not isinstance(status, dict):
+        return []
+    entries = status.get(key)
+    if not isinstance(entries, list):
+        return []
+    return [
+        {str(name): value for name, value in entry.items()}
+        for entry in entries
+        if isinstance(entry, dict)
+    ]
+
+
+def _send_to(ingest: object) -> list[str]:
+    """Where an encoder sends one feed: one line per host and protocol, the
+    key included. SRT carries the key as ``streamid``, RTMP as the stream
+    name under ``live``; any other protocol is spelled host and port with
+    the key beside it."""
+    if not isinstance(ingest, dict):
+        return []
+    key = _text(ingest, "key")
+    hosts = ingest.get("hosts")
+    ports = ingest.get("ports")
+    if not isinstance(hosts, list) or not isinstance(ports, list):
+        return []
+    lines: list[str] = []
+    for host in hosts:
+        if not isinstance(host, str):
+            continue
+        for entry in ports:
+            if not isinstance(entry, dict):
+                continue
+            protocol = _text(entry, "protocol").lower()
+            port = entry.get("port")
+            if not protocol or isinstance(port, bool) or not isinstance(port, int):
+                continue
+            if protocol == "srt":
+                address = f"srt://{host}:{port}?streamid={key}"
+            elif protocol in _DEFAULT_PORTS:
+                at = host if port == _DEFAULT_PORTS[protocol] else f"{host}:{port}"
+                address = f"{protocol}://{at}/live/{key}"
+            else:
+                address = f"{protocol}://{host}:{port} with key {key}"
+            lines.append(f"send {protocol.upper()} to {address}")
+    return lines
+
+
+def _feed_lines(feed: dict[str, object]) -> list[str]:
+    """One feed: the input it is, whether a sender is connected, and the
+    addresses to send to beneath."""
+    index = feed.get("input")
+    label = (
+        f"input {index}" if isinstance(index, int) and not isinstance(index, bool) else "input"
+    )
+    name = _text(feed, "name")
+    if name:
+        label = f"{label} ({name})"
+    connected = "a sender is connected" if feed.get("live") is True else "no sender connected"
+    return [f"{label}: {connected}", *(f"  {line}" for line in _send_to(feed.get("ingest")))]
+
+
+def _delivers_at(output: dict[str, object]) -> str:
+    """Where one output delivers, by its kind: a playlist URL, a relay URL
+    and broadcast name, a bucket prefix. A push's destination is the
+    owner's secret and the runner never sends it; the protocol stands in."""
+    kind = _text(output, "kind")
+    if kind == "push":
+        protocol = _text(output, "protocol")
+        return f"{protocol} (destination withheld)" if protocol else "(destination withheld)"
+    if kind == "relay":
+        parts = [_text(output, "relay")]
+        broadcast = _text(output, "broadcast")
+        if broadcast:
+            parts.append(f"broadcast {broadcast}")
+        return ", ".join(part for part in parts if part)
+    if kind in ("record", "thumbnail"):
+        parts = []
+        if _text(output, "bucket"):
+            parts.append(f"bucket {_text(output, 'bucket')}")
+        if _text(output, "prefix"):
+            parts.append(f"prefix {_text(output, 'prefix')}")
+        return ", ".join(parts)
+    return _text(output, "url")
+
+
+def _output_line(output: dict[str, object], *, with_state: bool) -> str:
+    """One output: its name, kind and (when asked) state, then where it delivers."""
+    name = _text(output, "name") or "output"
+    tags = [_text(output, "kind")]
+    if with_state:
+        tags.append(_text(output, "state"))
+    named = ", ".join(tag for tag in tags if tag)
+    head = f"output {name} ({named})" if named else f"output {name}"
+    where = _delivers_at(output)
+    return f"{head}: {where}" if where else head
+
+
+def _status_lines(detail: dict[str, object]) -> list[str]:
+    """What ``ffrwd jobs <id>`` prints of a live job's status: each feed with
+    its send-to addresses, then each output with its address and, when it
+    has one, its error. Empty for a job with no status."""
+    lines: list[str] = []
+    for feed in _status_entries(detail, "feeds"):
+        lines.extend(_feed_lines(feed))
+    for output in _status_entries(detail, "outputs"):
+        lines.append(_output_line(output, with_state=True))
+        error = _text(output, "error")
+        if error:
+            lines.append(f"  error: {error}")
+    return lines
+
+
+def _live_outputs_note(job_id: str, detail: dict[str, object] | None) -> str:
+    """The one sentence a fetch of a live job prints instead of fetching:
+    its outputs are addresses, and a recording's prefix is named."""
+    short = job_id[:8]
+    recordings = [
+        output
+        for output in (_status_entries(detail, "outputs") if detail is not None else [])
+        if _text(output, "kind") == "record" and _delivers_at(output)
+    ]
+    if recordings:
+        where = "; ".join(_delivers_at(output) for output in recordings)
+        return (
+            f"{short} is a live job and its recording is at {where}; fetching a "
+            "recording is a later addition, so nothing was fetched"
+        )
+    return (
+        f"{short} is a live job: its outputs are addresses in its status, which "
+        f"`ffrwd jobs {short}` shows, so nothing was fetched"
+    )
+
+
+def _live_detach_message(job_id: str) -> str:
+    short = job_id[:8]
+    return (
+        f"detached: {job_id} keeps running -- "
+        f"`ffrwd jobs {short}` shows where to send and what it delivers, "
+        f"`ffrwd jobs --stop {short}` ends it"
+    )
+
+
+def wait_for_send_to(job_id: str, *, console: Console) -> int:
+    """After a live submit: poll the job until its status says where to
+    send, and print each feed's addresses. Returns 0, or 130 when a Ctrl-C
+    ended the wait; the job keeps running either way.
+
+    The poll gives the runner ``_SEND_TO_WAIT_SECONDS`` to claim the job
+    and report its feeds, then says where the addresses appear once it
+    does. A job the server did not take as live, or one that ended first,
+    stops the poll too. The submit already succeeded and its id is printed,
+    so a read that fails here ends the poll with one line rather than
+    turning the run into a failure.
+    """
+    token = _token()
+    short = job_id[:8]
+    polls = int(_SEND_TO_WAIT_SECONDS / WATCH_SECONDS)
+    detail: dict[str, object] = {}
+    lines: list[str] = []
+    try:
+        with console.status("waiting for where to send"):
+            for attempt in range(polls):
+                if attempt:
+                    _sleep(WATCH_SECONDS)
+                detail = _job_detail(token, job_id)
+                for feed in _status_entries(detail, "feeds"):
+                    lines.extend(_feed_lines(feed))
+                if lines or detail.get("live") is False:
+                    break
+                if _text(detail, "state") in _WAIT_TERMINAL_STATES:
+                    break
+    except KeyboardInterrupt:
+        console.end_transient()
+        print(_live_detach_message(job_id), file=sys.stderr)
+        return 130
+    except FfrwdError as err:
+        console.say(
+            f"{short} could not be read ({err.message}); "
+            f"`ffrwd jobs {short}` shows where to send"
+        )
+        return 0
+    for line in lines:
+        print(line)
+    if lines or detail.get("live") is False:
+        return 0
+    state = _text(detail, "state")
+    if state in _WAIT_TERMINAL_STATES:
+        console.say(f"{short} is {state}; `ffrwd jobs {short}` shows its detail")
+    else:
+        console.say(
+            f"{short} has not reported where to send yet; "
+            f"`ffrwd jobs {short}` shows it once it does"
+        )
+    return 0
 
 
 def _print_row_failure(row: dict[str, object], detail: dict[str, object] | None) -> None:
@@ -1427,23 +1666,30 @@ def _watch(token: str) -> int:
         return 0
 
 
-def _resolve_id(token: str, written: str) -> str:
-    """The one job id `written` names, resolved as a prefix of the caller's own."""
+def _resolve_row(token: str, written: str) -> dict[str, object]:
+    """The one listing row `written` names, resolved as a prefix of the caller's own."""
     wanted = written.lower()
-    ids = [job_id for row in _rows(token) if (job_id := _text(row, "id"))]
-    if wanted in ids:
-        return wanted
-    matches = [one for one in ids if one.startswith(wanted)]
+    rows = [row for row in _rows(token) if _text(row, "id")]
+    for row in rows:
+        if _text(row, "id") == wanted:
+            return row
+    matches = [row for row in rows if _text(row, "id").startswith(wanted)]
     if not matches:
         raise _reject(
             f"'{written}' matches none of your jobs", "run `ffrwd jobs` to list them"
         )
     if len(matches) > 1:
         raise _reject(
-            f"'{written}' matches more than one job: {', '.join(matches)}",
+            f"'{written}' matches more than one job: "
+            f"{', '.join(_text(row, 'id') for row in matches)}",
             "give more of the id",
         )
     return matches[0]
+
+
+def _resolve_id(token: str, written: str) -> str:
+    """The one job id `written` names, resolved as a prefix of the caller's own."""
+    return _text(_resolve_row(token, written), "id")
 
 
 def _cancel(token: str, written: str) -> int:
@@ -1510,9 +1756,16 @@ def _fetch(
     file lands at its as-written path with its siblings beside it. Shared by
     ``jobs --fetch`` (which only cares that this returns at all -- a raise is
     the failure) and ``--wait`` (which reports the paths itself, as JSON,
-    when `quiet` drops the plain ``wrote <path>`` lines).
+    when `quiet` drops the plain ``wrote <path>`` lines). A live job's
+    outputs are addresses in its status, not files in the store: nothing is
+    fetched from one, and one sentence says so.
     """
-    job_id = _resolve_id(token, written)
+    row = _resolve_row(token, written)
+    job_id = _text(row, "id")
+    if row.get("live") is True:
+        if not quiet:
+            print(_live_outputs_note(job_id, _try_job_detail(token, job_id)))
+        return []
     where = f"{_jobs_url()}/{job_id}/fetch"
     answer = _json_object(_call(where, headers=_bearer(token), data=b"{}"), where)
     outputs = _outputs(answer, where)
@@ -1809,20 +2062,41 @@ def _bar_line(row: dict[str, object]) -> str:
     pct = _percent(row)
     filled = int(round(_BAR_WIDTH * pct / 100))
     bar = "#" * filled + "-" * (_BAR_WIDTH - filled)
-    return f"[{bar}] {int(pct):3d}% {_text(row, 'state')}"
+    return f"[{bar}] {int(pct):3d}% {_state_word(row)}"
 
 
 def _poll_to_terminal(
-    token: str, job_id: str, *, draw: Callable[[str], None] | None
+    token: str,
+    job_id: str,
+    *,
+    draw: Callable[[str], None] | None,
+    live: bool = False,
+    show: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, object], dict[str, object] | None]:
     """Redraw the bar off the same listing --watch reads, until `job_id` lands.
 
     `draw` is None under --json, which draws nothing. Returns the terminal
-    row alongside that poll's `remaining`, for the budget note.
+    row alongside that poll's `remaining`, for the budget note. A `live`
+    job is polled through its own detail instead, which carries its status:
+    each output's address goes to `show` once, when the output first
+    appears, and the row returned is the detail, status included; the
+    listing's `remaining` is not read then.
     """
+    shown: set[str] = set()
     while True:
-        rows, remaining = _listing(token)
-        row = next((one for one in rows if _text(one, "id") == job_id), None)
+        row: dict[str, object] | None
+        remaining: dict[str, object] | None = None
+        if live:
+            row = _job_detail(token, job_id)
+            for output in _status_entries(row, "outputs"):
+                name = _text(output, "name")
+                if name and name not in shown and _delivers_at(output):
+                    shown.add(name)
+                    if show is not None:
+                        show(_output_line(output, with_state=False))
+        else:
+            rows, remaining = _listing(token)
+            row = next((one for one in rows if _text(one, "id") == job_id), None)
         if row is not None:
             if draw is not None:
                 draw(_bar_line(row))
@@ -1862,7 +2136,9 @@ def _detach_message(job_id: str) -> str:
     )
 
 
-def wait_for_run(job_id: str, args: argparse.Namespace, *, console: Console) -> int:
+def wait_for_run(
+    job_id: str, args: argparse.Namespace, *, console: Console, live: bool = False
+) -> int:
     """``run --remote --wait``: poll `job_id` to a terminal state, then fetch.
 
     Shares `_listing` (--watch's own endpoint and interval) for the poll, and
@@ -1872,21 +2148,32 @@ def wait_for_run(job_id: str, args: argparse.Namespace, *, console: Console) -> 
     any written paths) as one JSON object instead of the plain narration. A
     failed or cancelled job also fetches its own detail here, to print (or,
     under --json, to carry) its log tail -- the thing the row's own error
-    tells you to look at.
+    tells you to look at. A `live` job is polled through its detail, each
+    output's address printed once as it appears, and nothing is fetched at
+    the end: its outputs are those addresses.
     """
     token = _token()
     draw = None if args.as_json else console.transient
+
+    def _show(line: str) -> None:
+        console.end_transient()
+        print(line)
+
+    show = None if args.as_json else _show
     try:
-        row, remaining = _poll_to_terminal(token, job_id, draw=draw)
+        row, remaining = _poll_to_terminal(token, job_id, draw=draw, live=live, show=show)
     except KeyboardInterrupt:
         console.end_transient()
-        print(_detach_message(job_id), file=sys.stderr)
+        print(
+            _live_detach_message(job_id) if live else _detach_message(job_id), file=sys.stderr
+        )
         return 130
     console.end_transient()
     state = _text(row, "state")
 
     if state in ("failed", "cancelled"):
-        detail = _try_job_detail(token, job_id)
+        # A live job's row is its detail already, tail included.
+        detail = row if live else _try_job_detail(token, job_id)
         if args.as_json:
             payload = dict(row)
             payload["log_tail"] = detail.get("log_tail") if detail is not None else None
@@ -1894,6 +2181,13 @@ def wait_for_run(job_id: str, args: argparse.Namespace, *, console: Console) -> 
             return 1
         _print_row_failure(row, detail)
         return 1
+
+    if live or row.get("live") is True:
+        if args.as_json:
+            print(json.dumps({"job": row, "written": []}, indent=2))
+        else:
+            print(_live_outputs_note(job_id, row))
+        return 0
 
     # succeeded, budget-stopped or not: fetched exactly as `jobs --fetch` does.
     announce = None if args.as_json else console.say

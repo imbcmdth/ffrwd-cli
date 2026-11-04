@@ -488,11 +488,17 @@ def test_submit_posts_the_spec_puts_the_file_and_queues_the_job(
     # The body is streamed off the disk, so its length is named rather than
     # left for urllib to measure.
     assert put.headers["content-length"] == "11"
-    # Then the same bearer queues it, and nothing goes anywhere else.
+    # Then the same bearer queues it, and the job being live, one read of
+    # where to send, which this table does not answer. Nothing else.
     ready = served.request_to(READY_URL)
     assert ready.method == "POST"
     assert ready.headers["authorization"] == f"Bearer {TOKEN}"
-    assert [asked.url for asked in served.asked] == [JOBS_URL, _put_url(0), READY_URL]
+    assert [asked.url for asked in served.asked] == [
+        JOBS_URL,
+        _put_url(0),
+        READY_URL,
+        _detail_url(JOB_ID),
+    ]
 
 
 def _reported(progress: list[tuple[int, int | None]]) -> Progress:
@@ -1568,6 +1574,17 @@ ROW_OLD = {
     "duration_gpu_s": None,
     "created_at": "2026-07-10T00:00:00+00:00",
 }
+ROW_LIVE = {
+    "id": "cccc3333-0000-0000-0000-000000000000",
+    "state": "running",
+    "recipe": None,
+    "gpu": True,
+    "live": True,
+    "stop_requested_at": "2026-08-29T11:55:00+00:00",
+    "duration_cpu_s": 0,
+    "duration_gpu_s": None,
+    "created_at": "2026-08-29T11:30:00+00:00",
+}
 
 
 def _listing(
@@ -1589,22 +1606,32 @@ def fixed_clock(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_jobs_lists_a_table_with_the_month_footer(
     served: _Served, logged_in: None, fixed_clock: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    _listing(served, ROW_DONE, ROW_OLD)
+    _listing(served, ROW_DONE, ROW_LIVE, ROW_OLD)
     code = cli.main(["jobs"])
     out = capsys.readouterr().out
     assert code == 0
     # The cells are this test's expectation; the layout is render_table's,
     # pinned by the cookbook. July's job shows in the table but stays out of
-    # the month line: only what this month spent counts.
+    # the month line: only what this month spent counts. The live job was
+    # asked to stop and has not ended: its state reads as the stop.
     expected = TableResult(
-        columns=["id", "state", "recipe", "gpu", "runtime", "created"],
+        columns=["id", "state", "recipe", "gpu", "live", "runtime", "created"],
         rows=[
-            ["aaaa1111", "succeeded", "broadcast/tracks:duck", True, "5m00s+1m00s gpu", "1h ago"],
-            ["bbbb2222", "failed", "sql", False, "1m30s", "50d ago"],
+            [
+                "aaaa1111",
+                "succeeded",
+                "broadcast/tracks:duck",
+                True,
+                False,
+                "5m00s+1m00s gpu",
+                "1h ago",
+            ],
+            ["cccc3333", "stopping", "sql", True, True, "", "30m ago"],
+            ["bbbb2222", "failed", "sql", False, False, "1m30s", "50d ago"],
         ],
     )
     assert out == render_table(expected) + (
-        "\nthis month: 5 min cpu · 1 min gpu · 1 jobs\n"
+        "\nthis month: 5 min cpu · 1 min gpu · 2 jobs\n"
         "free this month: 47m CPU + 15m GPU remaining\n"
     )
 
@@ -1727,6 +1754,77 @@ def _detail_url(job_id: str) -> str:
     return f"{JOBS_URL}/{job_id}"
 
 
+# A live job's status as the runner reports it: two feeds, one with a sender
+# connected, and three outputs. The push carries a destination the server
+# never actually sends, so that the renderer is seen to leave one alone.
+INGEST_HOST = "ingest-dev.ffrwd.video"
+KEY_ONE = "k1-5e2f7a9c3b1d"
+KEY_TWO = "k2-0d4b8e6f2a7c"
+HLS_URL = "https://egress-public.example/jobs/aaaa1111/hls/master.m3u8"
+RELAY_URL = "https://relay.example/anon?jwt=subscribe-token"
+PUSH_DESTINATION = "rtmp://live.example/app/never-shown"
+
+
+def _feed(name: str, index: int, key: str, *, live: bool) -> dict[str, object]:
+    return {
+        "name": name,
+        "input": index,
+        "live": live,
+        "ingest": {
+            "key": key,
+            "hosts": [INGEST_HOST],
+            "ports": [{"port": 9000, "protocol": "srt"}, {"port": 1935, "protocol": "rtmp"}],
+            "live": live,
+        },
+    }
+
+
+STATUS_OUTPUTS: list[dict[str, object]] = [
+    {"name": "hls", "kind": "package", "state": "live", "url": HLS_URL},
+    {
+        "name": "cf",
+        "kind": "relay",
+        "state": "connecting",
+        "relay": RELAY_URL,
+        "broadcast": "aaaa1111",
+    },
+    {
+        "name": "twitch",
+        "kind": "push",
+        "state": "retrying",
+        "protocol": "rtmp",
+        "error": "connection refused",
+        "url": PUSH_DESTINATION,
+    },
+]
+RECORDING: dict[str, object] = {
+    "name": "rec",
+    "kind": "record",
+    "state": "live",
+    "bucket": "ffrwd-public",
+    "prefix": "jobs/aaaa1111/rec",
+}
+STATUS: dict[str, object] = {
+    "phase": "Running",
+    "feeds": [_feed("in1", 1, KEY_ONE, live=True), _feed("in2", 2, KEY_TWO, live=False)],
+    "outputs": STATUS_OUTPUTS,
+}
+SEND_TO_LINES = [
+    "input 1 (in1): a sender is connected",
+    f"  send SRT to srt://{INGEST_HOST}:9000?streamid={KEY_ONE}",
+    f"  send RTMP to rtmp://{INGEST_HOST}/live/{KEY_ONE}",
+    "input 2 (in2): no sender connected",
+    f"  send SRT to srt://{INGEST_HOST}:9000?streamid={KEY_TWO}",
+    f"  send RTMP to rtmp://{INGEST_HOST}/live/{KEY_TWO}",
+]
+OUTPUT_LINES = [
+    f"output hls (package, live): {HLS_URL}",
+    f"output cf (relay, connecting): {RELAY_URL}, broadcast aaaa1111",
+    "output twitch (push, retrying): rtmp (destination withheld)",
+    "  error: connection refused",
+]
+
+
 def test_jobs_id_shows_one_jobs_detail_including_the_tail(
     served: _Served, logged_in: None, fixed_clock: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1776,13 +1874,16 @@ def test_jobs_id_with_a_null_tail_prints_nothing_extra(
     served: _Served, logged_in: None, fixed_clock: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _listing(served, ROW_DONE)
-    detail = dict(ROW_DONE, log_tail=None, outputs=None)
+    # An older runner's status names no feeds and no outputs: nothing of it prints.
+    older = {"phase": "Running", "ingest": {"host": "ingest.example"}, "ingestPorts": [9000]}
+    detail = dict(ROW_DONE, log_tail=None, outputs=None, status=older)
     served.answers[_detail_url(str(ROW_DONE["id"]))] = json.dumps(detail).encode("utf-8")
     code = cli.main(["jobs", "aaaa"])
     out = capsys.readouterr().out
     assert code == 0
     assert "log tail" not in out
-    assert "output:" not in out
+    assert "output" not in out
+    assert "input" not in out and "ingest.example" not in out
 
 
 def test_jobs_id_truncates_a_long_tail_and_says_so(
@@ -1800,11 +1901,13 @@ def test_jobs_id_truncates_a_long_tail_and_says_so(
     assert "L06" in out and "L25" in out  # the last 20 remain
 
 
-def test_jobs_id_json_carries_the_log_tail_verbatim(
+def test_jobs_id_json_carries_the_detail_verbatim_status_and_live_included(
     served: _Served, logged_in: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _listing(served, ROW_DONE)
-    detail = dict(ROW_DONE, log_tail="line one\nline two", outputs=None)
+    detail = dict(
+        ROW_DONE, log_tail="line one\nline two", outputs=None, live=True, status=STATUS
+    )
     served.answers[_detail_url(str(ROW_DONE["id"]))] = json.dumps(detail).encode("utf-8")
     code = cli.main(["jobs", "aaaa", "--json"])
     captured = capsys.readouterr()
@@ -2230,6 +2333,10 @@ def test_bar_line_renders_the_fill_and_the_state() -> None:
     assert line.startswith("[") and line.endswith("42% running")
     assert line.count("#") == 10  # round(24 * 42 / 100)
     assert line.count("-") == 14
+    # A live job asked to stop reads as the stop until it ends.
+    stopping = {"progress_pct": 42, "state": "running", "stop_requested_at": FRESH_UNTIL}
+    assert remote._bar_line(stopping).endswith("42% stopping")
+    assert remote._bar_line(dict(stopping, state="succeeded")).endswith("succeeded")
 
 
 def test_wait_polls_to_success_and_fetches_the_output(
@@ -2669,3 +2776,191 @@ def test_a_placement_that_means_nothing_is_refused_before_any_request(
     with pytest.raises(FfrwdError):
         remote.submit_run(_query(MEDIA_QUERY), None, _run_args(live=True, placement="fastest"))
     assert served.asked == []
+
+
+# ---------------------------------------------------------------------------
+# a live job's status: where to send, and where each output delivers
+# ---------------------------------------------------------------------------
+
+LIVE_QUERY = "COPY (SELECT a.video[1] FROM input('srt://relay.example:9000') a) TO 'out.mkv'"
+
+
+def _live_detail(state: str, *, status: dict[str, object] | None = None) -> dict[str, object]:
+    """GET /jobs/<id>'s answer for the submitted job as a live one."""
+    return dict(_wait_row(state), live=True, log_tail=None, outputs=None, status=status)
+
+
+def _detail_polling(served: _Served, bodies: list[dict[str, object]]) -> object:
+    return _wait_polling(served, _detail_url(JOB_ID), bodies)
+
+
+def _fetched(served: _Served) -> bool:
+    return any(asked.url.endswith("/fetch") for asked in served.asked)
+
+
+def test_jobs_id_prints_where_to_send_and_each_outputs_address_above_the_tail(
+    served: _Served, logged_in: None, fixed_clock: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _listing(served, ROW_DONE)
+    detail = dict(
+        ROW_DONE, state="running", live=True, status=STATUS, log_tail="frame=1", outputs=None
+    )
+    served.answers[_detail_url(str(ROW_DONE["id"]))] = json.dumps(detail).encode("utf-8")
+    code = cli.main(["jobs", "aaaa"])
+    out = capsys.readouterr().out
+    assert code == 0
+    row = TableResult(
+        columns=["id", "state", "recipe", "gpu", "live", "runtime", "created"],
+        rows=[
+            [
+                "aaaa1111",
+                "running",
+                "broadcast/tracks:duck",
+                True,
+                True,
+                "5m00s+1m00s gpu",
+                "1h ago",
+            ]
+        ],
+    )
+    assert out == render_table(row) + "\n" + "\n".join(
+        [*SEND_TO_LINES, *OUTPUT_LINES, "log tail:", "  frame=1"]
+    ) + "\n"
+    assert PUSH_DESTINATION not in out
+
+
+@pytest.mark.parametrize("recording", [False, True], ids=["addresses", "recording"])
+def test_fetch_on_a_live_job_says_where_its_outputs_are_and_fetches_nothing(
+    served: _Served, logged_in: None, capsys: pytest.CaptureFixture[str], recording: bool
+) -> None:
+    _listing(served, dict(ROW_DONE, state="running", live=True))
+    outputs = [*STATUS_OUTPUTS, RECORDING] if recording else STATUS_OUTPUTS
+    detail = dict(ROW_DONE, state="running", live=True, status=dict(STATUS, outputs=outputs))
+    served.answers[_detail_url(str(ROW_DONE["id"]))] = json.dumps(detail).encode("utf-8")
+    code = cli.main(["jobs", "--fetch", "aaaa"])
+    out = capsys.readouterr().out
+    assert code == 0
+    if recording:
+        assert out == (
+            "aaaa1111 is a live job and its recording is at bucket ffrwd-public, prefix "
+            "jobs/aaaa1111/rec; fetching a recording is a later addition, so nothing was "
+            "fetched\n"
+        )
+    else:
+        assert out == (
+            "aaaa1111 is a live job: its outputs are addresses in its status, which "
+            "`ffrwd jobs aaaa1111` shows, so nothing was fetched\n"
+        )
+    assert not _fetched(served)
+    assert KEY_ONE not in out  # the key prints where the owner asked for the job, not here
+
+
+def test_a_live_submit_polls_the_job_and_prints_where_to_send(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+    slept: list[float] = []
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: slept.append(seconds))
+    # The first poll finds the job still queued, with no status; the second
+    # finds the runner's report.
+    monkeypatch.setattr(
+        packages,
+        "_urlopen",
+        _detail_polling(served, [_live_detail("queued"), _live_detail("running", status=STATUS)]),
+    )
+    code = cli.main(["run", "--remote", LIVE_QUERY])
+    captured = capsys.readouterr()
+    assert code == 0
+    _headers, body = served.sent_to(JOBS_URL)
+    assert body is not None and json.loads(body)["live"] is True
+    assert captured.out == "\n".join(
+        [f"submitted {JOB_ID}", remote.free_footer(REMAINING), *SEND_TO_LINES]
+    ) + "\n"
+    assert slept == [remote.WATCH_SECONDS]
+
+
+def test_a_live_submit_stops_polling_after_a_minute_and_says_where_to_look(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+    slept: list[float] = []
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: slept.append(seconds))
+    monkeypatch.setattr(packages, "_urlopen", _detail_polling(served, [_live_detail("queued")]))
+    code = cli.main(["run", "--remote", LIVE_QUERY])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert sum(slept) + remote.WATCH_SECONDS == remote._SEND_TO_WAIT_SECONDS
+    assert "send SRT" not in captured.out
+    assert (
+        f"{JOB_ID[:8]} has not reported where to send yet; `ffrwd jobs {JOB_ID[:8]}` "
+        "shows it once it does" in captured.err
+    )
+
+
+def test_wait_on_a_live_job_prints_each_outputs_address_once_and_fetches_nothing(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+    slept: list[float] = []
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: slept.append(seconds))
+    # The submit's own poll takes the first answer; --wait's loop sees one
+    # output, then the same one and a second, then the end with a recording.
+    monkeypatch.setattr(
+        packages,
+        "_urlopen",
+        _detail_polling(
+            served,
+            [
+                _live_detail("running", status=dict(STATUS, outputs=[])),
+                _live_detail("running", status=dict(STATUS, outputs=STATUS_OUTPUTS[:1])),
+                _live_detail("running", status=dict(STATUS, outputs=STATUS_OUTPUTS[:2])),
+                _live_detail(
+                    "succeeded", status=dict(STATUS, outputs=[*STATUS_OUTPUTS[:2], RECORDING])
+                ),
+            ],
+        ),
+    )
+    code = cli.main(["run", "--remote", "--wait", LIVE_QUERY])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == "\n".join(
+        [
+            f"submitted {JOB_ID}",
+            remote.free_footer(REMAINING),
+            *SEND_TO_LINES,
+            f"output hls (package): {HLS_URL}",
+            f"output cf (relay): {RELAY_URL}, broadcast aaaa1111",
+            "output rec (record): bucket ffrwd-public, prefix jobs/aaaa1111/rec",
+            f"{JOB_ID[:8]} is a live job and its recording is at bucket ffrwd-public, prefix "
+            "jobs/aaaa1111/rec; fetching a recording is a later addition, so nothing was "
+            "fetched",
+        ]
+    ) + "\n"
+    assert slept == [remote.WATCH_SECONDS] * 2
+    assert not _fetched(served)
+
+
+def test_json_with_wait_on_a_live_job_carries_its_status_and_fetches_nothing(
+    served: _Served,
+    logged_in: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _submit_accepted(served)
+    monkeypatch.setattr(remote, "_sleep", lambda seconds: None)
+    ended = _live_detail("succeeded", status=STATUS)
+    monkeypatch.setattr(packages, "_urlopen", _detail_polling(served, [ended]))
+    code = cli.main(["run", "--remote", "--wait", "--json", LIVE_QUERY])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert json.loads(captured.out) == {"job": ended, "written": []}
+    assert not _fetched(served)

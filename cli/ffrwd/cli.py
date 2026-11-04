@@ -46,16 +46,22 @@ Subcommands:
   ``--remote`` submits the run to the hosted runner
   instead (``ffrwd.remote``): file inputs are hashed and uploaded, "://"
   inputs pass through for the runner to open, and no local ffmpeg is needed
-  -- ``ffrwd jobs`` follows the job from there.
+  -- ``ffrwd jobs`` follows the job from there. A live job also prints where
+  to send each input, SRT and RTMP addresses with the job's key, as soon as
+  the runner reports them; ``--wait`` on one prints each output's address
+  as it appears.
 * ``jobs [ID] [--json | --watch | --cancel ID | --fetch ID [-y]]`` -- the
-  runs submitted with ``--remote``: list them (with this month's usage),
-  show one job's own detail including its log tail, watch the listing until
-  nothing is running, ask for a cancellation, or download a succeeded job's
-  outputs to their as-written paths. A failed or cancelled job's log tail
-  also prints on its own -- from ``--watch`` once it stops, and from
-  ``run --remote --wait`` when the job it followed lands there -- right
-  under the error, bounded to the last few lines. An ID may be any unique
-  prefix of the id ``submit`` printed.
+  runs submitted with ``--remote``: list them (with this month's usage,
+  live jobs marked, ``stopping`` once a stop was asked), show one job's own
+  detail including its log tail, watch the listing until nothing is
+  running, ask for a cancellation, or download a succeeded job's outputs to
+  their as-written paths. A live job's detail prints its status above the
+  tail: where each input is sent and where each output delivers; its
+  outputs are those addresses, so ``--fetch`` on it fetches nothing and
+  says so. A failed or cancelled job's log tail also prints on its own --
+  from ``--watch`` once it stops, and from ``run --remote --wait`` when the
+  job it followed lands there -- right under the error, bounded to the last
+  few lines. An ID may be any unique prefix of the id ``submit`` printed.
 * ``list [TARGET] [--json]`` -- print what the project at the working
   directory and its dependencies provide, at the depth ``TARGET`` asks for.
   No target is one table of the installed packages. ``ns/pkg`` is that one
@@ -1758,8 +1764,14 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
                         "follow: ffrwd jobs --watch    "
                         f"fetch: ffrwd jobs --fetch {submitted.job_id[:8]}"
                     )
+                if submitted.live:
+                    code = remote.wait_for_send_to(submitted.job_id, console=console)
+                    if code != 0:
+                        return code
             if args.wait:
-                return remote.wait_for_run(submitted.job_id, args, console=console)
+                return remote.wait_for_run(
+                    submitted.job_id, args, console=console, live=submitted.live
+                )
         except FfrwdError as err:
             _print_error(err, source=args.query, packages=packages, query=query)
             return 1
