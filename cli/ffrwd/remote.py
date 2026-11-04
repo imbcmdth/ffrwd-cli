@@ -1574,7 +1574,7 @@ def _live_detach_message(job_id: str) -> str:
     return (
         f"detached: {job_id} keeps running -- "
         f"`ffrwd jobs {short}` shows where to send and what it delivers, "
-        f"`ffrwd jobs --stop {short}` ends it"
+        f"`ffrwd jobs --cancel {short}` ends it"
     )
 
 
