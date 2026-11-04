@@ -994,10 +994,13 @@ def test_an_unprovisioned_machine_leaves_the_sidecar_its_own_refusal(
     assert "-nn-runtime" not in argv
 
 
-def test_a_developers_own_runtime_directory_is_left_alone(
+def test_a_developers_own_runtime_directory_is_left_alone_and_still_gets_the_target(
     provisioned: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The directory is the developer's; the target is still the default's,
+    # so their runtime does not put the models on the CPU.
     monkeypatch.setenv(nn.RUNTIME_DIR_VAR, "/somewhere/of/my/own")
+    monkeypatch.delenv(nn.TARGET_VAR, raising=False)
     argv = wasm.sidecar_argv(_with_model())
     assert "-nn-runtime" not in argv
-    assert "-nn-target" not in argv
+    assert argv[argv.index("-nn-target") + 1] == nn.default_target(WINDOWS)

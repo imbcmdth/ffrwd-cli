@@ -1202,24 +1202,26 @@ def _named_runtime() -> str | None:
 def spawn_args() -> list[str]:
     """The ``-nn-runtime`` and ``-nn-target`` a spawned sidecar is given.
 
-    Empty when the environment already names a runtime directory, which is
-    what keeps a developer's own `FFRWD_NN_RUNTIME` in charge; empty too when
-    nothing has been provisioned, so a sidecar that would have run anyway
-    still gets its own refusal rather than a directory that is not there.
+    No ``-nn-runtime`` when the environment already names a runtime
+    directory, which is what keeps a developer's own `FFRWD_NN_RUNTIME` in
+    charge; the target is still spelled then, so that directory does not
+    put the models on the CPU. Empty when nothing has been provisioned, so
+    a sidecar that would have run anyway still gets its own refusal rather
+    than a directory that is not there.
 
     ``-nn-target`` is spelled only when `FFRWD_NN_TARGET` does not, since the
     variable is how a run asks for something other than the default.
     """
-    if _named_runtime() is not None:
-        return []
     try:
         known = info()
     except FfrwdError:
         return []
-    directory = runtime_dir(known)
-    if not directory.is_dir():
-        return []
-    args = [_NN_RUNTIME_FLAG, str(directory)]
+    args: list[str] = []
+    if _named_runtime() is None:
+        directory = runtime_dir(known)
+        if not directory.is_dir():
+            return []
+        args += [_NN_RUNTIME_FLAG, str(directory)]
     if not os.environ.get(TARGET_VAR):
         args += [_NN_TARGET_FLAG, default_target(known)]
     return args
