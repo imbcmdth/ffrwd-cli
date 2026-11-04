@@ -2444,8 +2444,9 @@ pub fn any_gpu_granted() -> bool {
 /// and each protocol stays refused until it is allowed by name, so a module
 /// granted `-udp` cannot open a TCP socket and one granted `-tcp` cannot
 /// send a datagram. Name resolution is allowed by neither. Under the public
-/// policy the address check refuses non-public destinations; binds, listens
-/// and accepts stay open, since only where traffic goes is policed.
+/// policy the address check refuses non-public destinations the allow list
+/// does not hold; binds, listens and accepts stay open, since only where
+/// traffic goes is policed.
 fn wasi_ctx(effects: Grants, policy: NetPolicy) -> WasiCtx {
     let mut builder = WasiCtx::builder();
     builder.inherit_stderr();
@@ -2454,9 +2455,9 @@ fn wasi_ctx(effects: Grants, policy: NetPolicy) -> WasiCtx {
             NetPolicy::Unrestricted => {
                 builder.inherit_network();
             }
-            NetPolicy::Public => {
-                builder.socket_addr_check(|addr, reason| {
-                    Box::pin(async move { egress::check_socket_addr(addr, reason) })
+            NetPolicy::Public(allow) => {
+                builder.socket_addr_check(move |addr, reason| {
+                    Box::pin(async move { egress::check_socket_addr(allow, addr, reason) })
                 });
             }
         }
@@ -8500,7 +8501,10 @@ mod socket_grant_test {
 
     #[test]
     fn each_grant_opens_its_own_protocol_and_not_the_other() {
-        for policy in [NetPolicy::Unrestricted, NetPolicy::Public] {
+        for policy in [
+            NetPolicy::Unrestricted,
+            NetPolicy::Public(&egress::NO_EXCEPTIONS),
+        ] {
             assert_eq!(
                 opens(grants(false, false), policy),
                 (false, false),
@@ -8654,7 +8658,7 @@ mod udp_grant_test {
 
         // Same module, same grant, public policy: 127.0.0.1 is not a public
         // destination, so the send is refused and the run fails.
-        let refused = run_component(&path, NetPolicy::Public);
+        let refused = run_component(&path, NetPolicy::Public(&egress::NO_EXCEPTIONS));
         assert!(
             refused.is_err(),
             "the public policy let a datagram go to 127.0.0.1"

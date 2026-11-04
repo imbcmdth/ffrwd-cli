@@ -876,6 +876,21 @@ on loopback keep working. Any other value is an error at startup. The
 hosted runner sets it; a module never resolves or reaches anything
 internal to the machine it runs on.
 
+`FFRWD_REACH_ALLOW` names the destinations `public` lets through
+although they are not public: a comma-separated list, each entry a
+host name (`ffrwd-pro-relay-egress.ffrwd.svc`), an IP address
+(`10.107.14.83`, `fd00::1`) or a CIDR (`10.107.14.0/24`, `fd00::/8`),
+with whitespace around an entry ignored. A connect or send to an
+address inside an entry passes the check that refuses the rest of its
+range. A host name is resolved once, when the policy is read, and
+stands for every address it resolved to; an HTTP request to that name
+connects to whatever it resolves to at the time. A name that does not
+resolve warns at startup and allows nothing. An entry that is none of
+the three is an error at startup, as a misspelt `FFRWD_NET_POLICY`
+is. The list only widens `public`: an unrestricted network ignores it,
+and `public` with the variable unset or empty is unchanged. The hosted
+runner sets it to the relays a live job publishes to and reads from.
+
 `private` is a boolean, false when absent: true publishes each version
 private -- installable with a token from the namespace, off the public
 index. A version's visibility is stamped when it is published and never
