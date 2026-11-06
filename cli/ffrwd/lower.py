@@ -463,6 +463,7 @@ from ffrwd.sink import (
     MANIFEST_SEGMENT_OPTION,
     SINK_OPTIONS,
     TWO_PASS_CODECS,
+    bits_per_second,
     copy_suppressed_scopes,
     validate_csv_option,
 )
@@ -2256,6 +2257,26 @@ class _VariantRow:
     audio: _Stream | None
     name: str | None = None
     language: str | None = None
+
+
+def _pad_rendition(
+    pad: Mapping[str, object], kind: str, meta: Mapping[str, object], pictured: bool
+) -> dict[str, object]:
+    """A sink pad's rendition: its row's, with the bandwidth of the stream on
+    this pad. An encoded pad states the bitrate its encoder is set to, or
+    none, since the source's figure describes the stream before the encode.
+    A copy keeps the source's figure, which is the whole row's: on the row's
+    video pad, or on its audio pad where the row has no picture."""
+    said = meta.get("rendition")
+    rendition = dict(said) if isinstance(said, Mapping) else {}
+    copied = rendition.pop("bandwidth", None)
+    if pad.get(f"{kind}_codec") == COPY_CODEC:
+        bandwidth = copied if kind == "video" or not pictured else None
+    else:
+        bandwidth = bits_per_second(pad.get(f"{kind}_bitrate"))
+    if bandwidth is not None:
+        rendition["bandwidth"] = bandwidth
+    return rendition
 
 
 def _compress_manifest_lists(
@@ -5593,6 +5614,11 @@ class _Lowerer:
                 )
         written = {option.name for option in raw.options}
         row_meta = self.row_reading_sink_pads.get(node)
+        pictured = {
+            meta.get("row")
+            for meta, kind in zip(row_meta or (), kinds, strict=False)
+            if kind == "video"
+        }
         # Each pad takes the options shaping ITS OWN encoder, a per-row value
         # indexed by the pad's position among the pads of that kind -- which
         # is the order the rows were gathered in.
@@ -5618,7 +5644,7 @@ class _Lowerer:
             if row_meta is not None and "row" in row_meta[position]:
                 meta = row_meta[position]
                 pad["row"] = meta["row"]
-                rendition = meta.get("rendition")
+                rendition = _pad_rendition(pad, kind, meta, meta["row"] in pictured)
                 if rendition:
                     pad["rendition"] = rendition
             pads.append(pad)

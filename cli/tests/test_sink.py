@@ -16,6 +16,7 @@ from ffrwd.sink import (
     REPLACED_OPTIONS,
     SINK_OPTIONS,
     SinkOptionSpec,
+    bits_per_second,
     validate_csv_option,
     validate_option,
 )
@@ -378,3 +379,24 @@ def test_validate_option_rejects_a_csv_only_option() -> None:
     with pytest.raises(FfrwdError) as excinfo:
         validate_option("header", True)
     assert excinfo.value.code == ErrorCode.UNKNOWN_SINK_OPTION
+
+
+def test_a_bitrate_reads_as_ffmpeg_reads_it() -> None:
+    """ffmpeg's SI suffixes, an `i` for powers of two and a `B` for bytes;
+    anything else is no bitrate, `m` (milli) included."""
+    said = {
+        "6M": 6_000_000,
+        "2500k": 2_500_000,
+        "160K": 160_000,
+        "2.5M": 2_500_000,
+        "6000000": 6_000_000,
+        6_000_000: 6_000_000,
+        "1Mi": 1_048_576,
+        "16kB": 128_000,
+        "6m": None,
+        "fast": None,
+        "": None,
+        "0": None,
+        True: None,
+    }
+    assert {text: bits_per_second(text) for text in said} == said

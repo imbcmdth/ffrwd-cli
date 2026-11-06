@@ -14208,6 +14208,46 @@ def test_a_per_row_option_binds_to_the_rows_that_carry_its_kind() -> None:
     assert pads[2]["audio_bitrate"] == "128k"
 
 
+def _bandwidths(g: Graph) -> list[object]:
+    """Each pad's bandwidth, in pad order: None where it states none."""
+    (pads,) = g.packet_sinks.values()
+    return [dict(pad.get("rendition") or {}).get("bandwidth") for pad in pads]
+
+
+def test_a_sink_pads_bandwidth_is_the_bitrate_its_encoder_is_set_to() -> None:
+    """At a sink a pad's bandwidth is its own stream's: the bitrate the
+    query encodes it at, read per row where the option is, in bits a
+    second."""
+    g = _row_sink_graph(
+        _DEMUXED_INTO_SINK.format(rates="ARRAY['4.5M', '2000k']"),
+        _two_alias_probes(),
+    )
+    assert _bandwidths(g) == [4_500_000, 2_000_000, 128_000]
+
+
+def test_a_copied_pad_keeps_the_sources_bandwidth_on_its_rows_picture() -> None:
+    """A copy is the source's stream, so the manifest's figure stands. It is
+    the whole variant's, so it goes on a muxed row's video pad, and on an
+    audio pad only where the row has no picture."""
+    g = _row_sink_graph(
+        "COPY (SELECT r.video[1], r.audio[1] FROM input('ladder.m3u8') r) "
+        "TO publish('relay', 'live')",
+        _rendition_probes(),
+    )
+    assert _bandwidths(g) == [800_000, None, 3_000_000, None, 128_000]
+
+
+def test_an_encode_without_a_bitrate_states_no_bandwidth() -> None:
+    """The source's figure describes the stream before the encode, so an
+    encoder set to no bitrate leaves the pad without one."""
+    g = _row_sink_graph(
+        "COPY (SELECT r.video[1], r.audio[1] FROM input('ladder.m3u8') r) "
+        "TO publish('relay', 'live') WITH (video_codec 'h264_nvenc', gop 60)",
+        _rendition_probes(),
+    )
+    assert _bandwidths(g) == [None, None, None, None, 128_000]
+
+
 def test_an_unmodified_source_stream_copies_onto_the_sink() -> None:
     """A ``src:`` cell in a codec the sink already accepts (h264/aac) copies
     instead of paying for an encode nothing asked for."""

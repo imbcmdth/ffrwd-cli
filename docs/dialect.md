@@ -314,7 +314,12 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   its value arguments configure it. One reading encoded packets sits
   behind an encoder the compiler places, whatever feeds it, and the
   COPY's `WITH` options shape that encoder the way they shape a
-  file's - a value read once per row shapes each stream separately. A
+  file's - a value read once per row shapes each stream separately.
+  Each stream's rendition carries that stream's `bandwidth`: the
+  bitrate its encoder is set to, none for an encoder set to a quality
+  instead, and a copied stream's source figure on its row's picture, or
+  on its sound where the row has none
+  ([173](examples.md#173-tell-a-packet-sink-each-streams-bitrate)). A
   packet sink reading one stream runs in the sidecar region writing it,
   with no process of its own, when the stream reaches it as packets the
   region holds: a node's packets it copies, or a picture the region

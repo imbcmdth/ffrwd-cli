@@ -2224,3 +2224,28 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f
 ```
 
 The sidecar writes the destination itself only when an ffmpeg would have nothing to do there. An encoder, a filter, a trim, a container other than nut, a muxer option, or a URL option the sidecar does not take (`tcp://...?listen=1`) puts an ffmpeg in front of the destination to write it. `udp://` takes `pkt_size`, as ffmpeg's udp protocol does, and sends each write as datagrams of at most that many bytes, 1472 when the URL names none. The sidecar flushes each batch as it writes it, and a peer that closes the connection ends the output, the same as a reader closing a pipe.
+
+## 173. Tell a packet sink each stream's bitrate
+
+A packet sink that reads rows is handed, with each stream, the row it belongs to and that row's rendition. The rendition's `bandwidth` is the bitrate of the stream on that pad: the one its encoder is set to, `video_bitrate` here, in bits a second. A publisher writes it where its readers pick a rendition by bitrate, as `ffrwd/moq`'s catalog does:
+
+```pgsql
+CREATE FUNCTION packet_stats() RETURNS sink
+  AS '../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm', 'packet_stats'
+  LANGUAGE wasm;
+
+COPY (
+  SELECT f.video[1]
+  FROM input('tests/fixtures/testsrc.mp4') f
+) TO packet_stats() WITH (video_codec 'libx264', video_bitrate '2500k')
+```
+
+```
+$ ffrwd compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 libx264 -pix_fmt:0 yuv420p -b:0 \
+  2500k -f nut pipe:1 | ffrwd-wasm -f nut -i pipe:0 -pad \
+  '{"row": 0, "rendition": {"name": "240p", "bandwidth": 2500000}}' -m \
+  ../sidecar/modules/target/wasm32-wasip2/release/packet_stats.wasm -f ndjson pipe:1
+```
+
+An encoder set to a quality rather than a bitrate (`crf`) gives its pad no bandwidth, since the source's figure describes the stream before the encode. A stream copied onto the sink keeps its source's figure, a manifest variant's, on its row's picture, and on its sound only where the row has no picture.

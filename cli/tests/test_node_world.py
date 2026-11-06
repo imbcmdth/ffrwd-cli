@@ -2334,8 +2334,9 @@ def test_a_source_a_node_on_the_gpu_and_a_sink_are_one_process(
     a node holding its picture there, encoded again for a node sink. The
     decode, the encode and both ends run in one sidecar, no ffmpeg anywhere,
     and the sink's row and rendition ride ``-pads`` since its pad reads a
-    label of the network. Held in host memory, the picture is decoded and
-    encoded by ffmpegs as before."""
+    label of the network, its bandwidth the 6M the picture is encoded at
+    rather than the source row's 3M. Held in host memory, the picture is
+    decoded and encoded by ffmpegs as before."""
     monkeypatch.setitem(SHAPES, "sub.wasm", _subscribe)
     monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
     monkeypatch.setitem(
@@ -2357,7 +2358,7 @@ def test_a_source_a_node_on_the_gpu_and_a_sink_are_one_process(
     assert "decode=format=rgba:hw=auto" in network
     assert "encode=codec=h264_d3d12va:b=6M[encode0];[video=encode0]publish=" in network
     assert argv[argv.index("-pads") + 1] == (
-        'publish=[{"row": 0, "rendition": {"name": "720p", "bandwidth": 3000000}}]'
+        'publish=[{"row": 0, "rendition": {"name": "720p", "bandwidth": 6000000}}]'
     )
     plan = _plan(query.format(", 'host'"), monkeypatch, describe=_reporting("publish.wasm"))
     assert len(plan.sidecars) == 3 and len(plan.ffmpeg) == 2

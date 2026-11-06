@@ -12,6 +12,7 @@ No ``extra_args`` escape hatch: arbitrary flag passthrough would break
 from __future__ import annotations
 
 import difflib
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -595,6 +596,34 @@ COLOR_OPTIONS: tuple[str, ...] = (
     "colorspace",
     "chroma_sample_location",
 )
+
+
+# A bitrate as ffmpeg reads one: a number, then one of its SI prefixes, an
+# `i` that makes the prefix a power of two, and a `B` that counts bytes.
+_BITRATE = re.compile(r"(\d+(?:\.\d*)?|\.\d+)([kKMG])?(i)?(B)?")
+_BITRATE_POWERS = {"k": 1, "K": 1, "M": 2, "G": 3}
+
+
+def bits_per_second(value: object) -> int | None:
+    """What a bitrate option says, in bits a second, read as ffmpeg reads
+    ``-b``: ``6M``, ``2500k``, ``1Mi``, ``16kB`` or a number. None for any
+    other spelling, ``m`` (milli to ffmpeg) included, and for zero."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        number = float(value)
+    else:
+        found = _BITRATE.fullmatch(str(value).strip())
+        if found is None or (found[3] and not found[2]):
+            return None
+        number = float(found[1])
+        if found[2]:
+            power = _BITRATE_POWERS[found[2]]
+            number *= (1024 if found[3] else 1000) ** power
+        if found[4]:
+            number *= 8
+    bits = round(number)
+    return bits if bits > 0 else None
 
 
 def option_spec(name: str) -> SinkOptionSpec | None:
