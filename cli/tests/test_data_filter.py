@@ -685,7 +685,8 @@ def test_a_data_filter_is_a_sidecar_of_its_own_between_data_edges() -> None:
     (reader,) = (e.target for e in plan.stream_edges if e.source == sidecar.id)
     assert all(keeps_clock(e, plan) for e in plan.stream_edges if e.target == reader)
     assert argv[reader][:2] == ["ffmpeg", "-copyts"]
-    assert argv[reader][-5:-1] == ["-map", "0:d:0", "-c:0", "copy"]
+    assert argv[reader][-7:-3] == ["-map", "0:d:0", "-c:0", "copy"]
+    assert argv[reader][-3:-1] == ["-write_index", "0"]
 
 
 def test_a_clock_crosses_as_a_tiny_picture_beside_the_data_it_times() -> None:
@@ -748,7 +749,10 @@ def test_a_data_filters_output_several_processes_read_is_copied_to_each(
     assert all(e.format == DataFormat() for e in [out, *onward])
     argv = _argv(plan)
     assert argv[first.id][-3:] == ["-f", "nut", "pipe:1"]
-    copy = ["-map", "0:d:0", "-c:0", "copy", "-f", "nut", "-flush_packets", "1"]
+    copy = [
+        "-map", "0:d:0", "-c:0", "copy", "-f", "nut", "-flush_packets", "1",
+        "-write_index", "0",
+    ]  # fmt: skip
     assert argv[relay] == [
         "ffmpeg", "-copyts", "-f", "nut", "-analyzeduration", "0", "-fpsprobesize",
         "3", "-i", "pipe:0",
@@ -921,13 +925,45 @@ def test_a_file_carrying_data_beside_media_waits_on_it_a_tenth_of_a_second(
     assert ("-max_interleave_delta" in argv) is waits
     if waits:
         at = argv.index("-max_interleave_delta")
-        assert argv[at + 1 :] == ["100000", "out.nut"]
+        assert argv[at + 1] == "100000"
 
 
 def test_a_data_filters_output_beside_the_picture_waits_on_it_too() -> None:
     plan = _plan("COPY (SELECT f.video[1], stamp(f.data[1], 'es')" + _FROM)
     (writer,) = [p for p in plan.ffmpeg if any(u.path == "out.nut" for u in p.graph.sinks)]
-    assert _argv(plan)[writer.id][-3:] == ["-max_interleave_delta", "100000", "out.nut"]
+    assert _argv(plan)[writer.id][-5:] == [
+        "-max_interleave_delta",
+        "100000",
+        "-write_index",
+        "0",
+        "out.nut",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("columns", "destination", "unindexed"),
+    [
+        ("f.video[1], f.data[1]", "'out.nut'", True),
+        ("f.data[1]", "'out.nut'", True),
+        ("f.video[1], f.data[1]", "'tcp://127.0.0.1:30355' WITH (format 'nut')", True),
+        ("f.video[1], f.audio[1]", "'out.nut'", False),
+    ],
+)
+def test_nut_carrying_data_is_written_without_an_index(
+    columns: str, destination: str, unindexed: bool
+) -> None:
+    """A message can share its pts with the heartbeat before it, which
+    ffmpeg's NUT muxer writes and then cannot index: it aborts at the end,
+    after the whole stream went out. Only seeking used the index."""
+    graph = lower(
+        resolve(parse(f"COPY (SELECT {columns} FROM input('deal.nut') f) TO {destination}")),
+        _deal(),
+        registry=_registry(),
+    )
+    argv = build_ffmpeg_args(emit(insert_splits(graph)))
+    assert ("-write_index" in argv) is unindexed
+    if unindexed:
+        assert argv[argv.index("-write_index") + 1] == "0"
 
 
 def test_a_pipe_carrying_data_flushes_every_packet_and_a_file_does_not() -> None:

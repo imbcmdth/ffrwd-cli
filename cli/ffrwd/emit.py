@@ -388,6 +388,10 @@ _DATA_INTERLEAVE_DELTA = 100_000
 # Write each packet out as it is muxed rather than when the output's buffer
 # fills: see :func:`_render_data_flush`.
 FLUSH_PACKETS_FLAG = "-flush_packets"
+# NUT written with no index where it carries a data stream: see
+# :func:`_render_data_index`.
+WRITE_INDEX_FLAG = "-write_index"
+NUT_CONTAINER = "nut"
 
 
 @dataclass
@@ -1251,6 +1255,7 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
             args += [MAP_CHAPTERS_FLAG, str(group.chapters)]
         args += _render_interleave(group)
         args += _render_data_flush(group)
+        args += _render_data_index(group, path)
         args.append(path)
     return args
 
@@ -1284,6 +1289,30 @@ def _render_data_flush(group: OutputGroup) -> list[str]:
     if group.wire is None or not any(m.type == "data" for m in group.maps):
         return []
     return [FLUSH_PACKETS_FLAG, "1"]
+
+
+def _render_data_index(group: OutputGroup, path: str) -> list[str]:
+    """``-write_index 0`` for NUT carrying a data stream.
+
+    Messages on a data stream can share a pts: the sidecar writes a heartbeat
+    whenever time moves on with nothing written, and a message that arrives
+    for a time a heartbeat already reached leaves at that same pts
+    (sidecar/ffrwd-wasm/src/heartbeat.rs, `Beats::place`). ffmpeg's NUT muxer
+    writes every packet of such a stream, then fails an assertion as it
+    writes the index at the end ("Multiple keyframes with same PTS") and
+    aborts. The index only speeds up seeking: a feeder connection and a pipe
+    are never sought, and a file without one seeks by its syncpoints.
+    """
+    if not any(m.type == "data" for m in group.maps):
+        return []
+    written = group.options.get(_FORMAT)
+    if isinstance(written, str) and written:
+        container = written.lower()
+    else:
+        container = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if container != NUT_CONTAINER:
+        return []
+    return [WRITE_INDEX_FLAG, "0"]
 
 
 # input option rendering
