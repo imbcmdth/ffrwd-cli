@@ -182,9 +182,15 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   - A node's data input whose `interval` names a hold group the lateral
     feeds (`interval.group`) takes the lateral's rows on that group's
     connection, after its picture and sound in the same NUT, and binds no
-    pad: `panel(prog.v, ad.video, ad.audio, ad.cues)`. A stream of the
-    query's own handed to such an input while a port serves the group is
-    refused; its rows would never arrive.
+    pad: `panel(prog.v, ad.video, ad.audio, ad.cues)`. The rows are a data
+    stream of the body's own, or the rows a node in the body writes, such
+    as a transcriber's over the feed's sound, which travel as JSON messages
+    there rather than as a subtitle track. Where the input takes many and
+    several laterals feed the group, each lateral's rows arrive on its own
+    connection, and a call may hand rows from only some of them:
+    `mosaic(k.video[1], ARRAY[main.video, cam.video], cues =>
+    ARRAY[cam.cues])`. A stream of the query's own handed to such an input
+    while a port serves the group is refused; its rows would never arrive.
   - Each value is bound by name, per message, in this order: an argument
     the call wrote, which is a constant the same for every message; the
     message's field of that name (a number for a number, a string for

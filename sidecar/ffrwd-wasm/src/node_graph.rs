@@ -1859,12 +1859,16 @@ fn listen_for(
         let Some(group) = &interval.group else {
             continue;
         };
-        let Some(&(_, at)) = groups
+        // The group's connections, one per port, in the order the held
+        // input's streams name them.
+        let served: Vec<usize> = groups
             .iter()
-            .find(|(g, _)| g.as_deref() == Some(group.as_str()))
-        else {
+            .filter(|(g, _)| g.as_deref() == Some(group.as_str()))
+            .map(|&(_, at)| at)
+            .collect();
+        if served.is_empty() {
             continue;
-        };
+        }
         if wanted.contains(&input.name) {
             bail!(
                 "{name} input '{}' arrives on the connection of group '{group}', which a port \
@@ -1872,38 +1876,82 @@ fn listen_for(
                 input.name
             );
         }
-        let format = StreamFormat::Data(runtime::DATA_CODEC.to_string());
-        let id = defs.len() as u32;
-        let def = StreamDef {
-            info: info_for(&format),
-            format,
-            base: clock_base(shape, bound),
-            decode_delay: 0,
-            latency: None,
-            header: None,
-            wire: None,
-            frame_rate: None,
-            spelling: format!(
-                "the data on 127.0.0.1:{} for input '{}' of {name}",
-                feeds[at].port, input.name
-            ),
-            rendition: RenditionMeta::default(),
-            row: None,
+        // Each run-time lateral feeding the group writes its own rows: a
+        // stream the call binds arrives on the connection its hint names,
+        // which may be only some of the group's (the cams of a programme
+        // whose main feed has none). With no port named, one stream rides
+        // the group's first connection, or, for an input taking many, the
+        // k-th stream the k-th.
+        let hints: &[StreamHint] = told
+            .iter()
+            .find(|b| b.input == input.name)
+            .map_or(&[], |b| b.streams.as_slice());
+        let wired: Vec<usize> = if hints.iter().any(|hint| hint.port.is_some()) {
+            hints
+                .iter()
+                .map(|hint| {
+                    let port = hint.port.with_context(|| {
+                        format!(
+                            "{name} input '{}' names the port of some of its streams and not \
+                             of others",
+                            input.name
+                        )
+                    })?;
+                    served
+                        .iter()
+                        .copied()
+                        .find(|&at| feeds[at].port == port)
+                        .with_context(|| {
+                            format!(
+                                "{name} input '{}' takes rows on 127.0.0.1:{port}, and no \
+                                 connection of group '{group}' is there",
+                                input.name
+                            )
+                        })
+                })
+                .collect::<Result<_>>()?
+        } else {
+            let count = if input.many {
+                hints.len().clamp(1, served.len())
+            } else {
+                1
+            };
+            served.iter().copied().take(count).collect()
         };
-        bound.push(bound_stream(
-            &input.name,
-            id,
-            &def,
-            hint_of(told, &input.name, 0),
-        ));
-        feeds[at].members.push(FeedMember {
-            id,
-            name: input.name.clone(),
-            format: def.format.clone(),
-            timing: false,
-            on_gpu: false,
-        });
-        defs.push(def);
+        for (k, &at) in wired.iter().enumerate() {
+            let format = StreamFormat::Data(runtime::DATA_CODEC.to_string());
+            let id = defs.len() as u32;
+            let def = StreamDef {
+                info: info_for(&format),
+                format,
+                base: clock_base(shape, bound),
+                decode_delay: 0,
+                latency: None,
+                header: None,
+                wire: None,
+                frame_rate: None,
+                spelling: format!(
+                    "the data on 127.0.0.1:{} for input '{}' of {name}",
+                    feeds[at].port, input.name
+                ),
+                rendition: RenditionMeta::default(),
+                row: None,
+            };
+            bound.push(bound_stream(
+                &input.name,
+                id,
+                &def,
+                hint_of(told, &input.name, k),
+            ));
+            feeds[at].members.push(FeedMember {
+                id,
+                name: input.name.clone(),
+                format: def.format.clone(),
+                timing: false,
+                on_gpu: false,
+            });
+            defs.push(def);
+        }
     }
     for feed in &mut feeds {
         feed.members
@@ -2979,6 +3027,160 @@ fn header_for(def: &StreamDef) -> Result<nut::Stream> {
 mod tests {
     use super::*;
 
+    /// Two run-time laterals feeding one group on 9100 and 9101, as
+    /// compose_av's held inputs are fed, with a rows input of the same group
+    /// bound to one stream per entry of `rows`, each with the port its hint
+    /// names, if any.
+    fn grouped_rows_feeds(many: bool, rows: &[Option<u16>]) -> Result<Vec<FeedSpec>> {
+        use ffrwd_wasm_runtime::node::{Accepts, Anchor, Hold, InputPort, Interval};
+        let port = |name: &str, kind: PortKind, many: bool, pairing: Pairing| InputPort {
+            name: name.to_string(),
+            kind,
+            required: false,
+            many,
+            pairing,
+            rows: if kind == PortKind::Data {
+                RowsUse::PerFrame
+            } else {
+                RowsUse::Ignore
+            },
+            window: 1,
+            stride: 1,
+            accepts: Accepts {
+                pixel_formats: if kind == PortKind::Video {
+                    vec!["rgba".to_string()]
+                } else {
+                    Vec::new()
+                },
+                ..Accepts::default()
+            },
+            schema: None,
+        };
+        let held = Pairing::Hold(Hold {
+            anchor: Anchor::FirstFrame,
+            lead: 0.3,
+            linger: None,
+            timeout: None,
+            group: Some("held".to_string()),
+            port_param: Some("port".to_string()),
+        });
+        let interval = Pairing::Interval(Interval {
+            latency: None,
+            ahead: 0.0,
+            anchor: Anchor::SharedClock,
+            group: Some("held".to_string()),
+        });
+        let shape = NodeShape {
+            inputs: vec![
+                port("v", PortKind::Video, false, Pairing::Lockstep),
+                port("inputs", PortKind::Video, true, held),
+                port("cues", PortKind::Data, many, interval),
+            ],
+            outputs: Vec::new(),
+            clock: Clock::Input("v".to_string()),
+            pure: false,
+            one_to_one: true,
+            bounded: true,
+            relation: Vec::new(),
+        };
+        let format = StreamFormat::Video(VideoFormat {
+            width: 16,
+            height: 16,
+            pix_fmt: "rgba",
+            frame_len: crate::frame_len_for("rgba", 16, 16).unwrap(),
+            color: None,
+        });
+        let mut bound = vec![BoundStream {
+            port: "v".to_string(),
+            id: 0,
+            info: info_for(&format),
+            time_base: TimeBase { num: 1, den: 25 },
+            format,
+            rendition: RenditionMeta::default(),
+            row: None,
+            decode_delay: 0,
+            latency: None,
+            hint: StreamHint::default(),
+        }];
+        let told = vec![
+            PortBinding {
+                input: "inputs".to_string(),
+                streams: vec![StreamHint::default(); 2],
+            },
+            PortBinding {
+                input: "cues".to_string(),
+                streams: rows
+                    .iter()
+                    .map(|&port| StreamHint {
+                        port,
+                        ..StreamHint::default()
+                    })
+                    .collect(),
+            },
+        ];
+        let schema = serde_json::json!({"properties": {"port": {"type": ["array", "integer"]}}});
+        let mut params = r#"{"port":[9100,9101]}"#.to_string();
+        let mut defs = Vec::new();
+        listen_for(
+            "n",
+            &shape,
+            &[],
+            &told,
+            &mut bound,
+            &mut params,
+            &schema,
+            &mut defs,
+        )
+    }
+
+    fn members(feed: &FeedSpec) -> Vec<&str> {
+        feed.members.iter().map(|m| m.name.as_str()).collect()
+    }
+
+    #[test]
+    fn each_lateral_feeding_a_group_brings_its_own_rows() {
+        for rows in [[Some(9100), Some(9101)], [None, None]] {
+            let feeds = grouped_rows_feeds(true, &rows).unwrap();
+            assert_eq!(
+                feeds.iter().map(|f| f.port).collect::<Vec<_>>(),
+                [9100, 9101]
+            );
+            assert_eq!(members(&feeds[0]), ["inputs", "cues"]);
+            assert_eq!(members(&feeds[1]), ["inputs", "cues"]);
+            assert_ne!(feeds[0].members[1].id, feeds[1].members[1].id);
+        }
+    }
+
+    #[test]
+    fn rows_from_some_laterals_ride_the_connections_their_ports_name() {
+        // A programme's main feed brings no rows and its cam does.
+        let feeds = grouped_rows_feeds(true, &[Some(9101)]).unwrap();
+        assert_eq!(members(&feeds[0]), ["inputs"]);
+        assert_eq!(members(&feeds[1]), ["inputs", "cues"]);
+    }
+
+    #[test]
+    fn rows_named_by_no_port_ride_the_groups_first_connection() {
+        let once = grouped_rows_feeds(true, &[None]).unwrap();
+        let single = grouped_rows_feeds(false, &[None, None]).unwrap();
+        for feeds in [once, single] {
+            assert_eq!(members(&feeds[0]), ["inputs", "cues"]);
+            assert_eq!(members(&feeds[1]), ["inputs"]);
+        }
+    }
+
+    #[test]
+    fn rows_on_a_port_the_group_does_not_serve_are_refused() {
+        let error = grouped_rows_feeds(true, &[Some(9200)])
+            .err()
+            .expect("a port the group does not serve is refused");
+        assert_eq!(
+            error.to_string(),
+            "n input 'cues' takes rows on 127.0.0.1:9200, and no connection of group 'held' is \
+             there"
+        );
+    }
+
     #[test]
     fn picked_ports_are_written_as_a_list_where_the_schema_takes_one() {
         let listed = serde_json::json!({"properties": {"port": {"type": ["array", "integer"]}}});
@@ -3071,6 +3273,7 @@ mod tests {
         let declared = StreamHint {
             rate: None,
             size: Some((640, 360)),
+            port: None,
         };
         let none = StreamHint::default();
         let conform = |clock, w: InputPort, hint: &StreamHint| {

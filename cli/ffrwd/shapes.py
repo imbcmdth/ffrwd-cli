@@ -231,11 +231,14 @@ class NodeShape:
 class StreamHint:
     """What the compiler knows of one bound stream before the run: a video
     stream's frame rate or an audio stream's sample rate, None where nothing
-    settles it; and, for a picture fed on a port, the width and height its
-    source declares, which the sidecar conforms the feed to."""
+    settles it; for a picture fed on a port, the width and height its source
+    declares, which the sidecar conforms the feed to; and for a run-time
+    lateral's rows on a hold group's data input, the port of the connection
+    they arrive on, which only the host reads."""
 
     rate: Fraction | None = None
     size: tuple[int, int] | None = None
+    port: int | None = None
 
 
 @dataclass(frozen=True)
@@ -262,8 +265,8 @@ def bound_json(bound: Sequence[Binding]) -> str:
 
 
 def _hint_json(hint: StreamHint) -> dict[str, object]:
-    """One stream's hint as ``--bound`` takes it: its rate, and its size
-    where it has one."""
+    """One stream's hint as ``--bound`` takes it: its rate, and its size and
+    its port where it has them."""
     found: dict[str, object] = {
         "rate": None
         if hint.rate is None
@@ -271,6 +274,8 @@ def _hint_json(hint: StreamHint) -> dict[str, object]:
     }
     if hint.size is not None:
         found["width"], found["height"] = hint.size
+    if hint.port is not None:
+        found["port"] = hint.port
     return found
 
 

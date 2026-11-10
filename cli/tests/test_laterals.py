@@ -1403,11 +1403,13 @@ def test_a_laterals_rows_ride_its_groups_connection_beside_the_picture_and_sound
     assert panel.ports == ["v"]
     assert panel.args["port"] == connection.port
     unknown = {"rate": None}
+    # The rows are told the connection they arrive on, which the host reads
+    # them off; a group's held input names its connections in its port param.
     assert json.loads(panel.bound) == [
         {"input": "v", "streams": [{"rate": {"num": 25, "den": 1}}]},
         {"input": "feed", "streams": [unknown]},
         {"input": "feed_audio", "streams": [unknown]},
-        {"input": "cues", "streams": [unknown]},
+        {"input": "cues", "streams": [{"rate": None, "port": connection.port}]},
     ]
     instance = compile_all(
         lateral.definitions + "\n" + statement.replace(":'url'", "'ad.nut'"),
@@ -1425,6 +1427,73 @@ def test_a_stream_bound_where_a_groups_connection_brings_the_rows_is_refused() -
         "panel() binds 'cues', which arrives on the connection of the group 'panel', "
         "and 'feed' of that group is served by a port"
     )
+
+
+# compose_av's held pictures, one connection per lateral, with a rows input of
+# the same group: a programme's cams bring captions and its main feed none.
+_CUED = (
+    "CREATE FUNCTION cued(v video_stream, inputs video_stream[] DEFAULT NULL, "
+    "cues data_stream[] DEFAULT NULL, port number DEFAULT NULL) RETURNS video_stream "
+    f"AS '{COMPOSE}', 'compose' LANGUAGE wasm;"
+)
+_MAIN_AND_CAM = """COPY (
+  WITH prog AS (SELECT s.video[1] AS v, s.data[1] AS d FROM input('leaf.nut') s)
+  SELECT cued(prog.v, ARRAY[main.video, cam.video], cues => ARRAY[cam.cues])
+  FROM prog, LATERAL play_rows(prog.d) main, LATERAL play_rows(prog.d) cam
+) TO 'out.nut'"""
+
+
+def _cued_shape(
+    module: str, params: str, bound: Sequence[shapes.Binding], grants: Sequence[str] = ()
+) -> shapes.NodeShape:
+    held = {"kind": "hold", "anchor": {"kind": "shared_clock"}, "lead": 0.3,
+            "group": "held", "port_param": "port"}
+
+    def port(name: str, kind: str, pairing: dict[str, object], many: bool) -> dict[str, object]:
+        return {
+            "name": name, "kind": kind, "required": name == "v", "many": many,
+            "pairing": pairing, "rows": "per-frame" if kind == "data" else "ignore",
+            "window": 1, "stride": 1, "accepts": {},
+        }
+
+    return shapes.node_shape(module, {
+        "inputs": [
+            port("v", "video", {"kind": "lockstep"}, False),
+            port("inputs", "video", held, True),
+            port("cues", "data", {"kind": "interval", "latency": 1, "ahead": 0,
+                                  "anchor": {"kind": "shared_clock"}, "group": "held"}, True),
+        ],
+        "outputs": [{"name": "v", "kind": "video", "latency": 0,
+                     "format": {"kind": "like", "port": "v"}}],
+        "clock": {"kind": "input", "port": "v"},
+        "pure": True, "one_to_one": True, "bounded": True, "relation": [],
+    })  # fmt: skip
+
+
+def test_a_laterals_rows_are_told_the_connection_they_arrive_on() -> None:
+    """The cam's rows ride the cam's connection, the second of the group's,
+    and the host learns which from the port, not from their place in the
+    call's array, where they are first."""
+    modules = _compose_modules({"type": "array", "items": {"type": "integer"}})
+    plan = compile_all(
+        _PLAY_ROWS + "\n" + _CUED + "\n" + _MAIN_AND_CAM,
+        describe=lambda path: modules[path],
+        shape=_cued_shape,
+    ).plan
+    assert plan is not None
+    # The cam's instance writes its rows; the main feed's writes none.
+    (cam,) = [lat.connections[0].port for lat in plan.laterals if ".cues" in lat.template]
+    (main,) = [lat.connections[0].port for lat in plan.laterals if ".cues" not in lat.template]
+    (cued,) = [
+        node
+        for process in plan.sidecars
+        if process.graph is not None
+        for node in process.graph.nodes.values()
+        if node.filter == "compose_node"
+    ]
+    assert cued.args["port"] == [main, cam]
+    told = {binding["input"]: binding["streams"] for binding in json.loads(cued.bound)}
+    assert told["cues"] == [{"rate": None, "port": cam}]
 
 
 # -- a lateral feeding a region with coded edges ------------------------------

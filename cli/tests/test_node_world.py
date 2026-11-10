@@ -590,6 +590,37 @@ def test_a_nodes_rows_under_a_pinned_track_row_are_a_track_of_the_file() -> None
     assert [output.type for output in graph.sinks[0].outputs] == ["video", "subtitle"]
 
 
+def test_a_nodes_rows_on_a_feeder_connection_stay_a_data_stream() -> None:
+    """What a run-time lateral's instance writes: the group's picture, sound
+    and rows as the NUT a node's group reads, whose data input takes JSON
+    messages. A titled subtitle track there was refused, since NUT keeps no
+    title, and would not have been what the input reads anyway."""
+    graph = _lowered(
+        "COPY (SELECT f.video[1], f.audio[1], hear(f.audio[1]) AS cues "
+        "FROM input('f.mp4') f) TO 'tcp://127.0.0.1:30355' WITH (format 'nut')"
+    )
+    (hear,) = [node for node in graph.nodes.values() if node.filter == "hear.wasm"]
+    assert hear.id not in graph.rows_sinks
+    ((sink,),) = [graph.sinks]
+    assert [output.type for output in sink.outputs] == ["video", "audio", "data"]
+    assert sink.outputs[2].ref == hear.id
+
+
+@pytest.mark.parametrize(
+    "destination",
+    ["'tcp://127.0.0.1:30355'", "'out.nut'", "'tcp://10.0.0.1:30355' WITH (format 'nut')"],
+)
+def test_a_nodes_rows_anywhere_but_a_feeder_connection_are_still_a_track(
+    destination: str,
+) -> None:
+    graph = _lowered(
+        "COPY (SELECT f.video[1], hear(f.audio[1]) FROM input('f.mp4') f) "
+        f"TO {destination}"
+    )
+    (hear,) = [node for node in graph.nodes.values() if node.filter == "hear.wasm"]
+    assert graph.rows_sinks[hear.id].container == "webvtt"
+
+
 def test_kinds_mix_in_one_call_and_a_left_out_port_is_unbound() -> None:
     asked = _Asked()
     graph = _lowered(

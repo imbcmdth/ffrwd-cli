@@ -1860,6 +1860,32 @@ def _feed_order(stream: _Stream) -> int:
     return {"video": 0, "audio": 1}.get(stream.type, 2)
 
 
+def _with_rows_ports(
+    bound: Sequence[Binding], rows_ports: Mapping[str, Sequence[int]]
+) -> list[Binding]:
+    """`bound` with each lateral's rows told the port of the connection they
+    arrive on. A group's connections follow its held input's streams, and a
+    data input may take rows from only some of them (the cams of a programme
+    whose main feed has none), so the host matches them by port, not by
+    position."""
+    told: list[Binding] = []
+    for binding in bound:
+        ports = rows_ports.get(binding.input)
+        if ports is None or len(ports) != len(binding.streams):
+            told.append(binding)
+            continue
+        told.append(
+            replace(
+                binding,
+                streams=tuple(
+                    replace(hint, port=port)
+                    for hint, port in zip(binding.streams, ports, strict=True)
+                ),
+            )
+        )
+    return told
+
+
 def _namespaced_call(node: exp.Expr) -> exp.Anonymous | None:
     """The ``exp.Anonymous`` inside ``ffmpeg.<filter>(...)``, else None.
 
@@ -2235,6 +2261,23 @@ def _manifest_format(raw: RawSink) -> str | None:
         if isinstance(value, str) and value in MANIFEST_FORMATS:
             return value
     return None
+
+
+def _feeder_destination(raw: RawSink) -> bool:
+    """Whether a COPY writes a feeder connection: NUT to a loopback port, as
+    each instance of a run-time lateral writes the group it feeds
+    (:func:`_instance_template`). What reads it is a node's group, whose data
+    input takes JSON messages, so a node's rows ride it as a data stream.
+    """
+    if raw.table_format or raw.path is None:
+        return False
+    host, _, port = raw.path.rpartition(":")
+    if host != f"tcp://{FEEDER_HOST}" or not port.isdigit():
+        return False
+    for option in raw.options:
+        if option.name == "format":
+            return _sink_value(_unwrap(option.value)) == _NUT_FORMAT
+    return False
 
 
 @dataclass(frozen=True)
@@ -4404,6 +4447,9 @@ class _Lowerer:
         # "" for every other sink. A rows file has no ffmpeg output at all:
         # the sidecar writes it, and the COPY makes no unit.
         self.rows_file = ""
+        # Whether this COPY writes a feeder connection (_feeder_destination),
+        # where a node's rows stay the data stream they are.
+        self.feeder_sink = False
         # Every track minted from a module's rows, so a sink holding one can
         # be given the subtitle codec its container needs.
         self.rows_tracks: list[FrameRef] = []
@@ -5005,6 +5051,7 @@ class _Lowerer:
         self.metadata = None
         self.attachments = []
         self.rows_file = self._rows_file(raw)
+        self.feeder_sink = _feeder_destination(raw)
         self.manifest = _manifest_format(raw)
         self._check_manifest_target(raw)
         self.row_reading_sink = bool(raw.module_sink) and self.res.wasm[
@@ -16604,6 +16651,9 @@ class _Lowerer:
             ports[hold.port_param] = held[name]
         self._check_grouped_data(declared, shape, streams, base, select)
         feeds: list[tuple[int, _Fed, Described]] = []
+        # The connection each lateral's rows arrive on, per data input, in
+        # the call's order: the host reads them off that port and no other.
+        rows_ports: dict[str, list[int]] = {}
         for name, lateral in fed.items():
             first_stream = lateral.streams[0]
             port = shape.input(name)
@@ -16659,6 +16709,8 @@ class _Lowerer:
                 if number not in numbers_given:
                     numbers_given.append(number)
                 feeds.append((number, one, conformed))
+                if port.kind == "data":
+                    rows_ports.setdefault(name, []).append(number)
             if listed:
                 # Every many input of a group lists the group's connections
                 # in one param, in the order they were first written.
@@ -16703,7 +16755,7 @@ class _Lowerer:
         made = self.graph.nodes[ref]
         made.ports = names
         made.out_ports = [output.name for output in shape.outputs]
-        made.bound = bound_json(bound)
+        made.bound = bound_json(_with_rows_ports(bound, rows_ports))
         self.graph.node_shapes[ref] = dict(shape.raw)
         self._emits_rows(ref, described)
         clock = shape.clock.port if shape.clock.port in names else None
@@ -17054,14 +17106,16 @@ class _Lowerer:
 
         Rows read by another node stay a data stream; the ones a COPY writes
         become what a module's rows have always become there, a rows file at a
-        rows destination and a subtitle track anywhere else. A one-element
-        array, the call under a track row a WHERE pinned, is its element.
+        rows destination and a subtitle track anywhere else. A feeder
+        connection is read by another node, so they stay a data stream there
+        too. A one-element array, the call under a track row a WHERE pinned,
+        is its element.
         """
         if len(value.streams) != 1:
             return value
         stream = value.streams[0]
         found = self._node_rows.get(self._under_rows_nodes(stream.ref))
-        if stream.type != "data" or found is None:
+        if stream.type != "data" or found is None or self.feeder_sink:
             return value
         declared, annotation, call = found
         return self._rows_output(

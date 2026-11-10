@@ -48,6 +48,10 @@ struct HintJson {
     width: Option<u32>,
     #[serde(default)]
     height: Option<u32>,
+    /// A run-time lateral's rows on a group's data input: the port of the
+    /// connection they arrive on.
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +111,7 @@ pub fn parse_bound(text: &str) -> Result<Vec<Binding>> {
                                 den: r.den,
                             }),
                             size,
+                            port: hint.port,
                         }),
                     }
                 })
