@@ -249,9 +249,9 @@ redownloadable.
 
 | tier | what | download |
 |---|---|---|
-| cpu | `onnxruntime.dll` | 72 MB |
+| cpu | `onnxruntime.dll` | 116 MB |
 | directml | `directml/onnxruntime.dll` and `directml/DirectML.dll` | 220 MB |
-| cuda | the CUDA build of `onnxruntime.dll`, `onnxruntime_providers_shared.dll`, `onnxruntime_providers_cuda.dll` | 298 MB |
+| cuda | the CUDA build of `onnxruntime.dll`, `onnxruntime_providers_shared.dll`, `onnxruntime_providers_cuda.dll` | 198 MB |
 | full | also a pinned CUDA 12 and cuDNN 9 set | 1.4 GB |
 
 What a query fetches for itself is what the machine turns out to have,
@@ -318,22 +318,22 @@ the same leaf name.
 
 ## What the other platforms take
 
-The same ONNX Runtime release publishes the rest, and the host already looks
-for these names on these platforms:
+The same ONNX Runtime release publishes the rest as NuGet packages, and the
+host already looks for these names on these platforms:
 
-| platform | archive | libraries |
+| platform | package | libraries |
 |---|---|---|
-| linux-x64 | `onnxruntime-linux-x64-1.22.0.tgz` | `libonnxruntime.so` |
-| linux-x64, cuda | `onnxruntime-linux-x64-gpu-1.22.0.tgz` | also `libonnxruntime_providers_shared.so`, `libonnxruntime_providers_cuda.so` |
-| osx-arm64 | `onnxruntime-osx-arm64-1.22.0.tgz` | `libonnxruntime.dylib`, CoreML inside it |
-| osx-x86_64 | `onnxruntime-osx-x86_64-1.22.0.tgz` | the same |
+| linux-x64 | `microsoft.ml.onnxruntime` | `libonnxruntime.so` |
+| linux-x64, cuda | `microsoft.ml.onnxruntime.gpu.linux` | also `libonnxruntime_providers_shared.so`, `libonnxruntime_providers_cuda.so` |
+| osx-arm64 | `microsoft.ml.onnxruntime` | `libonnxruntime.dylib`, CoreML inside it |
+| osx-x86_64 | `microsoft.ml.onnxruntime` | the same |
 
-Those archives carry one real file and a chain of symlinks to it. What is
-written out is the same set under the other arrangement: the real bytes land
-at the name the host loads, `libonnxruntime.so`, and the versioned names an
-soname lookup may ask for - `libonnxruntime.so.1`, `libonnxruntime.so.1.22.0` -
-are links to it. The runtime is loaded by full path either way; the links are
-for anything that goes looking by soname.
+Each package carries the library once, under `runtimes/<rid>/native/`. What
+is written out is the real bytes at the name the host loads,
+`libonnxruntime.so`, and the versioned names an soname lookup may ask for -
+`libonnxruntime.so.1`, `libonnxruntime.so.1.22.0` - as links to it. The
+runtime is loaded by full path either way; the links are for anything that
+goes looking by soname.
 
 ## CoreML
 

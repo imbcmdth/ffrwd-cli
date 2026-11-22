@@ -284,8 +284,18 @@ class Artifact:
     members: tuple[Member, ...] = field(default_factory=tuple)
 
 
-_ORT_RELEASES = "https://github.com/microsoft/onnxruntime/releases/download"
 _NUGET = "https://api.nuget.org/v3-flatcontainer"
+
+
+def _nupkg(package: str, version: str) -> str:
+    return f"{_NUGET}/{package}/{version}/{package}.{version}.nupkg"
+
+
+# The three packages that carry ONNX Runtime 1.22.0: the CPU one holds every
+# platform's library, the CUDA ones each hold their own platform's build.
+_ORT_CPU = _nupkg("microsoft.ml.onnxruntime", "1.22.0")
+_ORT_CUDA_WIN = _nupkg("microsoft.ml.onnxruntime.gpu.windows", "1.22.0")
+_ORT_CUDA_LINUX = _nupkg("microsoft.ml.onnxruntime.gpu.linux", "1.22.0")
 _NVIDIA = "https://developer.download.nvidia.com/compute"
 
 # What DirectML the sidecar's ONNX Runtime was built against. Windows ships a
@@ -300,12 +310,12 @@ _PINS: Mapping[tuple[str, str], Mapping[str, tuple[Artifact, ...]]] = {
     ("1.22.0", "win-x64"): {
         "cpu": (
             Artifact(
-                url=f"{_ORT_RELEASES}/v1.22.0/onnxruntime-win-x64-1.22.0.zip",
-                sha256="174c616efc0271194488642a72f1a514e01487da4dfe84c49296d66e40ebe0da",
-                size=72368545,
+                url=_ORT_CPU,
+                sha256="d571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a",
+                size=121402697,
                 members=(
                     Member(
-                        entry="onnxruntime-win-x64-1.22.0/lib/onnxruntime.dll",
+                        entry="runtimes/win-x64/native/onnxruntime.dll",
                         name="onnxruntime.dll",
                     ),
                 ),
@@ -346,22 +356,20 @@ _PINS: Mapping[tuple[str, str], Mapping[str, tuple[Artifact, ...]]] = {
         # built against that binary, not against the CPU one it replaces.
         "cuda": (
             Artifact(
-                url=f"{_ORT_RELEASES}/v1.22.0/onnxruntime-win-x64-gpu-1.22.0.zip",
-                sha256="5b5241716b2628c1ab5e79ee620be767531021149ee68f30fc46c16263fb94dd",
-                size=312740706,
+                url=_ORT_CUDA_WIN,
+                sha256="5496c77ed4ea1835caf27fe2f1cc3e52f68fc4a29c3dd84125b8e15c0e444daa",
+                size=207686427,
                 members=(
                     Member(
-                        entry="onnxruntime-win-x64-gpu-1.22.0/lib/onnxruntime.dll",
+                        entry="runtimes/win-x64/native/onnxruntime.dll",
                         name="onnxruntime.dll",
                     ),
                     Member(
-                        entry="onnxruntime-win-x64-gpu-1.22.0/lib"
-                        "/onnxruntime_providers_shared.dll",
+                        entry="runtimes/win-x64/native/onnxruntime_providers_shared.dll",
                         name="onnxruntime_providers_shared.dll",
                     ),
                     Member(
-                        entry="onnxruntime-win-x64-gpu-1.22.0/lib"
-                        "/onnxruntime_providers_cuda.dll",
+                        entry="runtimes/win-x64/native/onnxruntime_providers_cuda.dll",
                         name="onnxruntime_providers_cuda.dll",
                     ),
                 ),
@@ -436,17 +444,17 @@ _PINS: Mapping[tuple[str, str], Mapping[str, tuple[Artifact, ...]]] = {
             ),
         ),
     },
-    # The tgz members are the real files; the unversioned names the archive
-    # carries are symlinks to them, and so are the ones written here.
+    # The package carries one unversioned library; the versioned names a
+    # loader may ask for are symlinks to it, written here.
     ("1.22.0", "linux-x64"): {
         "cpu": (
             Artifact(
-                url=f"{_ORT_RELEASES}/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz",
-                sha256="8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3",
-                size=7798730,
+                url=_ORT_CPU,
+                sha256="d571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a",
+                size=121402697,
                 members=(
                     Member(
-                        entry="onnxruntime-linux-x64-1.22.0/lib/libonnxruntime.so.1.22.0",
+                        entry="runtimes/linux-x64/native/libonnxruntime.so",
                         name="libonnxruntime.so",
                         aliases=("libonnxruntime.so.1", "libonnxruntime.so.1.22.0"),
                     ),
@@ -455,23 +463,21 @@ _PINS: Mapping[tuple[str, str], Mapping[str, tuple[Artifact, ...]]] = {
         ),
         "cuda": (
             Artifact(
-                url=f"{_ORT_RELEASES}/v1.22.0/onnxruntime-linux-x64-gpu-1.22.0.tgz",
-                sha256="2a19dbfa403672ec27378c3d40a68f793ac7a6327712cd0e8240a86be2b10c55",
-                size=227317516,
+                url=_ORT_CUDA_LINUX,
+                sha256="d3dabd8235b7a04a67838a3b93437420f1a709528a8d8611e08bedbb08206d1d",
+                size=227384342,
                 members=(
                     Member(
-                        entry="onnxruntime-linux-x64-gpu-1.22.0/lib/libonnxruntime.so.1.22.0",
+                        entry="runtimes/linux-x64/native/libonnxruntime.so",
                         name="libonnxruntime.so",
                         aliases=("libonnxruntime.so.1", "libonnxruntime.so.1.22.0"),
                     ),
                     Member(
-                        entry="onnxruntime-linux-x64-gpu-1.22.0/lib"
-                        "/libonnxruntime_providers_shared.so",
+                        entry="runtimes/linux-x64/native/libonnxruntime_providers_shared.so",
                         name="libonnxruntime_providers_shared.so",
                     ),
                     Member(
-                        entry="onnxruntime-linux-x64-gpu-1.22.0/lib"
-                        "/libonnxruntime_providers_cuda.so",
+                        entry="runtimes/linux-x64/native/libonnxruntime_providers_cuda.so",
                         name="libonnxruntime_providers_cuda.so",
                     ),
                 ),
@@ -561,12 +567,12 @@ _PINS: Mapping[tuple[str, str], Mapping[str, tuple[Artifact, ...]]] = {
     ("1.22.0", "osx-arm64"): {
         "cpu": (
             Artifact(
-                url=f"{_ORT_RELEASES}/v1.22.0/onnxruntime-osx-arm64-1.22.0.tgz",
-                sha256="cab6dcbd77e7ec775390e7b73a8939d45fec3379b017c7cb74f5b204c1a1cc07",
-                size=25943843,
+                url=_ORT_CPU,
+                sha256="d571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a",
+                size=121402697,
                 members=(
                     Member(
-                        entry="onnxruntime-osx-arm64-1.22.0/lib/libonnxruntime.1.22.0.dylib",
+                        entry="runtimes/osx-arm64/native/libonnxruntime.dylib",
                         name="libonnxruntime.dylib",
                         aliases=("libonnxruntime.1.22.0.dylib",),
                     ),
@@ -577,12 +583,12 @@ _PINS: Mapping[tuple[str, str], Mapping[str, tuple[Artifact, ...]]] = {
     ("1.22.0", "osx-x86_64"): {
         "cpu": (
             Artifact(
-                url=f"{_ORT_RELEASES}/v1.22.0/onnxruntime-osx-x86_64-1.22.0.tgz",
-                sha256="e4ec94a7696de74fb1b12846569aa94e499958af6ffa186022cfde16c9d617f0",
-                size=27889590,
+                url=_ORT_CPU,
+                sha256="d571e63a2329baacb713f441e65ad75284de354db6e1ac435fe4bebbb417986a",
+                size=121402697,
                 members=(
                     Member(
-                        entry="onnxruntime-osx-x86_64-1.22.0/lib/libonnxruntime.1.22.0.dylib",
+                        entry="runtimes/osx-x64/native/libonnxruntime.dylib",
                         name="libonnxruntime.dylib",
                         aliases=("libonnxruntime.1.22.0.dylib",),
                     ),
