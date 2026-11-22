@@ -101,6 +101,30 @@ def _frame_hashes(path: Path) -> list[str]:
     return [line for line in done.stdout.splitlines() if not line.startswith("#")]
 
 
+def _take_one(listener: socket.socket, into: Path) -> tuple[threading.Thread, threading.Event]:
+    """A thread that writes the first connection `listener` takes into
+    `into`, and the event that stops it waiting for one, so a run that fails
+    or skips before it connects leaves no thread holding the test run open."""
+    stop = threading.Event()
+    listener.settimeout(0.5)
+
+    def take() -> None:
+        while not stop.is_set():
+            try:
+                connection, _ = listener.accept()
+            except TimeoutError:
+                continue
+            connection.settimeout(None)
+            with connection, into.open("wb") as out:
+                while chunk := connection.recv(1 << 16):
+                    out.write(chunk)
+            return
+
+    taker = threading.Thread(target=take, daemon=True)
+    taker.start()
+    return taker, stop
+
+
 def test_a_tcp_destination_takes_the_sidecars_nut_with_both_pictures(tmp_path: Path) -> None:
     """The plan runs no ffmpeg after the sidecar; what reaches the listener is
     one NUT with `dim`'s picture and the mask, every frame of the source in
@@ -109,20 +133,14 @@ def test_a_tcp_destination_takes_the_sidecars_nut_with_both_pictures(tmp_path: P
     url = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
     received = tmp_path / "received.nut"
 
-    def take() -> None:
-        connection, _ = listener.accept()
-        with connection, received.open("wb") as out:
-            while chunk := connection.recv(1 << 16):
-                out.write(chunk)
-
     plan = compile_all(_matte_query(url)).plan
     assert plan is not None
     assert not any(e.source == plan.sidecars[0].id for e in plan.stream_edges)
-    taker = threading.Thread(target=take)
-    taker.start()
+    taker, stop = _take_one(listener, received)
     try:
         assert cli.main(["run", _matte_query(url), "-y"]) == 0
     finally:
+        stop.set()
         taker.join(_TIMEOUT)
         listener.close()
 
@@ -217,20 +235,14 @@ def test_a_region_decoding_on_the_gpu_writes_its_tcp_destination_itself(
     url = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
     received = tmp_path / "received.nut"
 
-    def take() -> None:
-        connection, _ = listener.accept()
-        with connection, received.open("wb") as out:
-            while chunk := connection.recv(1 << 16):
-                out.write(chunk)
-
     plan = compile_all(_gpu_box_query(url)).plan
     assert plan is not None
     assert not any(e.source == plan.sidecars[0].id for e in plan.stream_edges)
-    taker = threading.Thread(target=take)
-    taker.start()
+    taker, stop = _take_one(listener, received)
     try:
         _run_or_skip(_gpu_box_query(url))
     finally:
+        stop.set()
         taker.join(_TIMEOUT)
         listener.close()
 
