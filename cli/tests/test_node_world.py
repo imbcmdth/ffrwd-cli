@@ -509,6 +509,35 @@ def test_rows_match_by_their_fields_and_extra_fields_pass() -> None:
     assert shapes.row_mismatch(_CUE, _ROWS) == ("text", "string", "nothing")
 
 
+def test_rows_satisfy_a_schema_by_its_required_fields_and_no_contradiction() -> None:
+    def cue(**fields: str) -> dict[str, object]:
+        return {"type": "object", "properties": {
+            name: {"type": kind} for name, kind in fields.items()}}
+
+    record = cue(index="number", track="string", text="string", start_t="number",
+                 end_t="number")
+    written = {
+        "utterance": _UTTERANCE,
+        "cue record": record,
+        "whole seconds": cue(text="string", start_t="integer", end_t="integer"),
+        "no cue": _ROWS,
+        "no fields": {"type": "object"},
+        "final as text": cue(text="string", start_t="number", end_t="number",
+                             final="string"),
+        "untyped text": {"type": "object", "properties": {
+            "text": {}, "start_t": {"type": "number"}, "end_t": {"type": "number"}}},
+    }
+    assert {name: shapes.row_unfit(_TEXT_ROW, rows) for name, rows in written.items()} == {
+        "utterance": None,
+        "cue record": None,
+        "whole seconds": None,
+        "no cue": ("text", "string", "nothing"),
+        "no fields": ("text", "string", "nothing"),
+        "final as text": ("final", "boolean", "string"),
+        "untyped text": ("text", "string", "no type"),
+    }
+
+
 def test_one_shape_is_asked_once_per_module_params_and_bound_list() -> None:
     asked = _Asked()
     cache = shapes.ShapeCache(asked)
@@ -1419,12 +1448,22 @@ def test_a_node_sources_coded_streams_keep_their_time_at_a_file(
     assert argv["ffmpeg0"][:2] == ["ffmpeg", "-copyts"]
 
 
-def _arrival(name: str, kind: str, codecs: Sequence[str] = ()) -> dict[str, object]:
-    return {
-        "name": name, "kind": kind, "required": name == "video", "many": True,
+def _arrival(
+    name: str,
+    kind: str,
+    codecs: Sequence[str] = (),
+    *,
+    many: bool = True,
+    schema: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    port: dict[str, object] = {
+        "name": name, "kind": kind, "required": name == "video", "many": many,
         "pairing": {"kind": "arrival"}, "rows": "ignore", "window": 1, "stride": 1,
         "accepts": {"codecs": list(codecs)},
     }
+    if schema is not None:
+        port["schema"] = json.dumps(schema)
+    return port
 
 
 def _publish(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
@@ -1516,6 +1555,217 @@ def test_a_node_sinks_data_beside_its_picture_and_sound_keeps_a_pipe_and_no_row(
     assert sidecar.count("-i") == 2 and "-pad" not in sidecar
     told = json.loads(sidecar[sidecar.index("-pads") + 1].removeprefix("publish="))
     assert [pad.get("row") for pad in told] == [0, 0, None]
+
+
+# What ffrwd/moq's publish declares on its `text` input.
+_TEXT_ROW = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "start_t": {"type": "number"},
+        "end_t": {"type": "number"},
+        "final": {"type": "boolean"},
+        "voice": {"type": "string"},
+    },
+    "required": ["text", "start_t", "end_t"],
+}
+# What ffrwd/parakeet's transcribe writes.
+_UTTERANCE = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "start_t": {"type": "number"},
+        "end_t": {"type": "number"},
+        "final": {"type": "boolean"},
+    },
+    "required": ["text", "start_t", "end_t", "final"],
+    "additionalProperties": False,
+}
+_REQUIRED_BOX = {**_BOX, "required": ["x", "y", "w", "h"]}
+
+
+def _writes(schema: Mapping[str, object] | None) -> Callable[..., dict[str, object]]:
+    """A node over sound writing rows of `schema`, or of no schema at all."""
+
+    def shaped(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        return _shape(
+            [_clock("a", "audio")],
+            [_output("rows", "data", schema=schema)],
+            {"kind": "input", "port": "a"},
+        )
+
+    return shaped
+
+
+def _sink_reading(*rows: dict[str, object]) -> Callable[..., dict[str, object]]:
+    """publish's coded picture and sound, and the rows inputs given."""
+
+    def shaped(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+        return _shape(
+            [_arrival("video", "packets", ["h264"]), _arrival("audio", "packets", ["aac"]),
+             *rows],
+            [],
+            {"kind": "rate", "num": 50, "den": 1},
+        )
+
+    return shaped
+
+
+_WRITERS = {
+    "utter": "RETURNS STRUCT(text text, start_t number, end_t number, final boolean)[]",
+    "said": "RETURNS cue[]",
+    "tally": "RETURNS STRUCT(count number)[]",
+}
+
+
+def _published_rows(columns: str) -> str:
+    """publish over the picture and `columns`, declaring each writer they call."""
+    called = [
+        f"CREATE FUNCTION {name}(a audio_stream) {returns} "
+        f"AS '{name}.wasm', '{name}' LANGUAGE wasm;\n"
+        for name, returns in _WRITERS.items()
+        if f"{name}(" in columns
+    ]
+    return (
+        _PUBLISH + "".join(called) + f"COPY (SELECT f.video[1], {columns} FROM input('f.mp4') f) "
+        "TO publish('https://relay', 'b') WITH (video_codec 'libx264')"
+    )
+
+
+def _with_data() -> ProbeResult:
+    media = _probes()["f"]
+    assert media is not None
+    data = StreamMeta(
+        type="data", index=0, metadata={}, width=None, height=None, fps=None,
+        sample_rate=None, codec=JSON_CODEC,
+    )
+    return ProbeResult(streams=[*media.streams, data])
+
+
+@pytest.fixture
+def _text_sink(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    """publish with `data` and `text` inputs, and the nodes writing rows."""
+    monkeypatch.setitem(
+        SHAPES,
+        "publish.wasm",
+        _sink_reading(_arrival("data", "data"), _arrival("text", "data", schema=_TEXT_ROW)),
+    )
+    monkeypatch.setitem(SHAPES, "utter.wasm", _writes(_UTTERANCE))
+    monkeypatch.setitem(SHAPES, "said.wasm", _writes(None))
+    monkeypatch.setitem(SHAPES, "tally.wasm", _writes({"type": "object", "properties": {
+        "count": {"type": "integer"}}}))
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    return monkeypatch
+
+
+def test_a_node_sinks_data_columns_bind_the_rows_input_their_rows_fit(
+    _text_sink: pytest.MonkeyPatch,
+) -> None:
+    """Cue rows bind `text`, whose schema they satisfy: parakeet's
+    utterances, a node's `cue[]` declared with a schema of its own, and one
+    whose rows are ffrwd's cue record as declared. A STRUCT that is no cue
+    and an input's own data track bind `data`, and each alias still names
+    the track."""
+    _text_sink.setattr("ffrwd.compiler.probe_path", lambda path, args=(), **kw: _with_data())
+    compiled = compile_all(
+        _declared(_published_rows(
+            "f.audio[1], utter(f.audio[1]) AS captions, said(f.audio[1]), "
+            "hear(f.audio[1]) AS loudness, tally(f.audio[1]) AS counts, f.data[1]"
+        )),
+        describe=_reporting("publish.wasm"),
+        shape=_Asked(),
+    )
+    assert compiled.plan is not None
+    (sink,) = [
+        node for graph in compiled.graphs for node in graph.nodes.values()
+        if node.filter == "publish.wasm"
+    ]
+    assert sink.ports == ["video", "audio", "text", "text", "text", "data", "data"]
+    assert [(bound["input"], len(bound["streams"])) for bound in json.loads(sink.bound)] == [
+        ("video", 1), ("audio", 1), ("text", 3), ("data", 2),
+    ]
+    (sidecar,) = [words for words in _shown(compiled.plan).values() if "-pads" in words]
+    told = json.loads(sidecar[sidecar.index("-pads") + 1].removeprefix("publish="))
+    assert [pad.get("rendition", {}).get("name") for pad in told[2:]] == [
+        "captions", None, "loudness", "counts", None,
+    ]
+
+
+def test_a_node_sinks_rows_inputs_declaring_no_schema_take_every_data_column_on_the_first(
+    _text_sink: pytest.MonkeyPatch,
+) -> None:
+    _text_sink.setitem(
+        SHAPES, "publish.wasm", _sink_reading(_arrival("data", "data"), _arrival("text", "data"))
+    )
+    graph = _lowered(_published_rows("utter(f.audio[1]), tally(f.audio[1])"))
+    (sink,) = [node for node in graph.nodes.values() if node.filter == "publish.wasm"]
+    assert sink.ports == ["video", "data", "data"]
+
+
+@pytest.mark.parametrize(
+    ("rows", "columns", "message"),
+    [
+        (
+            (_arrival("text", "data", schema=_TEXT_ROW),
+             _arrival("boxes", "data", schema=_REQUIRED_BOX)),
+            "f.data[1]",
+            "publish() takes rows on 'text' and 'boxes', and the column 'f.data[1]' fits "
+            "none of them",
+        ),
+        (
+            (_arrival("text", "data", schema=_TEXT_ROW),
+             _arrival("boxes", "data", schema=_REQUIRED_BOX)),
+            "tally(f.audio[1]) AS counts",
+            "publish() takes rows on 'text' and 'boxes', and the column 'counts' fits none "
+            "of them",
+        ),
+        (
+            (_arrival("text", "data", schema=_TEXT_ROW),
+             _arrival("words", "data", schema=_CUE)),
+            "hear(f.audio[1]) AS loudness",
+            "publish() takes rows on 'text' and 'words', and the column 'loudness' fits "
+            "'text' and 'words' alike",
+        ),
+        (
+            (_arrival("data", "data"), _arrival("text", "data", many=False, schema=_TEXT_ROW)),
+            "hear(f.audio[1]), utter(f.audio[1]) AS captions",
+            "the module 'publish.wasm' reads one data stream on 'text', and the column "
+            "'captions' is a second",
+        ),
+    ],
+    ids=["untyped", "unfit", "two-fit", "one-taken-twice"],
+)
+def test_a_data_column_no_one_rows_input_takes_is_refused_naming_it(
+    _text_sink: pytest.MonkeyPatch,
+    rows: tuple[dict[str, object], ...],
+    columns: str,
+    message: str,
+) -> None:
+    _text_sink.setitem(SHAPES, "publish.wasm", _sink_reading(*rows))
+    with pytest.raises(FfrwdError) as caught:
+        _lowered(_published_rows(columns), probes={**_probes(), "f": _with_data()})
+    assert caught.value.message == message
+
+
+def test_a_column_fitting_no_rows_input_is_told_what_each_requires(
+    _text_sink: pytest.MonkeyPatch,
+) -> None:
+    _text_sink.setitem(
+        SHAPES,
+        "publish.wasm",
+        _sink_reading(_arrival("text", "data", schema=_TEXT_ROW),
+                      _arrival("boxes", "data", schema=_REQUIRED_BOX)),
+    )
+    query = _published_rows("\n  tally(f.audio[1]) AS counts")
+    with pytest.raises(FfrwdError) as caught:
+        _lowered(query)
+    assert caught.value.hint == (
+        "'text' requires 'text' as string, which the rows lack; 'boxes' requires 'x' as "
+        "number, which the rows lack; hand it rows carrying every field one of them requires"
+    )
+    assert caught.value.line == query[: query.index("tally(f")].count("\n") + 1
 
 
 def _encoders(plan: ProcessPlan) -> dict[str, set[str]]:

@@ -15,7 +15,8 @@ list, hints and all, so :class:`ShapeCache` asks once per distinct triple.
 
 Also here, since every reader of a shape needs them: the streaming words a
 window is said in (:func:`window_words`), and structural row matching
-(:func:`row_mismatch`), which compares the JSON schemas two data ports carry.
+(:func:`row_mismatch`, :func:`row_unfit`), which compares the JSON schemas two
+data ports carry.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ __all__ = [
     "bound_json",
     "node_shape",
     "row_mismatch",
+    "row_unfit",
     "shape",
     "window_words",
 ]
@@ -810,4 +812,55 @@ def row_mismatch(
                     _type_text(item_types_want),
                     _type_text(item_types_have),
                 )
+    return None
+
+
+def _properties(schema: Mapping[str, object]) -> Mapping[str, object]:
+    written = schema.get("properties")
+    return written if isinstance(written, dict) else {}
+
+
+def row_unfit(
+    reader: Mapping[str, object], producer: Mapping[str, object]
+) -> tuple[str, str, str] | None:
+    """The first field keeping `producer`'s rows from satisfying `reader`'s schema.
+
+    ``(field, what the reader wants, what the producer writes)``, or None
+    where the rows satisfy it: every field the reader requires is there with
+    a type it takes, and no field both of them name is written as a type the
+    reader does not take. A field only one of them names passes, so an
+    optional field may go unwritten and a producer may write more. Nested
+    objects are compared the same way, a nested field named by its dotted
+    path.
+    """
+    wanted, given = _properties(reader), _properties(producer)
+    required = reader.get("required")
+    for name in required if isinstance(required, list) else []:
+        want = wanted.get(name) if isinstance(name, str) else None
+        want_types = _types(want) if isinstance(want, dict) else None
+        have = given.get(name) if isinstance(name, str) else None
+        if not isinstance(have, dict):
+            return (str(name), _type_text(want_types), "nothing")
+        if want_types is not None and _types(have) is None:
+            return (str(name), _type_text(want_types), _type_text(None))
+    for name, have in given.items():
+        want = wanted.get(name)
+        if not isinstance(want, dict) or not isinstance(have, dict):
+            continue
+        for said, want_part, have_part in (
+            (name, want, have),
+            (f"{name}[]", want.get("items"), have.get("items")),
+        ):
+            if not isinstance(want_part, dict) or not isinstance(have_part, dict):
+                continue
+            want_types, have_types = _types(want_part), _types(have_part)
+            if (
+                want_types is not None
+                and have_types is not None
+                and not _covers(want_types, have_types)
+            ):
+                return (said, _type_text(want_types), _type_text(have_types))
+        nested = row_unfit(want, have)
+        if nested is not None:
+            return (f"{name}.{nested[0]}", nested[1], nested[2])
     return None

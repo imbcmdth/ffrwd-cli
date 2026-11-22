@@ -452,6 +452,7 @@ from ffrwd.shapes import (
     bound_json,
     node_shape,
     row_mismatch,
+    row_unfit,
 )
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
@@ -2127,22 +2128,53 @@ def _sink_port(shape: NodeShape, kind: StreamType) -> InputPort | None:
     return next((port for port in coded if port.name != "audio"), None)
 
 
-def _sink_view(described: Described, ports: Mapping[str, InputPort | None]) -> Described:
+def _rows_inputs(shape: NodeShape) -> tuple[InputPort, ...]:
+    """Every input of a node sink's shape that reads rows, in its order."""
+    return tuple(port for port in shape.inputs if port.kind == "data")
+
+
+def _said_names(names: Sequence[str]) -> str:
+    """Names as a message lists them: 'a', 'a' and 'b', 'a', 'b' and 'c'."""
+    quoted = [f"'{name}'" for name in names]
+    return quoted[0] if len(quoted) == 1 else ", ".join(quoted[:-1]) + " and " + quoted[-1]
+
+
+def _column_said(read: FrameRef, column: exp.Expr | None) -> str:
+    """A sink's data column as a message names it: its alias, else its SQL."""
+    if column is None:
+        return read
+    return _sink_alias(column) or _sql_text(column)
+
+
+def _unfit_words(name: str, unfit: tuple[str, str, str]) -> str:
+    """Why rows do not satisfy the schema of the input `name`, for a hint."""
+    field, wants, writes = unfit
+    if writes == "nothing":
+        typed = "" if wants == "no type" else f" as {wants}"
+        return f"'{name}' requires '{field}'{typed}, which the rows lack"
+    return f"'{name}' takes '{field}' as {wants}, and the rows write {writes}"
+
+
+def _sink_view(
+    described: Described, shape: NodeShape, ports: Mapping[str, InputPort | None]
+) -> Described:
     """A node sink as the packet sink its ports describe: how many streams of
-    each kind it reads, the codecs it takes, and how much of each it wants."""
+    each kind it reads, the codecs it takes, and how much of each it wants.
+    Data streams are counted over every rows input at once."""
 
     def arity(port: InputPort | None) -> SinkArity:
         return "none" if port is None else "many" if port.many else "one"
 
     video, audio, data = ports["video"], ports["audio"], ports["data"]
     first = next((port for port in (video, audio, data) if port is not None), None)
+    rows = _rows_inputs(shape)
     return replace(
         described,
         video_codecs=tuple(video.accepts.codecs) if video is not None else (),
         audio_codecs=tuple(audio.accepts.codecs) if audio is not None else (),
         video_streams=arity(video),
         audio_streams=arity(audio),
-        data_streams=arity(data),
+        data_streams="many" if len(rows) > 1 else arity(data),
         wants=_sink_wants(first.accepts.wants) if first is not None else "all",
         packet_filter=False,
     )
@@ -4497,6 +4529,9 @@ class _Lowerer:
         # The same sinks' rows, for cutting a per-row option list to the rows
         # that carry the option's kind.
         self.row_reading_sink_rows: dict[str, list[_VariantRow]] = {}
+        # Sink node id -> the SELECT column each of its data pads came from,
+        # by pad position, for a message naming the column.
+        self._sink_columns: dict[str, dict[int, exp.Expr]] = {}
         # Every ``RETURNS packets`` call lowered so far, in lowering order:
         # the node it minted, what declared it, and where it was written. A
         # COPY takes the run of them its own SELECT added and settles what
@@ -18373,6 +18408,12 @@ class _Lowerer:
             [stream.ref for stream in pads],
             [pads[0].type],
         )
+        written = {id(stream): argument for stream, argument in gathered}
+        self._sink_columns[ref] = {
+            position: written[id(stream)]
+            for position, stream in enumerate(pads)
+            if stream.type == "data"
+        }
         # The module is the destination: its pad reaches no file and no other
         # node, and the record here is what says so.
         self.graph.module_sinks.append(ref)
@@ -18400,6 +18441,8 @@ class _Lowerer:
         Which ports there are is asked with nothing bound; once the SELECT's
         streams are on them, the shape is asked again with each port and a
         hint per stream bound there, which is what the host asks at run time.
+        A data stream binds the rows input its rows fit
+        (:meth:`_node_sink_rows_input`).
         """
         described = self._node_module(declared)
         assert described is not None  # what the caller checked
@@ -18411,39 +18454,40 @@ class _Lowerer:
         )
         shape = self._node_shape(declared, described, params, [], anchor, select)
         ports = self._node_sink_ports(declared, shape, node, select)
-        view = _sink_view(described, ports)
+        view = _sink_view(described, shape, ports)
         self._node_sinks[declared.module] = (view, shape)
         value = self._lower_sink_call(node, declared, view, call, env, select)
         ref = self.graph.module_sinks[-1]
         made = self.graph.nodes[ref]
         kinds = [ref_type(self.graph, read) for read in made.inputs]
-        named = {kind: port.name for kind, port in ports.items() if port is not None}
+        named = self._node_sink_pad_ports(declared, shape, ports, ref, select)
         bound = [
             Binding(
                 name,
                 tuple(
                     StreamHint(self._stream_rate(read))
-                    for read, kind in zip(made.inputs, kinds)
-                    if named.get(kind) == name
+                    for read, port in zip(made.inputs, named)
+                    if port == name
                 ),
             )
-            for name in dict.fromkeys(named[kind] for kind in kinds if kind in named)
+            for name in dict.fromkeys(port for port in named if port is not None)
         ]
         shape = self._node_shape(declared, described, params, bound, anchor, select)
         ports = self._node_sink_ports(declared, shape, node, select)
-        named = {kind: port.name for kind, port in ports.items() if port is not None}
-        if any(kind not in named for kind in kinds):
+        named = self._node_sink_pad_ports(declared, shape, ports, ref, select)
+        unread = sorted({kind for kind, port in zip(kinds, named) if port is None})
+        if unread:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"{declared.name}() returns sink, and with the streams the query "
                 f"hands it the module '{declared.module}' reads none of "
-                + ", ".join(sorted({kind for kind in kinds if kind not in named})),
+                + ", ".join(unread),
                 node,
                 fallback=select,
                 hint="hand the sink only the kinds of stream its shape reads",
             )
-        self._node_sinks[declared.module] = (_sink_view(described, ports), shape)
-        made.ports = [named[kind] for kind in kinds]
+        self._node_sinks[declared.module] = (_sink_view(described, shape, ports), shape)
+        made.ports = [port for port in named if port is not None]
         made.bound = bound_json(bound)
         emits = described.rows_schema is not None
         if emits:
@@ -18473,6 +18517,114 @@ class _Lowerer:
                 "no output; declare this one as what it is",
             )
         return ports
+
+    def _node_sink_pad_ports(
+        self,
+        declared: WasmFunction,
+        shape: NodeShape,
+        ports: Mapping[str, InputPort | None],
+        ref: FrameRef,
+        select: exp.Select,
+    ) -> list[str | None]:
+        """The input each pad of the node sink `ref` binds, None where the
+        shape reads nothing of its kind: a picture or a sound on the port of
+        its kind, a data stream on the rows input its rows fit."""
+        columns = self._sink_columns.get(ref, {})
+        several = len(_rows_inputs(shape)) > 1
+        named: list[str | None] = []
+        for position, read in enumerate(self.graph.nodes[ref].inputs):
+            kind = ref_type(self.graph, read)
+            column = columns.get(position)
+            port = (
+                self._node_sink_rows_input(declared, shape, read, column, select)
+                if kind == "data"
+                else ports.get(kind)
+            )
+            if (
+                several
+                and port is not None
+                and kind == "data"
+                and not port.many
+                and port.name in named
+            ):
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"the module '{declared.module}' reads one data stream on "
+                    f"'{port.name}', and the column '{_column_said(read, column)}' "
+                    "is a second",
+                    column if column is not None else select,
+                    fallback=select,
+                    hint=f"hand {declared.name}() one column whose rows fit '{port.name}'",
+                )
+            named.append(None if port is None else port.name)
+        return named
+
+    def _node_sink_rows_input(
+        self,
+        declared: WasmFunction,
+        shape: NodeShape,
+        read: FrameRef,
+        column: exp.Expr | None,
+        select: exp.Select,
+    ) -> InputPort | None:
+        """The rows input of a node sink's shape that the data stream `read`
+        binds.
+
+        With one rows input, or none declaring a schema, it is the first.
+        Otherwise the stream binds the input whose schema its rows satisfy
+        (:func:`row_unfit`), and rows satisfying none bind the first input
+        declaring no schema. Rows that declare no type, as an input's own
+        data track's do, satisfy no schema. Rows satisfying two schemas, or
+        none where every rows input declares one, are refused naming the
+        column.
+        """
+        rows = _rows_inputs(shape)
+        if len(rows) < 2 or all(port.schema is None for port in rows):
+            return rows[0] if rows else None
+        written = self._written_rows(read)
+        judged = [
+            (port, row_unfit(port.schema, written[1]) if written is not None else None)
+            for port in rows
+            if port.schema is not None
+        ]
+        fits = [port for port, unfit in judged if written is not None and unfit is None]
+        if len(fits) == 1:
+            return fits[0]
+        schemaless = [port for port in rows if port.schema is None]
+        if not fits and schemaless:
+            return schemaless[0]
+        label = _column_said(read, column)
+        inputs = _said_names([port.name for port in rows])
+        where = column if column is not None else select
+        if fits:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{declared.name}() takes rows on {inputs}, and the column "
+                f"'{label}' fits {_said_names([port.name for port in fits])} alike",
+                where,
+                fallback=select,
+                hint="a data column binds the one rows input whose schema its rows "
+                f"satisfy, so the module '{declared.module}' has to declare schemas "
+                f"that tell {_said_names([port.name for port in fits])} apart",
+            )
+        hint = (
+            "a column whose rows declare no type, such as an input's data track, "
+            "binds a rows input declaring no schema, and every rows input of the "
+            f"module '{declared.module}' declares one"
+            if written is None
+            else "; ".join(
+                _unfit_words(port.name, unfit) for port, unfit in judged if unfit is not None
+            )
+            + "; hand it rows carrying every field one of them requires"
+        )
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{declared.name}() takes rows on {inputs}, and the column '{label}' "
+            "fits none of them",
+            where,
+            fallback=select,
+            hint=hint,
+        )
 
     def _lower_row_reading_sink_call(
         self,
@@ -18507,7 +18659,7 @@ class _Lowerer:
         # alias, when the query wrote one, is its name: the track a sink
         # publishes it as.
         data = [
-            (stream, _sink_alias(argument))
+            (stream, argument)
             for argument, c in zip(call.args[:at], columns, strict=True)
             if c.value.type == "data"
             for stream in c.value.streams
@@ -18531,10 +18683,10 @@ class _Lowerer:
                 if rendition:
                     entry["rendition"] = rendition
                 meta.append(entry)
+        columns_at = {len(pads) + n: argument for n, (_, argument) in enumerate(data)}
         pads += [stream for stream, _ in data]
-        meta += [
-            {"row": 0, "rendition": {"name": name}} if name else {} for _, name in data
-        ]
+        named = [_sink_alias(argument) for _, argument in data]
+        meta += [{"row": 0, "rendition": {"name": name}} if name else {} for name in named]
         tuples = env.relation.tuples if env.relation is not None else []
         params = self._wasm_params(
             declared,
@@ -18554,6 +18706,7 @@ class _Lowerer:
         )
         self.row_reading_sink_pads[ref] = meta
         self.row_reading_sink_rows[ref] = rows
+        self._sink_columns[ref] = columns_at
         self.graph.module_sinks.append(ref)
         return _Value(type=pads[0].type, streams=(), is_array=False)
 

@@ -4088,6 +4088,15 @@ def _wasm_argument_kind(call: exp.Anonymous, wasm: Mapping[str, WasmFunction] | 
     return _declared_kind(declared.returns)
 
 
+def _called_wasm(node: exp.Expr, wasm: Mapping[str, WasmFunction]) -> WasmFunction | None:
+    """The wasm declaration `node` calls, bare or namespaced, through parens."""
+    while isinstance(node, exp.Paren) and isinstance(node.this, exp.Expr):
+        node = node.this
+    expression = node.args.get("expression") if isinstance(node, exp.Dot) else None
+    call = expression if isinstance(expression, exp.Anonymous) else node
+    return wasm.get(_call_name(call)) if isinstance(call, exp.Anonymous) else None
+
+
 def _positional_and_named(
     arguments: Sequence[exp.Expr],
 ) -> tuple[list[exp.Expr], list[tuple[str, exp.Expr]]]:
@@ -5422,14 +5431,18 @@ class _Expander:
         """A sink call's arguments, split where the rewrite says they split.
 
         The leading `streams` arguments came out of the SELECT list and are
-        checked for being streams at all; which parameter each fills is a
-        question of KIND, and kinds are settled in lowering. The rest are the
-        module's own values, positional and then named, held to the same
-        rules any call's are.
+        checked for being streams at all, the rows a module writes over a
+        stream (`STRUCT(...)[]`) among them, since those reach the sink as a
+        data stream; which parameter each fills is a question of KIND, and
+        kinds are settled in lowering. The rest are the module's own values,
+        positional and then named, held to the same rules any call's are.
         """
         for argument in arguments[:streams]:
             written = _argument_kind(argument, self.wasm)
             if written is None or written == "stream":
+                continue
+            called = _called_wasm(argument, self.wasm)
+            if written == _RECORD_KIND and called is not None and called.stream_params:
                 continue
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,

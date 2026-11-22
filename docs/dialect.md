@@ -309,7 +309,11 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   value parameters only; the SELECT list supplies the ROWS it reads,
   each row a video cell, an audio cell, either NULL - the relation a
   manifest destination reads, so one row is a file-shaped sink and N
-  rows are a ladder, every row one rendition. A sink that still
+  rows are a ladder, every row one rendition. A data column (a data
+  stream, or the rows a module writes over a stream, `cue[]` or
+  `STRUCT(...)[]`) rides beside the rows as a track of its own, named
+  by the column's alias; a node at `TO` binds each one to the rows input
+  its rows fit (see node functions, below). A sink that still
   declares stream parameters (`video_stream[]`, `audio_stream`) reads
   the SELECT's streams into them as before. How many streams of
   each kind a module reads is its own declaration, and a call whose
@@ -697,6 +701,29 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     rows of a `.ndjson` destination, a WebVTT track anywhere else. A
     gather, `ARRAY(SELECT r FROM unnest(<call>) r WHERE ...)`, narrows
     them on their way, as it narrows a module's annotation column.
+  - A node at a COPY's `TO` takes the SELECT's columns by kind: a
+    picture on its video input, a sound on its audio input, and each
+    data column on one of its rows inputs. With one rows input, or none
+    declaring a schema, every data column binds the first. Otherwise a
+    column binds the input whose schema its rows satisfy: every field
+    the schema requires is there with a type it takes (`integer` is a
+    `number`), and no field both of them name is written as another
+    type. A field only one of them names passes, so an optional field
+    may go unwritten and the rows may carry more. Rows satisfying no
+    schema bind the first input declaring none, and so do rows of no
+    declared type, such as an input's own data track. Refused, naming
+    the column: rows satisfying the schemas of two inputs, rows
+    satisfying none where every rows input declares one, and a second
+    column for an input that reads one stream. The column's alias names
+    its track whichever input it binds. ffrwd/moq's `publish` declares
+    `data`, with no schema, and `text`, which takes cue rows (`text`,
+    `start_t` and `end_t`, with `final` and `voice` optional) and
+    publishes them as a WebVTT text track: `COPY (SELECT f.video[1],
+    ffrwd.parakeet.transcribe(f.audio[1]) AS captions, spot(f.video[1])
+    AS boxes FROM input('f.mp4') f) TO ffrwd.moq.publish(...)` binds the
+    utterances to `text`, published as `captions`, and the boxes to
+    `data`, published as `boxes`. A `cue[]` column binds `text` the
+    same way.
   - A node read in FROM binds its outputs as an input binds its streams,
     `s.video[1]` the first picture, and its relation rows as renditions,
     so `WHERE s.height = 720` picks one. `WHERE s.t < 10` (or `<=`) ends
