@@ -2388,7 +2388,8 @@ def _node_network_args(
         if node.bound:
             argv += [_BOUND_FLAG, f"{nodes[name].filter}={node.bound}"]
     told: dict[str, list[dict[str, object]]] = {
-        name: [pad.to_dict() for pad in pads] for name, pads in process.call_pads
+        name: [{} if pad is None else pad.to_dict() for pad in pads]
+        for name, pads in process.call_pads
     }
     for name, flags in process.call_codecs:
         said: dict[str, object] = {}

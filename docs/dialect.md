@@ -321,6 +321,15 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
   behind an encoder the compiler places, whatever feeds it, and the
   COPY's `WITH` options shape that encoder the way they shape a
   file's - a value read once per row shapes each stream separately.
+  The pictures and sounds one ffmpeg encodes or copies for a node sink
+  cross as one NUT, so the sink reads them on the clock they share, as
+  a file holding all of them carries it. Where they would leave more
+  than one process (a module makes one of them, they come from more than
+  one input, or the sink also reads a module's rows), one ffmpeg encodes
+  them all, reading each raw: a module's off its region, an input's off
+  the input, a live one's off its one reader. A stream copied rather than
+  encoded, and a picture its own region encodes, still reach the sink
+  from the process they leave.
   Each stream's rendition carries that stream's `bandwidth`: the
   bitrate its encoder is set to, none for an encoder set to a quality
   instead, and a copied stream's source figure on its row's picture, or

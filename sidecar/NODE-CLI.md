@@ -217,11 +217,22 @@ as when it rides alone:
 after `-filter_complex`, one per call of a packet sink or codec in the
 network, taken in turn as `-bound` is: a list with one object per pad of
 the call, each what `-pad` says of an `-i` (`row`, `rendition`, `color`,
-the one object of its pad's one stream), and `pix_fmt` for a codec's pad. A sink's pad reads a label rather than an
-`-i`, so this is where its row and rendition come from:
+the one object of its pad's one stream), and `pix_fmt` for a codec's pad. A sink's pad reads a label, or one stream of
+an `-i` carrying several, so this is where its row and rendition come from:
 
     -pads 'publish=[{"row": 0, "rendition": {"name": "1080p"}}]'
     -pads 'pyrowave=[{"pix_fmt": "yuv420p"}]'
+
+A node's pad whose object names no row has none, as an `-i` with no
+`-pad` row; an older packet sink's is its position among the call's pads.
+
+The compiler hands a node sink the pictures and sounds one ffmpeg writes
+for it in one `-i`: one muxer writes them, so they reach the sink on the
+clock they share, each moved later by the same amount where one of them
+opens below zero (an encoder's reordered pictures, its priming). A data
+stream keeps an `-i` of its own:
+
+    -pads 'publish=[{"row": 0, "rendition": {"name": "720p"}}, {"row": 0, "rendition": {"name": "720p"}}, {}]'
 
 The host's `filter` reads one picture stream by position and runs a graph
 in libavfilter's own syntax over it, on a D3D12 device (`AV-EDGE.md`):

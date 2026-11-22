@@ -1,6 +1,7 @@
 //! A picture clock and its sound, lockstep: every tick says how many
 //! samples it was handed and where they start, which at 29.97 under 48 kHz
-//! is 1,601 or 1,602.
+//! is 1,601 or 1,602. On `v` and `a` it hands the picture and the sound on
+//! as they came, one node writing both, as a compositor does.
 
 // Every shape module carries the same few helpers, and not every one uses
 // each of them.
@@ -13,11 +14,11 @@ wit_bindgen::generate!({
 
 use std::cell::RefCell;
 
-use exports::ffrwd::av::node::{Emission, Emitted, Guest, Payload};
+use exports::ffrwd::av::node::{Emission, Emitted, Guest, Payload, SameFrame};
 use ffrwd::av::node_tick::Tick;
 use ffrwd::av::node_types::{
-    Accepts, BoundStream, Clock, InputPort, Message, NodeShape, OutputFormat, OutputPort, Pairing,
-    PortKind, RowsUse,
+    Accepts, BoundStream, Clock, InputPort, LikeInput, Message, NodeShape, OutputFormat,
+    OutputPort, Pairing, PortKind, RowsUse,
 };
 use ffrwd::av::types::{Meta, Rational, Wants};
 use serde::Deserialize;
@@ -136,8 +137,37 @@ fn rate(num: i32) -> Rational {
 struct Params {}
 
 struct State {
+    v: u32,
     a: u32,
     sample: usize,
+    /// Whether `v` and `a` are read.
+    hand_on: (bool, bool),
+}
+
+/// An output carrying what input `port` carries.
+fn like(port: &str, kind: PortKind) -> OutputPort {
+    output(
+        port,
+        kind,
+        Some(OutputFormat::Like(LikeInput {
+            port: port.to_string(),
+            pixel_format: None,
+            sample_format: None,
+        })),
+    )
+}
+
+/// Frame `index` of stream `id` this tick, leaving on `port` as it came.
+fn same(port: &str, id: u32, frame: &ffrwd::av::node_types::Frame) -> Emission {
+    Emission {
+        port: port.to_string(),
+        payload: Payload::Same(SameFrame {
+            pts: frame.pts,
+            duration: frame.duration,
+            id,
+            index: frame.index,
+        }),
+    }
 }
 
 thread_local! {
@@ -161,20 +191,28 @@ impl Guest for Node {
         a.accepts.sample_formats = vec!["f32".to_string()];
         Ok(shape(
             vec![v, a],
-            vec![data("samples")],
+            vec![
+                data("samples"),
+                like("v", PortKind::Video),
+                like("a", PortKind::Audio),
+            ],
             Clock::Input("v".to_string()),
             true,
         ))
     }
 
-    fn init(bound: Vec<BoundStream>, _latched: Vec<String>, _params: String) -> Result<(), String> {
+    fn init(bound: Vec<BoundStream>, latched: Vec<String>, _params: String) -> Result<(), String> {
+        let v = bound.iter().find(|b| b.port == "v").ok_or("v is bound")?;
         let a = bound.iter().find(|b| b.port == "a").ok_or("a is bound")?;
         let Some(OutputFormat::Audio(format)) = &a.format else {
             return Err("a is audio".to_string());
         };
+        let read = |port: &str| latched.iter().any(|one| one == port);
         let state = State {
+            v: v.id,
             a: a.id,
             sample: 4 * format.channels as usize,
+            hand_on: (read("v"), read("a")),
         };
         STATE.with(|s| *s.borrow_mut() = Some(state));
         Ok(())
@@ -199,7 +237,14 @@ impl Guest for Node {
                 tick.pts(),
                 json!({"pts": tick.pts(), "samples": samples, "audio_pts": first, "last": tick.last()}),
             );
-            Ok(emitted(vec![item], false))
+            let mut items = vec![item];
+            if state.hand_on.0 {
+                items.extend(tick.frames(state.v).iter().map(|f| same("v", state.v, f)));
+            }
+            if state.hand_on.1 {
+                items.extend(frames.iter().map(|f| same("a", state.a, f)));
+            }
+            Ok(emitted(items, false))
         })
     }
 }

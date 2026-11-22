@@ -156,6 +156,7 @@ from .ir import (
     is_rows_document,
 )
 from .processes import (
+    CODED_CLOCK_OFFSET,
     PIPE_BUFFER_LIMIT,
     RAWVIDEO,
     DataFormat,
@@ -1166,9 +1167,13 @@ def keeps_clock(edge: StreamEdge, plan: ProcessPlan) -> bool:
     A node network's packets keep the clock its inputs had, and a node
     reading nothing writes its own, as a source module does. A region that
     decodes or encodes itself keeps the clock its inputs had, frames and
-    packets alike: its decoder reads the packets as they arrived.
+    packets alike: its decoder reads the packets as they arrived. Packets
+    an ffmpeg wrote with the coded clock's offset keep it too: nothing
+    shifted them, and the region reading them takes the offset off.
     """
     if isinstance(edge.format, DataFormat):
+        return True
+    if dict(getattr(edge.format, "options", ())).get("output_ts_offset") == CODED_CLOCK_OFFSET:
         return True
     producer = next((p for p in plan.processes if p.id == edge.source), None)
     if isinstance(producer, SidecarProcess) and producer.av:

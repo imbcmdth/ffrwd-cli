@@ -570,8 +570,8 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
   invert=../sidecar/modules/target/wasm32-wasip2/release/invert.wasm -filter_complex \
   '[0:v]decode=format=rgba[decode0];[decode0]invert[n1];'\
 '[n1]encode=codec=h264_nvenc:b=6M:color_range=tv:colorspace=bt709[out0]' -map '[out0]' \
-  -f nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
-  -c:0 copy -color_range:0 tv -colorspace:0 bt709 inverted.mp4
+  -f nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 \
+  -map 0:v:0 -c:0 copy -color_range:0 tv -colorspace:0 bt709 inverted.mp4
 ```
 
 `decode` and `encode` are the host's own nodes, like `leaky`: no module file stands behind them. The entry takes the copy only when the module reads a source's own stream, unfiltered, in a codec the sidecar's libavcodec decodes (h264, hevc, av1, vp9, mpeg2video, prores, mjpeg, ffv1, mpeg4); a filtered picture arrives raw, as before. The exit takes the copy only when the destination names an encoder the sidecar hosts (the `_nvenc`, `_amf`, `_mf`, `_videotoolbox`, `_vaapi` and `_d3d12va` families, and the software ffv1, mpeg4, mpeg2video and mjpeg), and the encoder's options move into the node under the names ffmpeg's command line uses (`b` for `video_bitrate`, `g` for `gop`). Name `libx264` instead and the entry is still copied while the exit stays raw, since that encoder is not in the LGPL build the sidecar carries. Raw frames exist only inside the region, so the raw pipes, and ffmpeg's rawvideo packing on both sides, are gone from the path. `sidecar/AV-EDGE.md` says where the libraries come from and what the sidecar refuses.
@@ -1580,8 +1580,8 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
 '[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
 '[n1]encode=codec=h264_nvenc:b=6M:color_range=tv:colorspace=bt709[out0]' -bound \
   'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
-  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
-  copy -color_range:0 tv -colorspace:0 bt709 boxed.mp4
+  pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 copy -color_range:0 tv -colorspace:0 bt709 boxed.mp4
 ```
 
 With `memory => 'host'` the same module holds nothing on the GPU, and its region takes raw frames on both pipes unless the declaration says `SET ffrwd.edges = 'coded'`. The region's `decode` is told `hw=auto`: where the machine's decoder and the device share one (D3D12 on Windows, Metal on macOS, Vulkan on Linux) the decoder's frames land on the device directly; elsewhere the decoded picture reaches it through the sidecar's own upload at the module's input and comes back through one download at the output, which the `upload` and `download` rows of `--profile` count.
@@ -1617,8 +1617,8 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
 '[n1]filter=graph=scale_d3d12\\=w\\=160\\:h\\=120:format=yuv420p[n2];'\
 '[n2]encode=codec=h264_d3d12va:b=2M[out0]' -bound \
   'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
-  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
-  copy small.mp4
+  pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 copy small.mp4
 ```
 
 The variants are what `ffrwd-wasm --av-info` lists under `filters`, and the node runs the D3D12 ones; `scale` with its width and height is the one mapped so far. `deinterlace_d3d12` is not: creating its video processor removes the device on NVIDIA's driver, ffmpeg's own command line included, so `yadif` and `bwdif` stay in ffmpeg. A filter with no variant, or a call naming an option the variant lacks (`scale`'s `flags`, say), stays in ffmpeg, and the picture leaves the region for it at that filter. Where the compiling machine's sidecar loads no libav at all, the command is written for a reader whose sidecar carries the bundled libavfilter, as recipe 156 is written for a reader's ffmpeg.
@@ -1939,8 +1939,8 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
   '[0:v]decode=format=rgba:hw=auto[decode0];'\
 '[v=decode0]gpu_box=memory=gpu:size=8[out=out0]' -bound \
   'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
-  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
-  libx264 -crf:0 20 boxed.mp4
+  pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 libx264 -crf:0 20 boxed.mp4
 ```
 
 The command is the same on every machine; what `hw=auto` opens is decided where it runs. VideoToolbox in the bundled libav decodes h264, hevc and prores. Another codec, or a picture smaller than VideoToolbox decodes (64x48 is refused, 96x64 is not), is decoded in software, stderr says so, and the reader uploads the picture.
@@ -1973,8 +1973,8 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
 '[v=decode0]gpu_box=memory=gpu:size=8[out=n1];'\
 '[n1]encode=codec=h264_videotoolbox:b=6M:color_range=tv:colorspace=bt709[out0]' -bound \
   'gpu_box=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f nut \
-  pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 -c:0 \
-  copy -color_range:0 tv -colorspace:0 bt709 boxed.mp4
+  pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
+  -c:0 copy -color_range:0 tv -colorspace:0 bt709 boxed.mp4
 ```
 
 With the frames in host memory, a module holding them there or no GPU at all, the same encoder reads NV12 converted by libswscale. `hevc_videotoolbox` is the HEVC one. A `decode` read only by such an encoder decodes onto the device too, so a region that only re-encodes copies nothing to host memory.
@@ -2027,8 +2027,8 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -map 0:v:0 -c:0 copy -avoid_negative_ts dis
   '[0:v]decode=format=rgba:hw=auto[decode0];[v=decode0]depth_gpu=memory=gpu[out=n1];'\
 '[n1]encode=codec=h264_videotoolbox:b=4M:color_range=tv:colorspace=bt709[out0]' -bound \
   'depth_gpu=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]}]' -map '[out0]' -f \
-  nut pipe:1 | ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map 0:v:0 \
-  -c:0 copy -color_range:0 tv -colorspace:0 bt709 depth.mp4
+  nut pipe:1 | ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i pipe:0 -map \
+  0:v:0 -c:0 copy -color_range:0 tv -colorspace:0 bt709 depth.mp4
 ```
 
 `ffrwd run` asks for the GPU (`-nn-target gpu`), which on macOS is CoreML. Its session is built at the first frame with the model's free dimensions fixed to that frame's tensor, since CoreML runs a graph with free dimensions mostly on the CPU, and the compiled model is cached, so only the first run pays for the compile. `sidecar/NN-EDGE.md`, "CoreML", has the rules and what they cost.
@@ -2065,7 +2065,7 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 # named pipes: ffmpeg0 reads ffmpeg1, sidecar0
-1. ffmpeg: ffmpeg -f nut -analyzeduration 0 -fpsprobesize 3 -i \
+1. ffmpeg: ffmpeg -copyts -f nut -analyzeduration 0 -fpsprobesize 3 -i \
   '<named pipe ffmpeg1-ffmpeg0 n5 read>' -f nut -analyzeduration 0 -fpsprobesize 3 -i \
   '<named pipe sidecar0-ffmpeg0 n4 read>' -map 1:v:0 -map 0:v:0 -c:0 libx264 -c:1 \
   libx264 both.mkv

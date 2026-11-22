@@ -751,6 +751,47 @@ fn a_sink_of_many_pictures_takes_every_frame_of_each() {
 }
 
 #[test]
+fn a_sinks_pad_the_call_names_no_row_for_has_none() {
+    let dir = scratch("sink-rows");
+    let mut inputs = Vec::new();
+    for index in 0..2 {
+        let items: Vec<(usize, Write)> = (0..2)
+            .map(|k| (0, Write::Frame(k, vec![0u8; 16])))
+            .collect();
+        let path = dir.join(format!("{index}.nut"));
+        write_nut(&path, &[video(2, 2, TENTHS, (10, 1))], &items);
+        inputs.push(path.display().to_string());
+    }
+    let out = at_every_jobs(
+        "sink-rows",
+        &args(&[
+            "-f",
+            "nut",
+            "-i",
+            &inputs[0],
+            "-f",
+            "nut",
+            "-i",
+            &inputs[1],
+            "-m",
+            &module("shape_sink"),
+            "-filter_complex",
+            "[v=0:v][v=1:v]shape_sink[@rows=r]",
+            "-pads",
+            r#"shape_sink=[{"row": 3}, {}]"#,
+            "-map",
+            "[r]",
+            "-f",
+            "ndjson",
+            "{dir}/rows.ndjson",
+        ]),
+        &["rows.ndjson"],
+    );
+    let rows: Vec<serde_json::Value> = lines(&out[0]).iter().map(|r| r["row"].clone()).collect();
+    assert_eq!(rows, vec![serde_json::json!(3), serde_json::Value::Null]);
+}
+
+#[test]
 fn a_rate_clock_that_only_needs_turns_ends_with_its_inputs() {
     use std::io::Write as _;
     use std::process::Stdio;

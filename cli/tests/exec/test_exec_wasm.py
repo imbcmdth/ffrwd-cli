@@ -26,6 +26,7 @@ import json
 import os
 import shutil
 import subprocess
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -994,6 +995,142 @@ def test_a_packet_sink_reads_the_encoders_output_and_its_rows_arrive(
     assert len(rows) - 1 == summary["gops"]
     assert all(row["gop"] == index for index, row in enumerate(rows[:-1]))
     assert sum(row["packets"] for row in rows[:-1]) == 10
+
+
+# -- a node sink's coded picture and sound, on one clock ---------------------
+
+_SHAPE_SINK = _built(_SIDECAR_MODULES, "shape_sink")
+_SHAPE_RECUT = _built(_SIDECAR_MODULES, "shape_recut")
+_HEAR = _built(_SIDECAR_MODULES, "hear")
+_CODED = "WITH (video_codec 'libx264', video_bitrate '3M', audio_codec 'aac', gop 60)"
+
+
+def _sink_clip(tmp_path: Path) -> Path:
+    """One second of 30 fps picture and 48 kHz sound, neither coded."""
+    for module in (_SHAPE_SINK, _SHAPE_RECUT, _HEAR):
+        if not module.exists():
+            pytest.skip(
+                f"module missing: {module} (cargo build --target wasm32-wasip2 "
+                f"--release, from {_SIDECAR_MODULES})"
+            )
+    clip = tmp_path / "clip.mkv"
+    made = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=30:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+            "-c:v", "ffv1", "-c:a", "pcm_s16le", str(clip),
+        ],
+        capture_output=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+        check=False,
+    )
+    assert made.returncode == 0, made.stderr.decode("utf-8", "replace")
+    return clip
+
+
+def _assert_one_muxers_clock(sql: str, capfd: pytest.CaptureFixture[str]) -> None:
+    """Run `sql` into `shape_sink` and check each port's first pts is where
+    one muxer writing both streams puts it.
+
+    x264 presents its first picture at the source's start and decodes it two
+    pictures (3 B-frames, pyramid) before that; AAC's first packet starts its
+    1024 samples of priming before the start. NUT stores no time below zero,
+    so one muxer moves both streams later by the two pictures, and the sound
+    opens 1024 samples ahead of the picture, both at or past zero. A muxer per
+    stream would move each by its own, and the two would open together.
+    """
+    declared = (
+        "CREATE FUNCTION sink(packets boolean DEFAULT true) RETURNS sink\n"
+        f"  AS '{_SHAPE_SINK.as_posix()}', 'shape_sink' LANGUAGE wasm;\n"
+    )
+    _run_plan(declared + sql)
+    rows = [
+        row
+        for row in map(json.loads, filter(str.strip, capfd.readouterr().out.splitlines()))
+        if row["port"] != "data"
+    ]
+    first = {
+        row["port"]: Fraction(row["first"]) * Fraction(row["num"], row["den"]) for row in rows
+    }
+    assert {row["port"]: row["row"] for row in rows} == {"video": 0, "audio": 0}
+    assert first["video"] == Fraction(2, 30)
+    assert first["video"] - first["audio"] == Fraction(1024, 48000)
+
+
+def test_a_node_sink_takes_the_picture_and_sound_on_the_clock_one_muxer_gives(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """A paced file encoded by x264 and AAC into a node sink, as a publisher
+    takes it: one ffmpeg encodes both, and one muxer writes them."""
+    clip = _sink_clip(tmp_path)
+    _assert_one_muxers_clock(
+        "COPY (SELECT s.video[1], s.audio[1]\n"
+        f"  FROM input('{clip.as_posix()}', realtime => true) s) TO sink() {_CODED}",
+        capfd,
+    )
+
+
+def test_a_module_ahead_of_a_node_sinks_picture_leaves_one_ffmpeg_encoding_both(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The picture through `invert` and the sound straight off the paced
+    input: the ffmpeg encoding the module's picture encodes the sound too,
+    read raw off the input's one reader."""
+    clip = _sink_clip(tmp_path)
+    _assert_one_muxers_clock(
+        "CREATE FUNCTION invert(v video_stream) RETURNS video_stream\n"
+        f"  AS '{_MODULE.as_posix()}', 'invert' LANGUAGE wasm;\n"
+        "COPY (SELECT invert(s.video[1]), s.audio[1]\n"
+        f"  FROM input('{clip.as_posix()}', realtime => true) s) TO sink() {_CODED}",
+        capfd,
+    )
+
+
+def test_a_node_sink_reading_a_live_input_and_a_file_hears_them_on_one_clock(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """The picture off a paced input and the sound off a file opened apart:
+    one ffmpeg encodes both, each read raw where it is."""
+    clip = _sink_clip(tmp_path)
+    _assert_one_muxers_clock(
+        "COPY (SELECT a.video[1], b.audio[1]\n"
+        f"  FROM input('{clip.as_posix()}', realtime => true) a,\n"
+        f"       input('{clip.as_posix()}') b) TO sink() {_CODED}",
+        capfd,
+    )
+
+
+def test_a_node_sink_reading_a_modules_rows_beside_its_picture_and_sound_has_one_encoder(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """`hear`'s cues reach the sink from its region, and the picture and the
+    sound it hears still reach it from one ffmpeg encoding both."""
+    clip = _sink_clip(tmp_path)
+    _assert_one_muxers_clock(
+        "CREATE FUNCTION hear(a audio_stream) RETURNS cue[]\n"
+        f"  AS '{_HEAR.as_posix()}', 'hear' LANGUAGE wasm;\n"
+        "COPY (SELECT s.video[1], s.audio[1], hear(s.audio[1]) AS cues\n"
+        f"  FROM input('{clip.as_posix()}', realtime => true) s) TO sink() {_CODED}",
+        capfd,
+    )
+
+
+def test_a_node_writing_a_picture_and_a_sound_into_a_node_sink_has_one_encoder(
+    tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """One node hands on a picture and a sound, as a compositor does, and one
+    ffmpeg encodes the two off the region's one NUT."""
+    clip = _sink_clip(tmp_path)
+    _assert_one_muxers_clock(
+        "CREATE FUNCTION recut(v video_stream, a audio_stream)\n"
+        "  RETURNS STRUCT(v video_stream, a audio_stream)\n"
+        f"  AS '{_SHAPE_RECUT.as_posix()}', 'shape_recut' LANGUAGE wasm;\n"
+        "COPY (WITH m AS (SELECT (recut(s.video[1], s.audio[1])).*\n"
+        f"  FROM input('{clip.as_posix()}', realtime => true) s)\n"
+        f"  SELECT m.v, m.a FROM m) TO sink() {_CODED}",
+        capfd,
+    )
 
 
 # --- a live-paced source, read once ------------------------------------------

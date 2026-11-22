@@ -27,7 +27,7 @@ from ffrwd.execute import plan_argv
 from ffrwd.ir import Graph
 from ffrwd.lower import lower
 from ffrwd.parser import parse, resolve
-from ffrwd.probe import ProbeResult, StreamMeta
+from ffrwd.probe import JSON_CODEC, ProbeResult, StreamMeta
 from ffrwd.processes import (
     CutAtModules,
     CutCoding,
@@ -1469,13 +1469,239 @@ def test_a_node_at_a_copys_to_reads_the_select_as_a_packet_sink_did(
         describe=_reporting("publish.wasm"),
     )
     sidecar = argv["sidecar0"]
-    assert sidecar.count("-i") == 2 and sidecar.count("-pad") == 2
+    assert sidecar.count("-i") == 1 and "-pad" not in sidecar
     network = sidecar[sidecar.index("-filter_complex") + 1]
-    assert network.startswith("[video=0:v][audio=")
-    assert network.endswith("]publish=relay=https\\\\://relay:broadcast=b[@rows=out0]")
+    assert network == (
+        "[video=0:v][audio=0:a]publish=relay=https\\\\://relay:broadcast=b[@rows=out0]"
+    )
+    rows = json.loads(sidecar[sidecar.index("-pads") + 1].removeprefix("publish="))
+    assert [pad["row"] for pad in rows] == [0, 0]
     assert sidecar[-5:] == ["-map", "[out0]", "-f", "ndjson", "pipe:1"]
     (encoder,) = [words for pid, words in argv.items() if pid.startswith("ffmpeg")]
     assert encoder[encoder.index("-c:0") + 1] == "libx264"
+    assert encoder[encoder.index("-c:1") + 1] == "aac"
+    assert encoder.count("-f") == 1, "one muxer writes both, so they share its clock"
+
+
+def test_a_node_sinks_data_beside_its_picture_and_sound_keeps_a_pipe_and_no_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The picture and sound one ffmpeg writes ride one NUT and its data
+    stream a pipe of its own; the call says the two rows and nothing of the
+    data's, which has none."""
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    data = StreamMeta(
+        type="data", index=0, metadata={}, width=None, height=None, fps=None,
+        sample_rate=None, codec=JSON_CODEC,
+    )
+    probe = ProbeResult(streams=[*_probes()["f"].streams, data])
+    monkeypatch.setattr("ffrwd.compiler.probe_path", lambda path, args=(), **kw: probe)
+    compiled = compile_all(
+        _declared(
+            _PUBLISH + "COPY (SELECT f.video[1], f.audio[1], f.data[1] FROM input('f.mp4') f) "
+            "TO publish('https://relay', 'b') WITH (video_codec 'libx264', audio_codec 'aac')"
+        ),
+        describe=_reporting("publish.wasm"),
+        shape=_Asked(),
+    )
+    assert compiled.plan is not None
+    into = [edge for edge in compiled.plan.stream_edges if edge.target == "sidecar0"]
+    assert {edge.ref: bool(edge.nut) for edge in into} == {
+        "src:f:v:0": True, "src:f:a:0": True, "src:f:d:0": False,
+    }
+    sidecar = _shown(compiled.plan)["sidecar0"]
+    assert sidecar.count("-i") == 2 and "-pad" not in sidecar
+    told = json.loads(sidecar[sidecar.index("-pads") + 1].removeprefix("publish="))
+    assert [pad.get("row") for pad in told] == [0, 0, None]
+
+
+def _encoders(plan: ProcessPlan) -> dict[str, set[str]]:
+    """The codecs each process encodes onto a pipe, by process."""
+    found: dict[str, set[str]] = {}
+    for edge in plan.stream_edges:
+        codec = getattr(edge.format, "codec", "")
+        if codec in ("libx264", "aac"):
+            found.setdefault(edge.source, set()).add(codec)
+    return found
+
+
+def test_a_module_ahead_of_a_node_sinks_picture_leaves_one_encoder_and_one_live_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """burn's picture and the live input's sound reach publish from the one
+    ffmpeg encoding both, which takes the sound raw off the input's one
+    reader and holds it while x264 holds the picture."""
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    plan = _plan(
+        _PUBLISH + "COPY (SELECT burn(f.video[1]), f.audio[1] "
+        "FROM input('f.mp4', realtime => true) f) TO publish('https://relay', 'b') "
+        "WITH (video_codec 'libx264', audio_codec 'aac')",
+        monkeypatch,
+        describe=_reporting("publish.wasm"),
+    )
+    encoders = _encoders(plan)
+    assert list(encoders.values()) == [{"libx264", "aac"}], "one ffmpeg encodes both"
+    (encoder,) = encoders
+    assert [p.id for p in plan.ffmpeg if "f.mp4" in p.graph.input_paths] == ["ffmpeg0"]
+    (sound,) = [e for e in plan.stream_edges if e.target == encoder and e.ref == "src:f:a:0"]
+    assert (sound.source, sound.format.codec) == ("ffmpeg0", "pcm_f32le")
+    assert sound.bound > 40, "the sound waits on its pipe while x264 fills its lookahead"
+
+
+def _av(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    """A node writing a picture and a sound, as a compositor does."""
+    picture = _output("v", "video")
+    picture["format"] = {"kind": "like", "port": "v"}
+    sound = _output("a", "audio")
+    sound["format"] = {"kind": "like", "port": "a"}
+    return _shape(
+        [_clock("v"), _input("a", "audio", {"kind": "lockstep"}, required=True)],
+        [picture, sound],
+        {"kind": "input", "port": "v"},
+    )
+
+
+def test_a_nodes_picture_and_sound_into_a_node_sink_have_one_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(SHAPES, "av.wasm", _av)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    plan = _plan(
+        _PUBLISH + "CREATE FUNCTION av(v video_stream, a audio_stream) "
+        "RETURNS STRUCT(v video_stream, a audio_stream) AS 'av.wasm', 'av' LANGUAGE wasm;\n"
+        "COPY (WITH m AS (SELECT (av(f.video[1], f.audio[1])).* FROM input('f.mp4') f) "
+        "SELECT m.v, m.a FROM m) TO publish('https://relay', 'b') "
+        "WITH (video_codec 'libx264', audio_codec 'aac')",
+        monkeypatch,
+        describe=_reporting("publish.wasm"),
+    )
+    encoders = _encoders(plan)
+    assert list(encoders.values()) == [{"libx264", "aac"}], "one ffmpeg encodes both"
+    (encoder,) = encoders
+    into = {(e.source, e.nut) for e in plan.stream_edges if e.target == encoder}
+    assert into == {("sidecar0", "sidecar0>ffmpeg1")}, "the region hands both over in one NUT"
+
+
+def _published(query: str, monkeypatch: pytest.MonkeyPatch) -> ProcessPlan:
+    """`query` into publish's stand-in, av's shape on hand."""
+    monkeypatch.setitem(SHAPES, "publish.wasm", _publish)
+    monkeypatch.setitem(SHAPES, "av.wasm", _av)
+    monkeypatch.setitem(
+        _PARAMS, "publish.wasm", {"relay": {"type": "string"}, "broadcast": {"type": "string"}}
+    )
+    return _plan(_PUBLISH + query, monkeypatch, describe=_reporting("publish.wasm"))
+
+
+_TO_PUBLISH = (
+    "TO publish('https://relay', 'b') WITH (video_codec 'libx264', audio_codec 'aac')"
+)
+_AV = (
+    "CREATE FUNCTION av(v video_stream, a audio_stream) "
+    "RETURNS STRUCT(v video_stream, a audio_stream) AS 'av.wasm', 'av' LANGUAGE wasm;\n"
+)
+
+
+def test_a_node_sink_reading_a_live_input_and_a_file_straight_has_one_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each input is opened once, the live one by its one reader, and the
+    encoder reads both off pipes rather than standing in as a reader."""
+    plan = _published(
+        "COPY (SELECT a.video[1], b.audio[1] "
+        f"FROM input('a', realtime => true) a, input('b') b) {_TO_PUBLISH}",
+        monkeypatch,
+    )
+    encoders = _encoders(plan)
+    assert list(encoders.values()) == [{"libx264", "aac"}], "one ffmpeg encodes both"
+    (encoder,) = encoders
+    for path in ("a", "b"):
+        (reader,) = [p.id for p in plan.ffmpeg if path in p.graph.input_paths]
+        assert any((e.source, e.target) == (reader, encoder) for e in plan.stream_edges)
+
+
+def test_a_nodes_ladder_through_ffmpeg_filters_into_a_node_sink_has_one_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two rungs scaled from av's picture and its sound twice: the legs read
+    different pads of one region, so no one producer takes them all, and one
+    ffmpeg encodes all four."""
+    plan = _published(
+        _AV + "COPY (WITH m AS (SELECT (av(f.video[1], f.audio[1])).* FROM input('f.mp4') f) "
+        "SELECT scale(m.v, ARRAY[640, 320][i.i], -2) AS v, m.a AS a "
+        "FROM m, generate_series(1, 2) i) TO publish('https://relay', 'b') "
+        "WITH (video_codec 'libx264', video_bitrate ARRAY['3M', '1M'][i.i], audio_codec 'aac')",
+        monkeypatch,
+    )
+    encoders = _encoders(plan)
+    assert list(encoders.values()) == [{"libx264", "aac"}], "one ffmpeg encodes all four"
+    (encoder,) = encoders
+    assert len([e for e in plan.stream_edges if e.source == encoder]) == 4
+
+
+@pytest.mark.parametrize("live", [False, True], ids=["file", "live"])
+def test_a_node_sinks_picture_and_sound_beside_a_modules_rows_have_one_encoder(
+    monkeypatch: pytest.MonkeyPatch, live: bool
+) -> None:
+    """hear's cues put the sink a sidecar hop from the input, and the picture
+    and sound it reads straight still leave one ffmpeg, on one NUT in and
+    one out."""
+    opened = "input('f.mp4', realtime => true)" if live else "input('f.mp4')"
+    plan = _published(
+        f"COPY (SELECT f.video[1], f.audio[1], hear(f.audio[1]) AS cues FROM {opened} f) "
+        + _TO_PUBLISH,
+        monkeypatch,
+    )
+    encoders = _encoders(plan)
+    assert list(encoders.values()) == [{"libx264", "aac"}], "one ffmpeg encodes both"
+    (encoder,) = encoders
+    into = {e.nut for e in plan.stream_edges if e.target == encoder}
+    assert len(into) == 1 and "" not in into
+    if live:
+        assert [p.id for p in plan.ffmpeg if "f.mp4" in p.graph.input_paths] == ["ffmpeg0"]
+
+
+def test_the_one_encoder_keeps_the_clock_a_decoding_region_hands_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """box decodes the input's copied packets on the device and hands its
+    pictures on raw, on the input's own clock: the encoder reading them
+    beside the sound keeps both as they come."""
+    plan = _published(
+        f"COPY (SELECT box(f.video[1]), f.audio[1] FROM input('f.mp4') f) {_TO_PUBLISH}",
+        monkeypatch,
+    )
+    encoders = _encoders(plan)
+    assert list(encoders.values()) == [{"libx264", "aac"}], "one ffmpeg encodes both"
+    (encoder,) = encoders
+    assert _shown(plan)[encoder][:2] == ["ffmpeg", "-copyts"]
+
+
+def test_a_region_decoding_its_input_writes_its_tcp_destination_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """box decodes the input's packets, taking the copying ffmpeg's offset
+    off, so its pictures are on the input's own clock: no ffmpeg stands
+    between the region and the URL to copy its NUT."""
+    url = "tcp://127.0.0.1:9000"
+    plan = _plan(
+        f"COPY (SELECT box(f.video[1]) FROM input('f.mp4') f) TO '{url}' WITH (format 'nut')",
+        monkeypatch,
+    )
+    assert len(plan.ffmpeg) == 1, "no ffmpeg copies the region's NUT"
+    feeder = plan.ffmpeg[0].id
+    assert [(e.source, e.target) for e in plan.stream_edges] == [(feeder, "sidecar0")]
+    sidecar = _shown(plan)["sidecar0"]
+    assert json.loads(sidecar[sidecar.index("-pad") + 1])["offset"] == 1001
+    assert sidecar[-3:] == ["-f", "nut", url]
 
 
 _SUB = "CREATE FUNCTION sub(relay text) RETURNS source AS 'sub.wasm', 'sub' LANGUAGE wasm;\n"
@@ -1729,7 +1955,7 @@ def test_a_nodes_picture_into_a_node_sink_is_encoded_and_its_data_is_not_copied(
     ]
     assert "-copyts" in encoder
     sink = next(words for words in argv.values() if "publish=publish.wasm" in words)
-    assert sink.count("-i") == 2 and sink.count("-pad") == 2
+    assert sink.count("-i") == 2 and "-pad" not in sink and sink.count("-pads") == 1
     copies = [
         words for pid, words in argv.items()
         if pid.startswith("ffmpeg") and "-map" in words

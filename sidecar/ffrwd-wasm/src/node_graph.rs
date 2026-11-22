@@ -701,13 +701,19 @@ fn open(
                 mirrors.entry(id).or_default().push(mirror);
                 id = mirror;
             }
-            // A packet sink's pad reads a label, which no -pad names: -pads
-            // gives its row and rendition, on a copy of the stream of its own.
+            // A packet sink's pad reads a label, or one stream of an -i
+            // carrying several, which no -pad names: -pads gives its row and
+            // rendition, on a copy of the stream of its own. A node's pad it
+            // names no row for has none, as an -i with no -pad row has.
             let sink = matches!(kind, Kind::Module { .. } | Kind::PacketSink { .. });
             if let Some(spec) = told.filter(|_| sink).and_then(|list| list.get(position)) {
                 let mirror = streams.len() as u32;
                 let mut def = streams[id as usize].clone();
-                def.row = Some(spec.row.unwrap_or(position as u32));
+                def.row = if matches!(kind, Kind::Module { .. }) {
+                    spec.row
+                } else {
+                    Some(spec.row.unwrap_or(position as u32))
+                };
                 def.rendition = spec.rendition.clone().into();
                 let def = coloured(def, spec.color.first().and_then(Option::as_ref))?;
                 streams.push(def);

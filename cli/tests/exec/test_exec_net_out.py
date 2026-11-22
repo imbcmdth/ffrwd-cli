@@ -19,8 +19,9 @@ from pathlib import Path
 
 import pytest
 
-from ffrwd import binaries, cli
+from ffrwd import av, binaries, cli, wasm
 from ffrwd.compiler import compile_all
+from ffrwd.execute import execute_plan
 
 pytestmark = pytest.mark.exec
 
@@ -171,3 +172,73 @@ def test_a_udp_destination_takes_the_sources_packets_in_datagrams_of_pkt_size(
     (stream,) = _streams(received)
     assert (stream["codec_name"], stream["height"]) == ("h264", _REPLAY_HEIGHT)
     assert int(str(stream["nb_read_frames"])) == _REPLAY_PACKETS
+
+
+_GPU_BOX = _RELEASE / "gpu_box.wasm"
+
+
+def _gpu_box_query(destination: str) -> str:
+    return (
+        "CREATE FUNCTION gpu_box(v video_stream, memory text DEFAULT 'gpu',\n"
+        "                        size number DEFAULT 8) RETURNS video_stream\n"
+        f"  AS '{_GPU_BOX.as_posix()}', 'gpu_box' LANGUAGE wasm;\n"
+        f"COPY (SELECT gpu_box(f.video[1]) FROM input('{_SOURCE.as_posix()}') f)\n"
+        f"TO '{destination}' WITH (format 'nut')"
+    )
+
+
+def _run_or_skip(query: str) -> None:
+    """Run `query`, skipping where this machine has no GPU adapter."""
+    plan = compile_all(query).plan
+    assert plan is not None
+    result = execute_plan(plan, sidecar_argv=wasm.sidecar_argv, overwrite=True, timeout=_TIMEOUT)
+    told = "\n".join(
+        f"{member.id} exited {member.exit_code}: {member.stderr_tail}"
+        for stage in result.stages
+        for member in stage.members
+    )
+    if result.exit_code != 0 and "no GPU" in told:
+        pytest.skip("this machine has no GPU adapter")
+    assert result.exit_code == 0, told
+
+
+def test_a_region_decoding_on_the_gpu_writes_its_tcp_destination_itself(
+    tmp_path: Path,
+) -> None:
+    """gpu_box decodes the input's packets on the device, so its pictures are
+    on the input's own clock and the region writes the URL itself: what
+    arrives is frame for frame, times included, a NUT file of the same
+    query, and opens at the input's first picture."""
+    if not _GPU_BOX.exists():
+        pytest.skip(f"module missing: {_GPU_BOX}")
+    if av.sidecar_filters() is None:
+        pytest.skip("the sidecar loads no libav on this machine, so no region decodes")
+    listener = socket.create_server(("127.0.0.1", 0))
+    url = f"tcp://127.0.0.1:{listener.getsockname()[1]}"
+    received = tmp_path / "received.nut"
+
+    def take() -> None:
+        connection, _ = listener.accept()
+        with connection, received.open("wb") as out:
+            while chunk := connection.recv(1 << 16):
+                out.write(chunk)
+
+    plan = compile_all(_gpu_box_query(url)).plan
+    assert plan is not None
+    assert not any(e.source == plan.sidecars[0].id for e in plan.stream_edges)
+    taker = threading.Thread(target=take)
+    taker.start()
+    try:
+        _run_or_skip(_gpu_box_query(url))
+    finally:
+        taker.join(_TIMEOUT)
+        listener.close()
+
+    (stream,) = _streams(received)
+    assert (stream["codec_type"], stream["codec_name"]) == ("video", "rawvideo")
+    assert int(str(stream["nb_read_frames"])) == int(str(_streams(_SOURCE)[0]["nb_read_frames"]))
+    written = tmp_path / "written.nut"
+    _run_or_skip(_gpu_box_query(written.as_posix()))
+    hashes = _frame_hashes(received)
+    assert hashes == _frame_hashes(written)
+    assert hashes[0].split(",")[2].strip() == "0", "the first picture is at the input's start"

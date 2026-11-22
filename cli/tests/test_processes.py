@@ -2159,6 +2159,14 @@ def test_a_row_reading_sinks_pads_carry_their_row_and_rendition() -> None:
     )
 
 
+def test_an_older_worlds_packet_sink_is_one_after_its_plan_round_trips() -> None:
+    """A plan read back from its JSON still knows the region is a packet
+    sink, which is what lets it read several pads."""
+    plan = partition(_row_reading_packet_sink_graph(), external=external_ids("e0"))
+    back = ProcessPlan.from_dict(json.loads(json.dumps(plan.to_dict())))
+    assert [s.packet_sink for s in back.sidecars] == [True]
+
+
 def test_a_row_reading_sinks_argv_shows_pad_after_every_input() -> None:
     """`wasm._argv` (via `wasm.shown_argv`) renders one `-pad '<json>'` right
     after each pad's own `-i`, the row-reading sink's pads reaching the
@@ -2834,8 +2842,9 @@ def test_a_coded_region_copies_its_input_in_and_its_file_out() -> None:
     assert written[written.index("-c:0") + 1] == COPY_CODEC
     assert written[written.index("-c:1") + 1] == "aac"
     assert "-b:0" not in written and "-g:0" not in written
-    # The packets left the input with the clock ffmpeg shifted them by.
-    assert not keeps_clock(leaving, plan)
+    # The input's packets crossed with the coded clock's offset, which the
+    # region took off: what it writes is on the input's own clock.
+    assert keeps_clock(entry, plan) and keeps_clock(leaving, plan)
     assert SidecarProcess.from_dict(region.to_dict()) == region
 
 

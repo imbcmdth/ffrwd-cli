@@ -1315,10 +1315,12 @@ class SidecarProcess:
     impure module's calls run one at a time in order, and a pure one spreads
     across the worker pool, whatever this plan says.
 
-    `pads` is per-input rendition metadata for a packet SINK's several
-    ``-i`` reads, one entry per read in the same order, `None` where a pad
-    carries none. Empty is the ordinary case -- no ``-pad`` flag anywhere,
-    the same argv a 0.12 sink or a single-pad sink already renders.
+    `pads` is per-input rendition metadata for the several ``-i`` reads of
+    an older world's packet SINK or FILTER, one entry per read in the same
+    order, `None` where a pad carries none. Empty is the ordinary case -- no
+    ``-pad`` flag anywhere, the same argv a 0.12 sink or a single-pad sink
+    already renders. A node sink is told its pads on its call instead
+    (`call_pads`).
     """
 
     id: str
@@ -1408,10 +1410,10 @@ class SidecarProcess:
     # True for a region holding a `decode` or `encode` node: the sidecar
     # loads libavcodec, and is told where it is.
     av: bool = False
-    # The pad metadata of each packet sink a node network holds beside the
-    # nodes writing its stream, by the sink's node: its pads read labels of
-    # the network, which no ``-pad`` names.
-    call_pads: tuple[tuple[str, tuple[PadMeta, ...]], ...] = ()
+    # The pad metadata of each packet sink a node network holds, by the
+    # sink's node: its pads read labels of the network, or streams riding one
+    # NUT, which no ``-pad`` names. None for a node's pad with no row.
+    call_pads: tuple[tuple[str, tuple[PadMeta | None, ...]], ...] = ()
     # What each codec package's encoder or decoder a node network holds is
     # told of its stream, by its node: its colorimetry in the flags' names,
     # and the pixel format its pictures are made in (`pix_fmt`).
@@ -1481,6 +1483,8 @@ class SidecarProcess:
             written["rows"] = [document.to_dict() for document in self.rows]
         if self.sink:
             written["sink"] = True
+        if self.packet_sink:
+            written["packet_sink"] = True
         if self.packet_filter:
             written["packet_filter"] = True
         if self.rows_in:
@@ -1523,7 +1527,8 @@ class SidecarProcess:
             written["av"] = True
         if self.call_pads:
             written["call_pads"] = {
-                name: [pad.to_dict() for pad in pads] for name, pads in self.call_pads
+                name: [None if pad is None else pad.to_dict() for pad in pads]
+                for name, pads in self.call_pads
             }
         if self.call_codecs:
             written["call_codecs"] = {name: dict(color) for name, color in self.call_codecs}
@@ -1607,7 +1612,13 @@ class SidecarProcess:
             ),
             av=d.get("av") is True,
             call_pads=tuple(
-                (str(name), tuple(PadMeta.from_dict(pad) for pad in pads if isinstance(pad, dict)))
+                (
+                    str(name),
+                    tuple(
+                        PadMeta.from_dict(pad) if isinstance(pad, dict) else None
+                        for pad in pads
+                    ),
+                )
                 for name, pads in _read_object(d, "call_pads").items()
                 if isinstance(pads, list)
             ),
@@ -2520,6 +2531,9 @@ class _Partitioner:
         self.decoded_on_device: set[str] = set()
         # The packet sinks that run in the region writing their stream.
         self.joined_sinks: set[str] = set()
+        # The one ffmpeg encoding everything a node sink reads coded, by the
+        # sink's process, where that is several processes' streams.
+        self.sink_encoders: dict[str, _Pending] = {}
         # The codec packages' encoders and decoders that run in a region.
         self.joined_codecs: set[str] = set()
         # The setparams lowering put behind each decoder, by the decoder.
@@ -2933,6 +2947,8 @@ class _Partitioner:
         for process in self.pending:
             if self.consumer_of.get(process.id) != target or process.depth != depth:
                 continue
+            if self._encodes_for_a_node_sink(process):
+                continue
             if self._feeder_reads(process.nodes, process.pipes) == leg:
                 return process
         return None
@@ -2996,7 +3012,7 @@ class _Partitioner:
         for process in self.pending:
             if process.id == target or process.depth != depth:
                 continue
-            if process.id in self.feeding.values():
+            if process.id in self.feeding.values() or self._encodes_for_a_node_sink(process):
                 continue
             if self._feeder_reads(process.nodes, process.pipes)[1] == wanted:
                 return process
@@ -3103,6 +3119,8 @@ class _Partitioner:
         for process in self.pending:
             if process.depth != depth or process.id in self.feeding.values():
                 continue
+            if self._encodes_for_a_node_sink(process):
+                continue
             theirs, others = self._feeder_reads(process.nodes, process.pipes)
             if others or not theirs & wanted:
                 continue
@@ -3113,9 +3131,12 @@ class _Partitioner:
         """The input aliases `process` opens itself, and the refs it reads off each.
 
         Only video, audio and data: a subtitle track never travels a pipe,
-        so it is not something a reader could hand over.
+        so it is not something a reader could hand over. A node sink's one
+        encoder opens nothing: every stream it encodes arrives on a pipe.
         """
         found: dict[str, list[FrameRef]] = {}
+        if self._encodes_for_a_node_sink(process):
+            return found
         refs: list[FrameRef] = [ref for name in process.nodes
                                 for ref in self.g.nodes[name].inputs]
         for unit in process.sinks:
@@ -3131,6 +3152,8 @@ class _Partitioner:
 
     def _reads(self, process: _Pending, alias: str) -> list[FrameRef]:
         """Every stream of `alias` this process opens itself, of any type."""
+        if self._encodes_for_a_node_sink(process):
+            return []
         refs: list[FrameRef] = [ref for name in process.nodes
                                 for ref in self.g.nodes[name].inputs]
         for unit in process.sinks:
@@ -4202,6 +4225,20 @@ class _Partitioner:
                         meta.height if meta is not None else None,
                     ),
                 )
+        # A picture encoded onto a pipe, for a sink, holds the same.
+        for edge in self.edges:
+            wire = edge.format
+            if edge.source != pid or not isinstance(wire, VideoFormat):
+                continue
+            if not _encodes(wire) or not carries(edge.ref):
+                continue
+            meta = self._origin_meta(edge.ref)
+            held = max(
+                held,
+                encoder_delay(
+                    wire.codec, dict(wire.options), meta.height if meta is not None else None
+                ),
+            )
         return held
 
     def _bound_edges(self) -> None:
@@ -4926,7 +4963,7 @@ class _Partitioner:
                     or name in self.cut_coding
                     for name in members
                 ),
-                call_pads=self._joined_pads(members),
+                call_pads=self._call_pads(members),
                 call_codecs=self._joined_codecs_told(members),
             )
             self.sidecars.append(sidecar)
@@ -4974,6 +5011,7 @@ class _Partitioner:
             self.feeding[unit.path] = process.id
             demands.extend((process.id, ref, depth) for ref in self._consumed(process))
 
+        one_encoder = self._sinks_encoded_in_one_ffmpeg()
         for sidecar in self.sidecars:
             members = self.members[sidecar.id]
             # A node region reads a source stream wherever a member does, so
@@ -5006,6 +5044,22 @@ class _Partitioner:
                 # reading it.
                 assert producer is not None  # what being in `cut_coding` says
                 self._add_edge(self.sidecar_of[producer], target, ref)
+                continue
+            if (
+                target in one_encoder
+                and self._coded_for_sink(target, ref)
+                and not self._encoded_in_its_region(target, ref)
+            ):
+                stage = self._sink_encoder(target, depth)
+                stage.pipes.append(ref)
+                self._add_edge(stage.id, target, ref)
+                if self._from_a_region(ref):
+                    assert producer is not None  # a region's output has a node
+                    self._add_edge(self.sidecar_of[producer], stage.id, ref)
+                else:
+                    # Read where the input is: a source's own streams at depth 0,
+                    # off the one reader of a live input.
+                    demands.append((stage.id, ref, 0))
                 continue
             if producer is not None and (self.external.get(producer, False) or dissolved):
                 consumer = self._reader(target, ref)
@@ -5113,6 +5167,98 @@ class _Partitioner:
             for document in sidecar.rows
             if document.sink.path == tap
         )
+
+    def _sinks_encoded_in_one_ffmpeg(self) -> set[str]:
+        """The node sinks whose coded streams one ffmpeg encodes, all of them.
+
+        Each ffmpeg writing coded streams to a sink writes a NUT of its own,
+        and each NUT's muxer moves its streams later by how far they open
+        below zero: a picture by its encoder's reorder delay, a sound by its
+        priming. Coded in two processes, a picture and its sound would reach
+        the sink that far apart. So where a sink's coded streams would come
+        from more than one process -- a region's output beside anything else,
+        or legs no one producer would take together -- one ffmpeg reads them
+        all raw and encodes them, and one muxer writes them. Legs join one
+        producer only where they run at one depth and read exactly alike
+        (:meth:`_sibling_feeder`).
+
+        A picture its own region encodes stays there, as it would for a sink
+        reading it alone.
+        """
+        found: set[str] = set()
+        for sidecar in self.sidecars:
+            if not (sidecar.node_network and sidecar.packet_sink):
+                continue
+            members = self.members[sidecar.id]
+            lowest = min(self.depth[member] for member in members)
+            coded = [
+                ref
+                for ref, _ in self._region_reads(members)
+                if self._coded_for_sink(sidecar.id, ref)
+                and not self._encoded_in_its_region(sidecar.id, ref)
+            ]
+            if len(coded) < 2:
+                continue
+            legs: set[tuple[int, tuple[frozenset[str], frozenset[FrameRef]]]] = set()
+            for ref in coded:
+                if self._from_a_region(ref):
+                    found.add(sidecar.id)
+                    break
+                at = self._leg_depth(ref, lowest)
+                legs.add((at, self._feeder_reads(self._ancestors([ref], at), [ref])))
+            if len(legs) > 1:
+                found.add(sidecar.id)
+        return found
+
+    def _leg_depth(self, ref: FrameRef, depth: int) -> int:
+        """The depth a leg handing `ref` over runs at, as a demand places it."""
+        producer = _ref_node(ref)
+        return self.depth[producer] if producer in self.depth else depth
+
+    def _coded_for_sink(self, sink: str, ref: FrameRef) -> bool:
+        """Whether sink process `sink` reads `ref` as an encoder's output."""
+        reader = self._reader(sink, ref)
+        return _encodes(self._format(ref, self._wire_reader(sink, reader)))
+
+    def _from_a_region(self, ref: FrameRef) -> bool:
+        """Whether a sidecar region writes `ref`: a module's output, or a leg
+        of a split the region dissolved."""
+        producer = _ref_node(ref)
+        return producer is not None and producer in self.sidecar_of
+
+    def _encoded_in_its_region(self, sink: str, ref: FrameRef) -> bool:
+        """Whether the region writing `ref` encodes it itself for `sink`: one
+        declared coded or holding its pictures on the GPU, reading a picture
+        into an encoder the sidecar hosts (:meth:`_encoded_for_a_sink`)."""
+        producer = _ref_node(ref)
+        if producer is None or producer not in self.sidecar_of:
+            return False
+        members = self.members[self.sidecar_of[producer]]
+        if not any(
+            self.g.nodes[name].filter in self.coded or self._holds_on_the_gpu(name)
+            for name in members
+        ):
+            return False
+        reader = self._reader(sink, ref)
+        pads = self.g.packet_sinks.get(reader) if reader is not None else None
+        if pads is None or reader is None or ref_type(self.g, ref) != "video":
+            return False
+        codec = pads[self.g.nodes[reader].inputs.index(ref)].get("video_codec")
+        return isinstance(codec, str) and codec in HOSTED_ENCODERS
+
+    def _encodes_for_a_node_sink(self, process: _Pending) -> bool:
+        """Whether `process` is the one ffmpeg encoding a node sink's streams."""
+        return any(stage is process for stage in self.sink_encoders.values())
+
+    def _sink_encoder(self, sink: str, depth: int) -> _Pending:
+        """The one ffmpeg encoding what node sink `sink` reads coded."""
+        stage = self.sink_encoders.get(sink)
+        if stage is None:
+            stage = _Pending(id=self._ffmpeg_id(), depth=depth, nodes=[], sinks=[], pipes=[])
+            self.pending.append(stage)
+            self.consumer_of[stage.id] = sink
+            self.sink_encoders[sink] = stage
+        return stage
 
     def _code_edges(self) -> None:
         """The edges of each region whose entry module says its edges are
@@ -5432,21 +5578,52 @@ class _Partitioner:
         A node reads and writes its kinds side by side, so the streams one
         process hands another travel interleaved on one pipe, and no stream of
         it can wait on another pipe.
+
+        A sink's pads stay one input apiece, except the pictures and sounds an
+        ffmpeg writes for a node sink: those ride one NUT, and the sink's call
+        says their rows. One muxer then writes them, so they keep the clock
+        they share: NUT stores no time below zero, and where a stream opens
+        below it (a coded picture decoded ahead of its first presentation, a
+        coded sound's priming) the muxer moves every stream of the file later
+        by the same amount. A data stream keeps a pipe of its own there: a
+        file holding one beside media waits at most a tenth of a second on
+        the next packet (``-max_interleave_delta``), so it would write the
+        sound before an encoder's first picture and could not then move that
+        picture's decode times past zero.
+
+        What one process hands a node sink's one encoder rides one NUT too:
+        the encoder reads nothing more of one input while x264 fills its
+        lookahead, and a producer writing the picture and the sound on two
+        pipes would wait on the one it is not read from.
         """
-        # A sink's pads stay one input apiece, each with what it says of its row.
         nodes = {
             sidecar.id
             for sidecar in self.sidecars
             if sidecar.node_network and not sidecar.packet_sink
         }
-        if not nodes:
+        node_sinks = {
+            sidecar.id
+            for sidecar in self.sidecars
+            if sidecar.node_network and sidecar.packet_sink
+        }
+        encoders = {stage.id for stage in self.sink_encoders.values()}
+        if not nodes and not node_sinks:
             return
         sinks = {sidecar.id for sidecar in self.sidecars if sidecar.packet_sink}
+        ffmpegs = {process.id for process in self.pending}
         for index, edge in enumerate(self.edges):
-            if edge.target in sinks:
+            if edge.target in encoders:
+                pass
+            elif edge.target in sinks:
+                if (
+                    edge.target not in node_sinks
+                    or edge.source not in ffmpegs
+                    or isinstance(edge.format, DataFormat)
+                ):
+                    continue
+            elif edge.source not in nodes and edge.target not in nodes:
                 continue
-            if edge.source in nodes or edge.target in nodes:
-                self.edges[index] = replace(edge, nut=f"{edge.source}>{edge.target}")
+            self.edges[index] = replace(edge, nut=f"{edge.source}>{edge.target}")
 
     def _offset_whole_nuts(self) -> None:
         """Give every picture riding a NUT with a copied input's packets the
@@ -5646,7 +5823,9 @@ class _Partitioner:
         door.
         """
         for table in (self.g.packet_sinks, self.g.packet_filters):
-            name = next((n for n in members if n in table and n not in self.joined_sinks), None)
+            name = next(
+                (n for n in members if n in table and not self._pads_on_the_call(n)), None
+            )
             if name is not None:
                 return tuple(
                     PadMeta.from_dict(pad) if "row" in pad else None
@@ -5654,16 +5833,37 @@ class _Partitioner:
                 )
         return ()
 
-    def _joined_pads(self, members: Sequence[str]) -> tuple[tuple[str, tuple[PadMeta, ...]], ...]:
-        """The pad metadata of each packet sink this region holds beside the
-        nodes writing its stream, by the sink's node, where its pads carry
-        any: a ``-pad`` names an ``-i``, and such a sink's pads are none."""
-        return tuple(
-            (name, tuple(PadMeta.from_dict(pad) for pad in self.g.packet_sinks[name]))
-            for name in members
-            if name in self.joined_sinks
-            and all("row" in pad for pad in self.g.packet_sinks[name])
+    def _pads_on_the_call(self, name: str) -> bool:
+        """Whether packet sink `name` is told its pads' rows on its call
+        rather than on an ``-i`` each: one a network holds beside the nodes
+        writing its stream, whose pads read labels, and a node sink, whose
+        pictures and sounds from one ffmpeg ride one NUT."""
+        return name in self.joined_sinks or (
+            name in self.g.packet_sinks and name in self.node_shapes
         )
+
+    def _call_pads(
+        self, members: Sequence[str]
+    ) -> tuple[tuple[str, tuple[PadMeta | None, ...]], ...]:
+        """The pad metadata of each packet sink this region tells on its call
+        (:meth:`_pads_on_the_call`), by the sink's node, where its pads carry
+        any: a ``-pad`` names an ``-i``, and such a sink's pads are none.
+
+        A node's pad with no row, a data stream's, is told none (`None`), as
+        an ``-i`` with no ``-pad`` is; an older world's sink is told its pads
+        only where every one has a row.
+        """
+        found: list[tuple[str, tuple[PadMeta | None, ...]]] = []
+        for name in members:
+            if not self._pads_on_the_call(name):
+                continue
+            pads = self.g.packet_sinks[name]
+            told = tuple(PadMeta.from_dict(pad) if "row" in pad else None for pad in pads)
+            if all(pad is not None for pad in told) or (
+                name in self.node_shapes and any(pad is not None for pad in told)
+            ):
+                found.append((name, told))
+        return tuple(found)
 
     def _joined_codecs_told(
         self, members: Sequence[str]
