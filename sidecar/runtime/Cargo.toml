@@ -39,6 +39,8 @@ tokio = { version = "1", default-features = false, features = ["net", "time"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = "1"
+# The digest an allow-list entry names a module by.
+sha2 = "0.10"
 
 # default-features=false drops the openvino and winml backends; only ONNX is
 # wanted, and only ONNX has a dynamically loaded runtime. Which providers come

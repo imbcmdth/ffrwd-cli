@@ -4553,9 +4553,14 @@ fn main() {
         exit(relay::main(&argv[1..]));
     }
 
-    // The egress policy is read before anything runs: a bad value is a
-    // configuration error even for a run granting no network.
+    // The egress policy and the modules' environment are read before
+    // anything runs: a bad value is a configuration error even for a run
+    // granting no network.
     if let Err(e) = ffrwd_wasm_runtime::egress::net_policy() {
+        eprintln!("ffrwd-wasm: {e:#}");
+        exit(2);
+    }
+    if let Err(e) = ffrwd_wasm_runtime::runtime::module_env() {
         eprintln!("ffrwd-wasm: {e:#}");
         exit(2);
     }

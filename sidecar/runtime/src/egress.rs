@@ -1,14 +1,16 @@
 //! Outbound network policy, read from `FFRWD_NET_POLICY`. Unset leaves the
 //! two grants (`-udp`, `-http`) unrestricted; `public` refuses destinations
 //! in the private, loopback, link-local, carrier-NAT, multicast and
-//! broadcast ranges, except the ones `FFRWD_REACH_ALLOW` names. Local binds
-//! are never restricted.
+//! broadcast ranges, except the ones `FFRWD_REACH_ALLOW` names. An entry of
+//! that list may name the one module it admits, by the sha256 of its wasm
+//! file. Local binds are never restricted.
 //!
 //! For wasi:sockets the check runs per address use. For wasi:http the
 //! request path resolves the authority itself and connects only to public
 //! or allowed addresses, so a hostname is judged by what it resolves to,
 //! not by its spelling, unless the allow list names it.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
@@ -19,6 +21,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use http::uri::Scheme;
 use http_body_util::BodyExt;
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use wasmtime_wasi::sockets::SocketAddrUse;
@@ -34,9 +37,39 @@ pub enum NetPolicy {
     Public(&'static ReachAllow),
 }
 
+impl NetPolicy {
+    /// Whether an allow-list entry names a module by its digest, and so
+    /// whether a module's wasm file has to be hashed.
+    pub fn names_modules(self) -> bool {
+        matches!(self, NetPolicy::Public(allow) if allow.names_modules())
+    }
+}
+
+/// The sha256 of a module's wasm file.
+pub type Digest = [u8; 32];
+
+/// The sha256 of `bytes`.
+pub(crate) fn sha256(bytes: &[u8]) -> Digest {
+    Sha256::digest(bytes).into()
+}
+
+/// `digest` as 64 lowercase hex digits, the way an entry spells it.
+fn hex(digest: &Digest) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// One entry of `FFRWD_REACH_ALLOW`, as written.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReachEntry {
+pub struct ReachEntry {
+    pub target: Target,
+    /// The sha256 of the one module's wasm file the entry admits; `None`
+    /// admits every module.
+    pub module: Option<Digest>,
+}
+
+/// Where an entry lets a module go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
     /// A host name, standing for the addresses it resolves to.
     Name(String),
     /// One address.
@@ -45,13 +78,21 @@ pub enum ReachEntry {
     Cidr { net: IpAddr, bits: u8 },
 }
 
+/// Whether an entry for `scope` holds for the module whose sha256 is
+/// `module`: an entry with no digest holds for every module, one with a
+/// digest only for the module with that digest.
+fn admits(scope: Option<&Digest>, module: Option<&Digest>) -> bool {
+    scope.is_none_or(|digest| module == Some(digest))
+}
+
 /// The destinations `FFRWD_REACH_ALLOW` lets a module reach under `public`
 /// although they are not public.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReachAllow {
     entries: Vec<ReachEntry>,
-    /// What the host-name entries resolved to when the policy was read.
-    resolved: Vec<IpAddr>,
+    /// What the host-name entries resolved to when the policy was read, each
+    /// with its entry's digest.
+    resolved: Vec<(IpAddr, Option<Digest>)>,
 }
 
 /// `public` with no exceptions.
@@ -61,23 +102,28 @@ pub static NO_EXCEPTIONS: ReachAllow = ReachAllow {
 };
 
 impl ReachAllow {
-    /// Resolves every host-name entry once through `resolve`, which gives a
-    /// name's addresses or none. A name with none warns on stderr and allows
-    /// nothing.
+    /// Resolves every host-name entry through `resolve`, which gives a name's
+    /// addresses or none, once per name. A name with none warns on stderr and
+    /// allows nothing.
     pub fn resolved(mut self, resolve: impl Fn(&str) -> Vec<IpAddr>) -> ReachAllow {
+        let mut looked_up: HashMap<String, Vec<IpAddr>> = HashMap::new();
         for entry in &self.entries {
-            let ReachEntry::Name(name) = entry else {
+            let Target::Name(name) = &entry.target else {
                 continue;
             };
-            let addrs = resolve(name);
-            if addrs.is_empty() {
-                eprintln!(
-                    "ffrwd-wasm: FFRWD_REACH_ALLOW names {name:?}, which does not resolve here, \
-                     so it allows nothing"
-                );
-            }
+            let key = name.trim_end_matches('.').to_ascii_lowercase();
+            let addrs = looked_up.entry(key).or_insert_with(|| {
+                let addrs = resolve(name);
+                if addrs.is_empty() {
+                    eprintln!(
+                        "ffrwd-wasm: FFRWD_REACH_ALLOW names {name:?}, which does not resolve \
+                         here, so it allows nothing"
+                    );
+                }
+                addrs.into_iter().map(|addr| addr.to_canonical()).collect()
+            });
             self.resolved
-                .extend(addrs.into_iter().map(|addr| addr.to_canonical()));
+                .extend(addrs.iter().map(|addr| (*addr, entry.module)));
         }
         self
     }
@@ -86,33 +132,50 @@ impl ReachAllow {
         self.entries.is_empty()
     }
 
-    /// Whether `addr` is inside an entry: an address or prefix holding it, or
-    /// a host name that resolved to it.
-    fn permits(&self, addr: IpAddr) -> bool {
+    /// Whether an entry names a module by its digest, and so whether a
+    /// module's wasm file has to be hashed.
+    pub fn names_modules(&self) -> bool {
+        self.entries.iter().any(|entry| entry.module.is_some())
+    }
+
+    /// Whether `addr` is inside an entry that holds for `module`: an address
+    /// or prefix holding it, or a host name that resolved to it.
+    fn permits(&self, addr: IpAddr, module: Option<&Digest>) -> bool {
         let addr = addr.to_canonical();
-        self.resolved.contains(&addr)
-            || self.entries.iter().any(|entry| match entry {
-                ReachEntry::Name(_) => false,
-                ReachEntry::Addr(allowed) => *allowed == addr,
-                ReachEntry::Cidr { net, bits } => in_prefix(addr, *net, *bits),
+        self.resolved
+            .iter()
+            .any(|(resolved, scope)| *resolved == addr && admits(scope.as_ref(), module))
+            || self.entries.iter().any(|entry| {
+                admits(entry.module.as_ref(), module)
+                    && match entry.target {
+                        Target::Name(_) => false,
+                        Target::Addr(allowed) => allowed == addr,
+                        Target::Cidr { net, bits } => in_prefix(addr, net, bits),
+                    }
             })
     }
 
-    /// Whether `host` is a host-name entry, in any case, with or without a
-    /// trailing dot.
-    fn names(&self, host: &str) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| matches!(entry, ReachEntry::Name(name) if same_name(name, host)))
+    /// Whether `host` is a host-name entry that holds for `module`, in any
+    /// case, with or without a trailing dot.
+    fn names(&self, host: &str, module: Option<&Digest>) -> bool {
+        self.entries.iter().any(|entry| {
+            admits(entry.module.as_ref(), module)
+                && matches!(&entry.target, Target::Name(name) if same_name(name, host))
+        })
     }
 
     /// What `public` allows, for a refusal line: the list is mentioned only
-    /// when it is set.
-    fn allowed_scope(&self) -> &'static str {
+    /// when it is set, and the module's digest only when an entry names one.
+    fn allowed_scope(&self, module: Option<&Digest>) -> String {
         if self.is_empty() {
-            "public destinations only"
-        } else {
-            "public destinations and FFRWD_REACH_ALLOW only"
+            return "public destinations only".to_string();
+        }
+        let scope = "public destinations and FFRWD_REACH_ALLOW only";
+        match module {
+            Some(digest) if self.names_modules() => {
+                format!("{scope}, and this module's sha256 is {}", hex(digest))
+            }
+            _ => scope.to_string(),
         }
     }
 }
@@ -165,8 +228,9 @@ fn is_host_name(entry: &str) -> bool {
 /// Parses `FFRWD_NET_POLICY` and, under `public`, `FFRWD_REACH_ALLOW`:
 /// `None` when the network is unrestricted, otherwise the exceptions
 /// `public` makes, their host names not yet resolved. The policy is an exact
-/// match and every entry a host name, an IP literal or a CIDR, trimmed,
-/// commas between: a typo in either is an error, never an open network.
+/// match and every entry a host name, an IP literal or a CIDR, optionally
+/// followed by `@sha256:` and 64 lowercase hex digits, trimmed, commas
+/// between: a typo in either is an error, never an open network.
 /// Unrestricted does not read the list.
 pub fn parse(policy: Option<&str>, reach_allow: Option<&str>) -> Result<Option<ReachAllow>> {
     match policy {
@@ -195,27 +259,75 @@ fn parse_reach_allow(value: Option<&str>) -> Result<ReachAllow> {
     })
 }
 
-/// One trimmed entry of `FFRWD_REACH_ALLOW`.
+/// One trimmed entry of `FFRWD_REACH_ALLOW`: a target, then the module's
+/// digest when an `@` follows it.
 fn parse_entry(entry: &str) -> Result<ReachEntry> {
-    if let Ok(addr) = entry.parse::<IpAddr>() {
-        return Ok(ReachEntry::Addr(addr.to_canonical()));
+    let (target, module) = match entry.split_once('@') {
+        Some((target, digest)) => (target, Some(parse_digest(entry, digest)?)),
+        None => (entry, None),
+    };
+    Ok(ReachEntry {
+        target: parse_target(entry, target)?,
+        module,
+    })
+}
+
+/// The target part of `entry`.
+fn parse_target(entry: &str, target: &str) -> Result<Target> {
+    if let Ok(addr) = target.parse::<IpAddr>() {
+        return Ok(Target::Addr(addr.to_canonical()));
     }
-    if let Some((net, bits)) = entry.split_once('/') {
+    if let Some((net, bits)) = target.split_once('/') {
         if let (Ok(net), Ok(bits)) = (net.parse::<IpAddr>(), bits.parse::<u8>()) {
             let width = if net.is_ipv4() { 32 } else { 128 };
             if bits > width {
                 bail!("FFRWD_REACH_ALLOW entry {entry:?} has a prefix longer than {width} bits");
             }
-            return Ok(ReachEntry::Cidr { net, bits });
+            return Ok(Target::Cidr { net, bits });
         }
     }
-    if is_host_name(entry) {
-        return Ok(ReachEntry::Name(entry.to_string()));
+    if is_host_name(target) {
+        return Ok(Target::Name(target.to_string()));
     }
     bail!(
         "FFRWD_REACH_ALLOW entry {entry:?} is not a host name, an IP address or a CIDR \
          like 10.0.0.0/8; unset the variable to allow public destinations only"
     )
+}
+
+/// The part of `entry` after its `@`: `sha256:` and 64 lowercase hex digits.
+fn parse_digest(entry: &str, digest: &str) -> Result<Digest> {
+    let Some(digits) = digest.strip_prefix("sha256:") else {
+        bail!(
+            "FFRWD_REACH_ALLOW entry {entry:?} names a module by {digest:?}; write \
+             @sha256: and the 64 hex digits of the module's sha256, as sha256sum prints them"
+        );
+    };
+    let count = digits.chars().count();
+    if count != 64 {
+        bail!(
+            "FFRWD_REACH_ALLOW entry {entry:?} has a sha256 of {count} digits; a sha256 is \
+             64 hex digits, as sha256sum prints them"
+        );
+    }
+    if digits.bytes().any(|b| b.is_ascii_uppercase()) {
+        bail!(
+            "FFRWD_REACH_ALLOW entry {entry:?} writes its sha256 in uppercase; write it in \
+             lowercase, as sha256sum prints it"
+        );
+    }
+    if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!(
+            "FFRWD_REACH_ALLOW entry {entry:?} has a sha256 that is not hex; a sha256 is \
+             64 digits from 0-9 and a-f, as sha256sum prints them"
+        );
+    }
+    let nibble = |b: u8| char::from(b).to_digit(16).unwrap_or(0) as u8;
+    let mut parsed = [0u8; 32];
+    for (byte, pair) in parsed.iter_mut().zip(digits.as_bytes().chunks(2)) {
+        *byte = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    Ok(parsed)
 }
 
 /// The process's policy, read from the environment once; the allow list's
@@ -287,10 +399,16 @@ fn public_v4(addr: Ipv4Addr) -> bool {
         || addr == Ipv4Addr::BROADCAST)
 }
 
-/// Whether the sockets layer may use `addr` for `reason` under `policy`.
-/// Binds and inbound addresses pass; only where traffic goes is policed, and
-/// there a public destination or one the allow list holds passes.
-pub fn permit_socket_addr(policy: NetPolicy, addr: SocketAddr, reason: SocketAddrUse) -> bool {
+/// Whether the sockets layer may use `addr` for `reason` under `policy`, for
+/// the module whose sha256 is `module`. Binds and inbound addresses pass;
+/// only where traffic goes is policed, and there a public destination or one
+/// an entry holding for the module holds passes.
+pub fn permit_socket_addr(
+    policy: NetPolicy,
+    module: Option<&Digest>,
+    addr: SocketAddr,
+    reason: SocketAddrUse,
+) -> bool {
     match policy {
         NetPolicy::Unrestricted => true,
         NetPolicy::Public(allow) => match reason {
@@ -300,7 +418,7 @@ pub fn permit_socket_addr(policy: NetPolicy, addr: SocketAddr, reason: SocketAdd
             | SocketAddrUse::UdpBind
             | SocketAddrUse::UdpReceive => true,
             SocketAddrUse::TcpConnect | SocketAddrUse::UdpSend => {
-                public_destination(addr.ip()) || allow.permits(addr.ip())
+                public_destination(addr.ip()) || allow.permits(addr.ip(), module)
             }
         },
     }
@@ -310,12 +428,13 @@ pub fn permit_socket_addr(policy: NetPolicy, addr: SocketAddr, reason: SocketAdd
 /// so on stderr when refusing.
 pub(crate) fn check_socket_addr(
     allow: &'static ReachAllow,
+    module: Option<&Digest>,
     addr: SocketAddr,
     reason: SocketAddrUse,
 ) -> bool {
-    let allowed = permit_socket_addr(NetPolicy::Public(allow), addr, reason);
+    let allowed = permit_socket_addr(NetPolicy::Public(allow), module, addr, reason);
     if !allowed {
-        let scope = allow.allowed_scope();
+        let scope = allow.allowed_scope(module);
         eprintln!("ffrwd-wasm: refused {addr}: FFRWD_NET_POLICY=public allows {scope}");
     }
     allowed
@@ -327,14 +446,16 @@ type SendFuture = Box<
 >;
 
 /// The store's wasi:http hooks. Every hook keeps its default; only how a
-/// request is sent depends on the policy.
+/// request is sent depends on the policy and on the store's module.
 pub struct Hooks {
     policy: NetPolicy,
+    /// The sha256 of the store's module's wasm file, when it was hashed.
+    module: Option<Digest>,
 }
 
 impl Hooks {
-    pub fn new(policy: NetPolicy) -> Self {
-        Self { policy }
+    pub fn new(policy: NetPolicy, module: Option<Digest>) -> Self {
+        Self { policy, module }
     }
 }
 
@@ -351,7 +472,9 @@ impl WasiHttpHooks for Hooks {
                 let (res, io) = default_send_request(request, options).await?;
                 Ok((res.map(BodyExt::boxed_unsync), Box::new(io) as IoFuture))
             }),
-            NetPolicy::Public(allow) => Box::new(send_request_public(allow, request, options)),
+            NetPolicy::Public(allow) => {
+                Box::new(send_request_public(allow, self.module, request, options))
+            }
         }
     }
 }
@@ -410,6 +533,7 @@ impl http_body::Body for TimedBody {
 /// gap between checking a name and dialing it.
 async fn send_request_public(
     allow: &'static ReachAllow,
+    module: Option<Digest>,
     mut req: http::Request<WasiBody>,
     options: Option<RequestOptions>,
 ) -> std::result::Result<(http::Response<WasiBody>, IoFuture), Error> {
@@ -443,9 +567,9 @@ async fn send_request_public(
             info_code: None,
         });
     }
-    let dialable = dialable(allow, &host, candidates);
+    let dialable = dialable(allow, module.as_ref(), &host, candidates);
     if dialable.is_empty() {
-        let scope = allow.allowed_scope();
+        let scope = allow.allowed_scope(module.as_ref());
         eprintln!(
             "ffrwd-wasm: refused http request to {host}:{port}: \
              FFRWD_NET_POLICY=public allows {scope}"
@@ -541,16 +665,22 @@ async fn send_request_public(
     Ok((res, Box::new(conn) as IoFuture))
 }
 
-/// Which of a request's addresses `public` may dial: every one when `host`
-/// is a host-name entry of the allow list, otherwise the public and the
-/// allowed ones.
-fn dialable(allow: &ReachAllow, host: &str, candidates: Vec<SocketAddr>) -> Vec<SocketAddr> {
-    if allow.names(host) {
+/// Which of a request's addresses `public` may dial for the module whose
+/// sha256 is `module`: every one when `host` is a host-name entry holding
+/// for the module, otherwise the public ones and the ones an entry holding
+/// for the module allows.
+fn dialable(
+    allow: &ReachAllow,
+    module: Option<&Digest>,
+    host: &str,
+    candidates: Vec<SocketAddr>,
+) -> Vec<SocketAddr> {
+    if allow.names(host, module) {
         return candidates;
     }
     candidates
         .into_iter()
-        .filter(|addr| public_destination(addr.ip()) || allow.permits(addr.ip()))
+        .filter(|addr| public_destination(addr.ip()) || allow.permits(addr.ip(), module))
         .collect()
 }
 
@@ -596,6 +726,23 @@ mod tests {
     /// environment does.
     fn public_with(list: &str, resolve: impl Fn(&str) -> Vec<IpAddr>) -> NetPolicy {
         NetPolicy::Public(Box::leak(Box::new(allow(list).resolved(resolve))))
+    }
+
+    /// An entry with no digest, which holds for every module.
+    fn any(target: Target) -> ReachEntry {
+        ReachEntry {
+            target,
+            module: None,
+        }
+    }
+
+    /// Three modules' sha256s, as an entry writes them.
+    const PUBLISH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const SUBSCRIBE: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const OTHER: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+
+    fn digest(hex: &str) -> Digest {
+        parse_digest(hex, &format!("sha256:{hex}")).expect("a digest")
     }
 
     #[test]
@@ -706,20 +853,91 @@ mod tests {
         assert_eq!(
             parsed.entries,
             vec![
-                ReachEntry::Name("ffrwd-pro-relay-egress.ffrwd.svc".to_string()),
-                ReachEntry::Addr(v4("10.107.14.83")),
-                ReachEntry::Addr(v6("fd00::1")),
-                ReachEntry::Cidr {
+                any(Target::Name("ffrwd-pro-relay-egress.ffrwd.svc".to_string())),
+                any(Target::Addr(v4("10.107.14.83"))),
+                any(Target::Addr(v6("fd00::1"))),
+                any(Target::Cidr {
                     net: v4("10.107.14.83"),
                     bits: 32
-                },
-                ReachEntry::Cidr {
+                }),
+                any(Target::Cidr {
                     net: v6("fd00::"),
                     bits: 8
-                },
+                }),
             ]
         );
         assert!(parsed.resolved.is_empty(), "parsing resolves nothing");
+        assert!(!parsed.names_modules(), "no entry names a module");
+    }
+
+    #[test]
+    fn an_entry_may_name_its_module_and_a_target_may_repeat_per_module() {
+        let parsed = allow(&format!(
+            "relay.ffrwd.svc@sha256:{PUBLISH}, relay.ffrwd.svc@sha256:{SUBSCRIBE},\
+             10.107.14.0/24@sha256:{PUBLISH},fd00::1@sha256:{SUBSCRIBE},10.0.0.1"
+        ));
+        let scoped = |target, hex| ReachEntry {
+            target,
+            module: Some(digest(hex)),
+        };
+        assert_eq!(
+            parsed.entries,
+            vec![
+                scoped(Target::Name("relay.ffrwd.svc".to_string()), PUBLISH),
+                scoped(Target::Name("relay.ffrwd.svc".to_string()), SUBSCRIBE),
+                scoped(
+                    Target::Cidr {
+                        net: v4("10.107.14.0"),
+                        bits: 24
+                    },
+                    PUBLISH
+                ),
+                scoped(Target::Addr(v6("fd00::1")), SUBSCRIBE),
+                any(Target::Addr(v4("10.0.0.1"))),
+            ]
+        );
+        assert!(parsed.names_modules());
+        let publish = digest(PUBLISH);
+        assert_eq!(
+            (publish[0], publish[1], publish[31]),
+            (0x01, 0x23, 0xef),
+            "the digits are the digest's bytes in order"
+        );
+    }
+
+    #[test]
+    fn a_malformed_digest_is_an_error_naming_the_entry_and_the_fix() {
+        let upper = PUBLISH.to_ascii_uppercase();
+        let short = &PUBLISH[..63];
+        let not_hex = format!("{}g", &PUBLISH[..63]);
+        for (bad, says) in [
+            (format!("relay.svc@sha256:{upper}"), "lowercase"),
+            (format!("10.0.0.1@sha256:{short}"), "of 63 digits"),
+            (format!("10.0.0.1@sha256:{PUBLISH}0"), "of 65 digits"),
+            ("relay.svc@sha256:".to_string(), "of 0 digits"),
+            (format!("relay.svc@sha256:{not_hex}"), "not hex"),
+            (format!("relay.svc@SHA256:{PUBLISH}"), "write @sha256:"),
+            (format!("relay.svc@sha512:{PUBLISH}"), "write @sha256:"),
+            (format!("relay.svc@{PUBLISH}"), "write @sha256:"),
+            ("relay.svc@".to_string(), "write @sha256:"),
+            (format!("@sha256:{PUBLISH}"), "is not a host name"),
+            (format!("relay.svc @sha256:{PUBLISH}"), "is not a host name"),
+            (
+                format!("10.0.0.0/33@sha256:{PUBLISH}"),
+                "longer than 32 bits",
+            ),
+        ] {
+            let err = parse(Some("public"), Some(&bad)).expect_err(&bad);
+            let message = err.to_string();
+            assert!(
+                message.contains("FFRWD_REACH_ALLOW") && message.contains(&bad),
+                "error should name the variable and quote the entry, got: {message}"
+            );
+            assert!(
+                message.contains(says),
+                "error for {bad} should say {says:?}, got: {message}"
+            );
+        }
     }
 
     #[test]
@@ -767,7 +985,7 @@ mod tests {
         ] {
             assert_eq!(
                 allow(name).entries,
-                vec![ReachEntry::Name(name.to_string())],
+                vec![any(Target::Name(name.to_string()))],
                 "{name} is a host name"
             );
         }
@@ -785,21 +1003,39 @@ mod tests {
         let internet: SocketAddr = "1.1.1.1:9".parse().expect("addr");
         let policy = NetPolicy::Public(&NO_EXCEPTIONS);
 
-        assert!(permit_socket_addr(policy, loopback, SocketAddrUse::UdpBind));
-        assert!(permit_socket_addr(policy, loopback, SocketAddrUse::TcpBind));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            loopback,
+            SocketAddrUse::UdpBind
+        ));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            loopback,
+            SocketAddrUse::TcpBind
+        ));
         assert!(!permit_socket_addr(
             policy,
+            None,
             loopback,
             SocketAddrUse::UdpSend
         ));
         assert!(!permit_socket_addr(
             policy,
+            None,
             loopback,
             SocketAddrUse::TcpConnect
         ));
-        assert!(permit_socket_addr(policy, internet, SocketAddrUse::UdpSend));
         assert!(permit_socket_addr(
             policy,
+            None,
+            internet,
+            SocketAddrUse::UdpSend
+        ));
+        assert!(permit_socket_addr(
+            policy,
+            None,
             internet,
             SocketAddrUse::TcpConnect
         ));
@@ -815,6 +1051,7 @@ mod tests {
         ] {
             assert!(permit_socket_addr(
                 NetPolicy::Unrestricted,
+                None,
                 loopback,
                 reason
             ));
@@ -826,6 +1063,7 @@ mod tests {
         let mapped = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9);
         assert!(!permit_socket_addr(
             NetPolicy::Public(&NO_EXCEPTIONS),
+            None,
             mapped,
             SocketAddrUse::UdpSend
         ));
@@ -838,25 +1076,85 @@ mod tests {
             resolving_to(&["10.107.14.84"]),
         );
         let send = SocketAddrUse::UdpSend;
-        assert!(permit_socket_addr(policy, sock("10.107.14.83:4443"), send));
-        assert!(permit_socket_addr(policy, sock("10.107.14.84:4443"), send));
-        assert!(!permit_socket_addr(policy, sock("10.0.0.9:4443"), send));
-        assert!(!permit_socket_addr(policy, sock("10.107.14.85:4443"), send));
-        assert!(!permit_socket_addr(policy, sock("127.0.0.1:4443"), send));
-        assert!(permit_socket_addr(policy, sock("1.1.1.1:443"), send));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            sock("10.107.14.83:4443"),
+            send
+        ));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            sock("10.107.14.84:4443"),
+            send
+        ));
+        assert!(!permit_socket_addr(
+            policy,
+            None,
+            sock("10.0.0.9:4443"),
+            send
+        ));
+        assert!(!permit_socket_addr(
+            policy,
+            None,
+            sock("10.107.14.85:4443"),
+            send
+        ));
+        assert!(!permit_socket_addr(
+            policy,
+            None,
+            sock("127.0.0.1:4443"),
+            send
+        ));
+        assert!(permit_socket_addr(policy, None, sock("1.1.1.1:443"), send));
     }
 
     #[test]
     fn a_prefix_entry_holds_its_range_in_either_family() {
         let policy = public_with("10.107.14.0/24,fd00::/8", nothing);
         let connect = SocketAddrUse::TcpConnect;
-        assert!(permit_socket_addr(policy, sock("10.107.14.1:1"), connect));
-        assert!(permit_socket_addr(policy, sock("10.107.14.255:1"), connect));
-        assert!(!permit_socket_addr(policy, sock("10.107.15.0:1"), connect));
-        assert!(permit_socket_addr(policy, sock("[fd00::1]:1"), connect));
-        assert!(permit_socket_addr(policy, sock("[fdff::1]:1"), connect));
-        assert!(!permit_socket_addr(policy, sock("[fe80::1]:1"), connect));
-        assert!(!permit_socket_addr(policy, sock("[fc00::1]:1"), connect));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            sock("10.107.14.1:1"),
+            connect
+        ));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            sock("10.107.14.255:1"),
+            connect
+        ));
+        assert!(!permit_socket_addr(
+            policy,
+            None,
+            sock("10.107.15.0:1"),
+            connect
+        ));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            sock("[fd00::1]:1"),
+            connect
+        ));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            sock("[fdff::1]:1"),
+            connect
+        ));
+        assert!(!permit_socket_addr(
+            policy,
+            None,
+            sock("[fe80::1]:1"),
+            connect
+        ));
+        assert!(!permit_socket_addr(
+            policy,
+            None,
+            sock("[fc00::1]:1"),
+            connect
+        ));
     }
 
     #[test]
@@ -864,20 +1162,33 @@ mod tests {
         let policy = public_with("192.168.1.20", nothing);
         let relay = sock("192.168.1.20:4443");
         let loopback = sock("127.0.0.1:0");
-        assert!(permit_socket_addr(policy, relay, SocketAddrUse::UdpSend));
-        assert!(permit_socket_addr(policy, loopback, SocketAddrUse::UdpBind));
         assert!(permit_socket_addr(
             policy,
+            None,
+            relay,
+            SocketAddrUse::UdpSend
+        ));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            loopback,
+            SocketAddrUse::UdpBind
+        ));
+        assert!(permit_socket_addr(
+            policy,
+            None,
             sock("0.0.0.0:0"),
             SocketAddrUse::TcpBind
         ));
         assert!(!permit_socket_addr(
             policy,
+            None,
             loopback,
             SocketAddrUse::UdpSend
         ));
         assert!(!permit_socket_addr(
             policy,
+            None,
             sock("192.168.1.21:4443"),
             SocketAddrUse::UdpSend
         ));
@@ -890,9 +1201,24 @@ mod tests {
             resolving_to(&["10.107.14.83", "fd00::83"]),
         );
         let send = SocketAddrUse::UdpSend;
-        assert!(permit_socket_addr(policy, sock("10.107.14.83:4443"), send));
-        assert!(permit_socket_addr(policy, sock("[fd00::83]:4443"), send));
-        assert!(!permit_socket_addr(policy, sock("10.107.14.84:4443"), send));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            sock("10.107.14.83:4443"),
+            send
+        ));
+        assert!(permit_socket_addr(
+            policy,
+            None,
+            sock("[fd00::83]:4443"),
+            send
+        ));
+        assert!(!permit_socket_addr(
+            policy,
+            None,
+            sock("10.107.14.84:4443"),
+            send
+        ));
     }
 
     #[test]
@@ -900,6 +1226,7 @@ mod tests {
         let policy = public_with("relay.ffrwd.svc", nothing);
         assert!(!permit_socket_addr(
             policy,
+            None,
             sock("10.107.14.83:4443"),
             SocketAddrUse::UdpSend
         ));
@@ -918,16 +1245,19 @@ mod tests {
         let send = SocketAddrUse::UdpSend;
         assert!(permit_socket_addr(
             policy,
+            None,
             sock("[::ffff:10.107.14.83]:4443"),
             send
         ));
         assert!(permit_socket_addr(
             policy,
+            None,
             sock("[::ffff:10.107.15.9]:4443"),
             send
         ));
         assert!(!permit_socket_addr(
             policy,
+            None,
             sock("[::ffff:10.107.16.9]:4443"),
             send
         ));
@@ -938,15 +1268,15 @@ mod tests {
         let allow = allow("relay.ffrwd.svc").resolved(nothing);
         let resolved = vec![sock("10.107.14.83:443"), sock("1.1.1.1:443")];
         assert_eq!(
-            dialable(&allow, "relay.ffrwd.svc", resolved.clone()),
+            dialable(&allow, None, "relay.ffrwd.svc", resolved.clone()),
             resolved
         );
         assert_eq!(
-            dialable(&allow, "RELAY.ffrwd.svc.", resolved.clone()),
+            dialable(&allow, None, "RELAY.ffrwd.svc.", resolved.clone()),
             resolved
         );
         assert_eq!(
-            dialable(&allow, "other.ffrwd.svc", resolved),
+            dialable(&allow, None, "other.ffrwd.svc", resolved),
             vec![sock("1.1.1.1:443")]
         );
     }
@@ -955,17 +1285,18 @@ mod tests {
     fn the_http_path_dials_an_allowed_literal_and_filters_the_rest() {
         let allow = allow("10.107.14.83,fd00::/8");
         assert_eq!(
-            dialable(&allow, "10.107.14.83", vec![sock("10.107.14.83:443")]),
+            dialable(&allow, None, "10.107.14.83", vec![sock("10.107.14.83:443")]),
             vec![sock("10.107.14.83:443")]
         );
         assert_eq!(
-            dialable(&allow, "fd00::9", vec![sock("[fd00::9]:443")]),
+            dialable(&allow, None, "fd00::9", vec![sock("[fd00::9]:443")]),
             vec![sock("[fd00::9]:443")]
         );
-        assert!(dialable(&allow, "10.0.0.9", vec![sock("10.0.0.9:443")]).is_empty());
+        assert!(dialable(&allow, None, "10.0.0.9", vec![sock("10.0.0.9:443")]).is_empty());
         assert_eq!(
             dialable(
                 &allow,
+                None,
                 "mixed.example",
                 vec![
                     sock("10.0.0.9:443"),
@@ -979,10 +1310,153 @@ mod tests {
 
     #[test]
     fn the_refusal_names_the_list_only_when_it_is_set() {
-        assert_eq!(NO_EXCEPTIONS.allowed_scope(), "public destinations only");
         assert_eq!(
-            allow("10.0.0.0/8").allowed_scope(),
+            NO_EXCEPTIONS.allowed_scope(None),
+            "public destinations only"
+        );
+        assert_eq!(
+            allow("10.0.0.0/8").allowed_scope(None),
             "public destinations and FFRWD_REACH_ALLOW only"
         );
+    }
+
+    #[test]
+    fn a_refusal_under_a_list_naming_modules_gives_the_modules_sha256() {
+        let module = sha256(b"abc");
+        let printed = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(hex(&module), printed, "sha256sum's spelling");
+        assert_eq!(digest(printed), module, "an entry reads what is printed");
+        assert_eq!(
+            allow(&format!("10.0.0.1@sha256:{PUBLISH}")).allowed_scope(Some(&module)),
+            format!(
+                "public destinations and FFRWD_REACH_ALLOW only, and this module's sha256 is \
+                 {printed}"
+            )
+        );
+        assert_eq!(
+            allow("10.0.0.1").allowed_scope(Some(&module)),
+            "public destinations and FFRWD_REACH_ALLOW only",
+            "a list naming no module says nothing of digests"
+        );
+    }
+
+    #[test]
+    fn a_scoped_entry_admits_its_module_and_refuses_every_other() {
+        let policy = public_with(
+            &format!(
+                "10.107.14.83@sha256:{PUBLISH},10.107.15.0/24@sha256:{SUBSCRIBE},\
+                 relay.ffrwd.svc@sha256:{PUBLISH}"
+            ),
+            resolving_to(&["10.107.14.84"]),
+        );
+        let (publish, subscribe, other) = (digest(PUBLISH), digest(SUBSCRIBE), digest(OTHER));
+        let send = SocketAddrUse::UdpSend;
+        let connect = SocketAddrUse::TcpConnect;
+        let address = sock("10.107.14.83:4443");
+        let named = sock("10.107.14.84:4443");
+        let range = sock("10.107.15.9:4443");
+
+        assert!(permit_socket_addr(policy, Some(&publish), address, send));
+        assert!(permit_socket_addr(policy, Some(&publish), named, connect));
+        assert!(!permit_socket_addr(policy, Some(&publish), range, send));
+        assert!(permit_socket_addr(policy, Some(&subscribe), range, connect));
+        assert!(!permit_socket_addr(policy, Some(&subscribe), address, send));
+        assert!(!permit_socket_addr(policy, Some(&subscribe), named, send));
+        for module in [Some(&other), None] {
+            for addr in [address, named, range] {
+                assert!(
+                    !permit_socket_addr(policy, module, addr, send),
+                    "{addr} is held for other modules only"
+                );
+            }
+            assert!(permit_socket_addr(
+                policy,
+                module,
+                sock("1.1.1.1:443"),
+                send
+            ));
+            assert!(permit_socket_addr(
+                policy,
+                module,
+                sock("127.0.0.1:0"),
+                SocketAddrUse::UdpBind
+            ));
+        }
+    }
+
+    #[test]
+    fn an_unscoped_entry_admits_every_module_beside_scoped_ones() {
+        let policy = public_with(
+            &format!("10.107.14.83@sha256:{PUBLISH},10.107.14.83@sha256:{SUBSCRIBE},10.0.0.9"),
+            nothing,
+        );
+        let (publish, subscribe, other) = (digest(PUBLISH), digest(SUBSCRIBE), digest(OTHER));
+        let send = SocketAddrUse::UdpSend;
+        for module in [Some(&publish), Some(&subscribe), Some(&other), None] {
+            assert!(permit_socket_addr(
+                policy,
+                module,
+                sock("10.0.0.9:4443"),
+                send
+            ));
+        }
+        let relay = sock("10.107.14.83:4443");
+        assert!(permit_socket_addr(policy, Some(&publish), relay, send));
+        assert!(permit_socket_addr(policy, Some(&subscribe), relay, send));
+        assert!(!permit_socket_addr(policy, Some(&other), relay, send));
+        assert!(!permit_socket_addr(policy, None, relay, send));
+    }
+
+    #[test]
+    fn a_name_in_several_entries_is_resolved_once_and_held_per_entry() {
+        let lookups = std::cell::Cell::new(0);
+        let allow = allow(&format!(
+            "relay.ffrwd.svc@sha256:{PUBLISH},RELAY.ffrwd.svc.@sha256:{SUBSCRIBE}"
+        ))
+        .resolved(|_| {
+            lookups.set(lookups.get() + 1);
+            vec![v4("10.107.14.83")]
+        });
+        assert_eq!(lookups.get(), 1, "one name, one lookup");
+        let relay = v4("10.107.14.83");
+        assert!(allow.permits(relay, Some(&digest(PUBLISH))));
+        assert!(allow.permits(relay, Some(&digest(SUBSCRIBE))));
+        assert!(!allow.permits(relay, Some(&digest(OTHER))));
+    }
+
+    #[test]
+    fn the_http_path_dials_a_scoped_name_only_for_its_module() {
+        let allow = allow(&format!(
+            "relay.ffrwd.svc@sha256:{PUBLISH},10.107.14.83@sha256:{SUBSCRIBE}"
+        ))
+        .resolved(nothing);
+        let (publish, subscribe, other) = (digest(PUBLISH), digest(SUBSCRIBE), digest(OTHER));
+        let resolved = vec![
+            sock("10.107.14.83:443"),
+            sock("10.107.14.84:443"),
+            sock("1.1.1.1:443"),
+        ];
+        assert_eq!(
+            dialable(&allow, Some(&publish), "relay.ffrwd.svc", resolved.clone()),
+            resolved,
+            "the module the name is held for dials every address it resolves to"
+        );
+        assert_eq!(
+            dialable(
+                &allow,
+                Some(&subscribe),
+                "relay.ffrwd.svc",
+                resolved.clone()
+            ),
+            vec![sock("10.107.14.83:443"), sock("1.1.1.1:443")],
+            "another module dials the public addresses and its own entries"
+        );
+        for module in [Some(&other), None] {
+            assert_eq!(
+                dialable(&allow, module, "relay.ffrwd.svc", resolved.clone()),
+                vec![sock("1.1.1.1:443")],
+                "a module no entry holds for dials the public addresses alone"
+            );
+        }
     }
 }

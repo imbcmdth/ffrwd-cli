@@ -21,9 +21,8 @@ use super::world_0191::node::exports::ffrwd::av::node as wit;
 use super::world_0191::node::ffrwd::av::{node_tick, node_types as nt, types as wt};
 use super::world_0191::node::NodeModule;
 use super::{
-    compile, component_exports, conv_0191, egress, engine, granted, has_export, interface, link,
-    wasi_ctx, wasm_err, world_0191, Host, Meta, Purpose, StreamInfo, TimeBase, Wants,
-    GPU_PORTS_EXPORT,
+    compile, component_exports, conv_0191, engine, has_export, interface, link, store_wasi,
+    wasm_err, world_0191, Host, Meta, Purpose, StreamInfo, TimeBase, Wants, GPU_PORTS_EXPORT,
 };
 use crate::node::{
     check_shape, Accepts, Anchor, AudioSpec, Binding, BoundStream, Clock, ColorSpec, Emission,
@@ -287,8 +286,7 @@ fn instantiate_node(module_path: &str, purpose: Purpose) -> Result<Instantiated>
     let component = compile(module_path)?;
     check_node_export(&component, module_path)?;
     let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
-    let policy = egress::net_policy()?;
-    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let (wasi, hooks) = store_wasi(module_path)?;
     let mut store = Store::new(
         engine(),
         Host {
@@ -298,7 +296,7 @@ fn instantiate_node(module_path: &str, purpose: Purpose) -> Result<Instantiated>
             nn_scope,
             models,
             http: WasiHttpCtx::new(),
-            hooks: egress::Hooks::new(policy),
+            hooks,
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),

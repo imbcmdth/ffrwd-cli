@@ -668,6 +668,7 @@ dependencies = [
  "ort",
  "rustls",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "wasi-webgpu-wasmtime",

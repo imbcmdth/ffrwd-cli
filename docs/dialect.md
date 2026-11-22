@@ -902,6 +902,27 @@ is. The list only widens `public`: an unrestricted network ignores it,
 and `public` with the variable unset or empty is unchanged. The hosted
 runner sets it to the relays a live job publishes to and reads from.
 
+An entry may end in `@sha256:` and the 64 lowercase hex digits of a
+module's sha256, as `sha256sum` prints them:
+`ffrwd-pro-relay-ingress.ffrwd.svc@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08`.
+Such an entry lets through only the module whose wasm file, the file
+its grant names, has that sha256; to every other module the entry is
+absent. One target may appear in several entries, one per module. An
+entry without a digest lets every module through. Socket connects and
+sends, and HTTP requests, are checked alike. The sidecar hashes a
+module's file once, when it loads it, and only when some entry carries
+a digest. A refusal under such a list prints the refused module's
+sha256. Anything after the `@` other than `sha256:` and 64 lowercase
+hex digits is an error at startup.
+
+Every module's environment holds the host's variables whose names begin
+with `FFRWD_MODULE_`, names and values unchanged, and no other
+variable. A module reads them through `wasi:cli/environment`
+(`std::env::var` in Rust). They are how the host hands every module a
+setting the query cannot change: a module's arguments come from the
+query, its environment from the host. An `FFRWD_MODULE_` variable whose
+name or value is not text is an error at startup.
+
 `private` is a boolean, false when absent: true publishes each version
 private -- installable with a token from the namespace, off the public
 index. A version's visibility is stamped when it is published and never

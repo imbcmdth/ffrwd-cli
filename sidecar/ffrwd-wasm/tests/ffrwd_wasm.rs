@@ -123,9 +123,19 @@ impl FfrwdWasmRun {
 /// Runs `ffrwd-wasm` with the given argv (everything after the binary name),
 /// feeding `stdin_bytes` and collecting stdout/stderr.
 fn run_ffrwd_wasm(args: &[&str], stdin_bytes: &[u8]) -> FfrwdWasmRun {
+    run_ffrwd_wasm_with_env(args, &[], stdin_bytes)
+}
+
+/// [`run_ffrwd_wasm`] with `vars` set in the sidecar's environment.
+fn run_ffrwd_wasm_with_env(
+    args: &[&str],
+    vars: &[(&str, &str)],
+    stdin_bytes: &[u8],
+) -> FfrwdWasmRun {
     let exe = env!("CARGO_BIN_EXE_ffrwd-wasm");
     let mut cmd = Command::new(exe);
     cmd.args(args)
+        .envs(vars.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3624,6 +3634,79 @@ fn an_http_module_posts_each_row_under_its_grant() {
     let mut expected = vec![rect_row(0, 0, 2, 2), rect_row(4, 4, 2, 2)];
     expected.sort();
     assert_eq!(bodies, expected, "one POST per row, the row as the body");
+}
+
+/// The sha256 of the file at `path`, as sha256sum prints it.
+fn sha256_hex(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    format!("{:x}", Sha256::digest(&bytes))
+}
+
+#[test]
+fn an_allow_entry_naming_a_module_lets_that_module_alone_through_public() {
+    ensure_modules_built();
+    let module = module_path("post_rows");
+    let module_str = module.to_str().expect("module path is valid UTF-8");
+    let own = sha256_hex(&module);
+    let other = sha256_hex(&module_path("invert"));
+
+    for (digest, reaches) in [(&own, true), (&other, false)] {
+        let (url, received) = collecting_endpoint();
+        let params = format!(r#"{{"url":"{url}"}}"#);
+        let allow = format!("127.0.0.1@sha256:{digest}");
+        let run = run_ffrwd_wasm_with_env(
+            &[
+                "-http",
+                module_str,
+                "-f",
+                "nut",
+                "-i",
+                "-",
+                "-annotations",
+                "in",
+                "-m",
+                module_str,
+                "-params",
+                &params,
+                "-f",
+                "null",
+                "-",
+            ],
+            &[
+                ("FFRWD_NET_POLICY", "public"),
+                ("FFRWD_REACH_ALLOW", &allow),
+            ],
+            &annotated_nut_stream(&[(synthetic_frame(0), vec![rect_row(0, 0, 2, 2)])]),
+        );
+        if reaches {
+            assert_run_ok(&run, "post_rows under an entry naming its sha256");
+            assert_eq!(
+                received.try_iter().collect::<Vec<_>>(),
+                vec![rect_row(0, 0, 2, 2)],
+                "the row reached the endpoint"
+            );
+        } else {
+            assert!(
+                !run.success(),
+                "an entry naming another module's sha256 let post_rows reach 127.0.0.1"
+            );
+            assert!(
+                run.stderr.contains("refused http request to 127.0.0.1")
+                    && run
+                        .stderr
+                        .contains(&format!("this module's sha256 is {own}")),
+                "expected the refusal to give the module's sha256, got:\n{}",
+                run.stderr
+            );
+            assert_eq!(
+                received.try_iter().count(),
+                0,
+                "nothing reached the endpoint"
+            );
+        }
+    }
 }
 
 // A module written in Go, built with TinyGo for wasm32-wasip2: a node of the

@@ -80,7 +80,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use wasmtime::component::{Component, HasSelf, Linker, Resource, ResourceTable};
-use wasmtime::{Engine, Store};
+use wasmtime::{CodeBuilder, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 use wasmtime_wasi_nn::wit::{WasiNnCtx, WasiNnView};
@@ -2438,18 +2438,25 @@ pub fn any_gpu_granted() -> bool {
         .is_ok_and(|table| table.values().any(|grants| grants.gpu))
 }
 
-/// The store's WASI context: no preopens, no env, no args; stderr passes
-/// through. The network is reachable only for a module granted `-udp`, and
-/// One protocol per grant: inherit_network opens only the address check,
-/// and each protocol stays refused until it is allowed by name, so a module
-/// granted `-udp` cannot open a TCP socket and one granted `-tcp` cannot
-/// send a datagram. Name resolution is allowed by neither. Under the public
-/// policy the address check refuses non-public destinations the allow list
-/// does not hold; binds, listens and accepts stay open, since only where
-/// traffic goes is policed.
-fn wasi_ctx(effects: Grants, policy: NetPolicy) -> WasiCtx {
+/// The store's WASI context: no preopens, no args, `env` as the
+/// environment; stderr passes through. The network is reachable only for a
+/// module granted `-udp` or `-tcp`, one protocol per grant: inherit_network
+/// opens only the address check, and each protocol stays refused until it is
+/// allowed by name, so a module granted `-udp` cannot open a TCP socket and
+/// one granted `-tcp` cannot send a datagram. Name resolution is allowed by
+/// neither. Under the public policy the address check refuses non-public
+/// destinations no allow-list entry holding for `module`, the sha256 of the
+/// module's wasm file, holds; binds, listens and accepts stay open, since
+/// only where traffic goes is policed.
+fn wasi_ctx(
+    effects: Grants,
+    policy: NetPolicy,
+    module: Option<egress::Digest>,
+    env: &[(String, String)],
+) -> WasiCtx {
     let mut builder = WasiCtx::builder();
     builder.inherit_stderr();
+    builder.envs(env);
     if effects.sockets() {
         match policy {
             NetPolicy::Unrestricted => {
@@ -2457,7 +2464,9 @@ fn wasi_ctx(effects: Grants, policy: NetPolicy) -> WasiCtx {
             }
             NetPolicy::Public(allow) => {
                 builder.socket_addr_check(move |addr, reason| {
-                    Box::pin(async move { egress::check_socket_addr(allow, addr, reason) })
+                    Box::pin(async move {
+                        egress::check_socket_addr(allow, module.as_ref(), addr, reason)
+                    })
                 });
             }
         }
@@ -2465,6 +2474,55 @@ fn wasi_ctx(effects: Grants, policy: NetPolicy) -> WasiCtx {
         builder.allow_tcp(effects.tcp);
     }
     builder.build()
+}
+
+/// The WASI context and the wasi:http hooks of a store running the module
+/// at `module_path`: its grants, the process's policy, its digest when the
+/// allow list names modules by one, and the host's `FFRWD_MODULE_*`
+/// variables.
+fn store_wasi(module_path: &str) -> Result<(WasiCtx, egress::Hooks)> {
+    let policy = egress::net_policy()?;
+    let module = module_digest(module_path)?;
+    let wasi = wasi_ctx(granted(module_path)?, policy, module, module_env()?);
+    Ok((wasi, egress::Hooks::new(policy, module)))
+}
+
+/// The prefix of the host variables every module's environment receives.
+const MODULE_ENV_PREFIX: &str = "FFRWD_MODULE_";
+
+/// The host's `FFRWD_MODULE_*` variables, read from the environment once:
+/// what every module's WASI environment holds.
+pub fn module_env() -> Result<&'static [(String, String)]> {
+    static ENV: OnceLock<std::result::Result<Vec<(String, String)>, String>> = OnceLock::new();
+    match ENV.get_or_init(|| module_vars(std::env::vars_os()).map_err(|e| e.to_string())) {
+        Ok(vars) => Ok(vars),
+        Err(message) => Err(anyhow!(message.clone())),
+    }
+}
+
+/// The variables among `vars` whose names begin with `FFRWD_MODULE_`, names
+/// and values unchanged. One that is not unicode is an error.
+fn module_vars(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Result<Vec<(String, String)>> {
+    let mut picked = Vec::new();
+    for (name, value) in vars {
+        if !name
+            .as_encoded_bytes()
+            .starts_with(MODULE_ENV_PREFIX.as_bytes())
+        {
+            continue;
+        }
+        let (Some(name_text), Some(value)) = (name.to_str(), value.to_str()) else {
+            bail!(
+                "{} is not unicode, and a module's environment is text: set it to text or \
+                 unset it",
+                name.to_string_lossy()
+            );
+        };
+        picked.push((name_text.to_string(), value.to_string()));
+    }
+    Ok(picked)
 }
 
 /// Why a component is being instantiated. Reading what it publishes needs no
@@ -2614,10 +2672,18 @@ fn engine() -> &'static Engine {
     ENGINE.get_or_init(Engine::default)
 }
 
+/// A compiled component, and the sha256 of the wasm file it was compiled
+/// from when the allow list names modules by digest.
+#[derive(Clone)]
+struct Loaded {
+    component: Component,
+    digest: Option<egress::Digest>,
+}
+
 /// Compiled components, keyed by canonical path. Compilation is expensive and
 /// `Component` is cheap to clone.
-fn component_cache() -> &'static Mutex<HashMap<PathBuf, Component>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Component>>> = OnceLock::new();
+fn component_cache() -> &'static Mutex<HashMap<PathBuf, Loaded>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Loaded>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2629,20 +2695,44 @@ fn canonical(module_path: &str) -> PathBuf {
 }
 
 fn compile(module_path: &str) -> Result<Component> {
+    load(module_path).map(|loaded| loaded.component)
+}
+
+/// The sha256 of the wasm file `module_path` was compiled from, when the
+/// allow list names modules by digest; `None` otherwise.
+fn module_digest(module_path: &str) -> Result<Option<egress::Digest>> {
+    load(module_path).map(|loaded| loaded.digest)
+}
+
+/// Reads the wasm file at `module_path` once, compiles it, and hashes the
+/// same bytes when the allow list names modules by digest.
+fn load(module_path: &str) -> Result<Loaded> {
     let key = canonical(module_path);
 
     let mut cache = component_cache()
         .lock()
         .map_err(|_| anyhow!("component cache poisoned"))?;
-    if let Some(component) = cache.get(&key) {
-        return Ok(component.clone());
+    if let Some(loaded) = cache.get(&key) {
+        return Ok(loaded.clone());
     }
 
-    let component = Component::from_file(engine(), &key)
+    let context = || format!("loading WASM component {module_path}");
+    let bytes = std::fs::read(&key).with_context(context)?;
+    let mut builder = CodeBuilder::new(engine());
+    builder
+        .wasm_binary_or_text(&bytes, Some(&key))
         .map_err(wasm_err)
-        .with_context(|| format!("loading WASM component {module_path}"))?;
-    cache.insert(key, component.clone());
-    Ok(component)
+        .with_context(context)?;
+    let component = builder
+        .compile_component()
+        .map_err(wasm_err)
+        .with_context(context)?;
+    let digest = egress::net_policy()?
+        .names_modules()
+        .then(|| egress::sha256(&bytes));
+    let loaded = Loaded { component, digest };
+    cache.insert(key, loaded.clone());
+    Ok(loaded)
 }
 
 /// The component's exported interface names. No instantiation needed.
@@ -3694,8 +3784,7 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
 
     let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
-    let policy = egress::net_policy()?;
-    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let (wasi, hooks) = store_wasi(module_path)?;
     let mut store = Store::new(
         engine(),
         Host {
@@ -3705,7 +3794,7 @@ fn instantiate(module_path: &str, purpose: Purpose) -> Result<Opened> {
             nn_scope,
             models,
             http: WasiHttpCtx::new(),
-            hooks: egress::Hooks::new(policy),
+            hooks,
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
@@ -4147,8 +4236,7 @@ fn instantiate_values(
 
     let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
-    let policy = egress::net_policy()?;
-    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let (wasi, hooks) = store_wasi(module_path)?;
     let mut store = Store::new(
         engine(),
         Host {
@@ -4158,7 +4246,7 @@ fn instantiate_values(
             nn_scope,
             models,
             http: WasiHttpCtx::new(),
-            hooks: egress::Hooks::new(policy),
+            hooks,
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
@@ -4773,8 +4861,7 @@ fn instantiate_packet(
 
     let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
-    let policy = egress::net_policy()?;
-    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let (wasi, hooks) = store_wasi(module_path)?;
     let mut store = Store::new(
         engine(),
         Host {
@@ -4784,7 +4871,7 @@ fn instantiate_packet(
             nn_scope,
             models,
             http: WasiHttpCtx::new(),
-            hooks: egress::Hooks::new(policy),
+            hooks,
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
@@ -5242,8 +5329,7 @@ fn instantiate_packet_filter(
 
     let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
-    let policy = egress::net_policy()?;
-    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let (wasi, hooks) = store_wasi(module_path)?;
     let mut store = Store::new(
         engine(),
         Host {
@@ -5253,7 +5339,7 @@ fn instantiate_packet_filter(
             nn_scope,
             models,
             http: WasiHttpCtx::new(),
-            hooks: egress::Hooks::new(policy),
+            hooks,
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
@@ -5997,8 +6083,7 @@ fn instantiate_packet_source(
 
     let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
-    let policy = egress::net_policy()?;
-    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let (wasi, hooks) = store_wasi(module_path)?;
     let mut store = Store::new(
         engine(),
         Host {
@@ -6008,7 +6093,7 @@ fn instantiate_packet_source(
             nn_scope,
             models,
             http: WasiHttpCtx::new(),
-            hooks: egress::Hooks::new(policy),
+            hooks,
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
@@ -6370,8 +6455,7 @@ fn instantiate_data_filter(
 
     let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
-    let policy = egress::net_policy()?;
-    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let (wasi, hooks) = store_wasi(module_path)?;
     let mut store = Store::new(
         engine(),
         Host {
@@ -6381,7 +6465,7 @@ fn instantiate_data_filter(
             nn_scope,
             models,
             http: WasiHttpCtx::new(),
-            hooks: egress::Hooks::new(policy),
+            hooks,
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
@@ -6899,8 +6983,7 @@ fn instantiate_codec(
 
     let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
-    let policy = egress::net_policy()?;
-    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let (wasi, hooks) = store_wasi(module_path)?;
     let mut store = Store::new(
         engine(),
         Host {
@@ -6910,7 +6993,7 @@ fn instantiate_codec(
             nn_scope,
             models,
             http: WasiHttpCtx::new(),
-            hooks: egress::Hooks::new(policy),
+            hooks,
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
@@ -7585,8 +7668,7 @@ fn instantiate_rows_module(
 
     let (linker, nn, nn_scope, gpu, models) = link(&component, module_path, purpose)?;
 
-    let policy = egress::net_policy()?;
-    let wasi = wasi_ctx(granted(module_path)?, policy);
+    let (wasi, hooks) = store_wasi(module_path)?;
     let mut store = Store::new(
         engine(),
         Host {
@@ -7596,7 +7678,7 @@ fn instantiate_rows_module(
             nn_scope,
             models,
             http: WasiHttpCtx::new(),
-            hooks: egress::Hooks::new(policy),
+            hooks,
             gpu,
             gpu_tick: None,
             gpu_emitted: Vec::new(),
@@ -8467,13 +8549,13 @@ mod socket_grant_test {
 
     fn opened(grants: Grants, policy: NetPolicy) -> Host {
         Host {
-            wasi: wasi_ctx(grants, policy),
+            wasi: wasi_ctx(grants, policy, None, &[]),
             table: ResourceTable::new(),
             nn: nn::empty_ctx(),
             nn_scope: nn::Scope::default(),
             models: models::Files::default(),
             http: WasiHttpCtx::new(),
-            hooks: egress::Hooks::new(policy),
+            hooks: egress::Hooks::new(policy, None),
             gpu: StoreGpu::new(false),
             gpu_tick: None,
             gpu_emitted: Vec::new(),
@@ -8550,6 +8632,76 @@ mod socket_grant_test {
     }
 }
 
+// What a module's WASI environment holds, read back through the host side of
+// `wasi:cli/environment`.
+#[cfg(test)]
+mod module_env_test {
+    use super::*;
+    use std::ffi::OsString;
+    use wasmtime_wasi::cli::WasiCliCtxView;
+    use wasmtime_wasi::p2::bindings::cli::environment::Host as Environment;
+
+    fn os(vars: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        vars.iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect()
+    }
+
+    #[test]
+    fn a_module_sees_the_hosts_ffrwd_module_variables_and_no_others() {
+        let vars = module_vars(os(&[
+            ("PATH", "/usr/bin"),
+            ("FFRWD_MODULE_RELAY", "https://relay.ffrwd.svc:4443/anon"),
+            ("FFRWD_NET_POLICY", "public"),
+            ("ffrwd_module_lower", "not this one"),
+            ("FFRWD_MODULE_EMPTY", ""),
+            ("FFRWD_MODULES", "nor this one"),
+        ]))
+        .expect("all text");
+        let expected = vec![
+            (
+                "FFRWD_MODULE_RELAY".to_string(),
+                "https://relay.ffrwd.svc:4443/anon".to_string(),
+            ),
+            ("FFRWD_MODULE_EMPTY".to_string(), String::new()),
+        ];
+        assert_eq!(vars, expected);
+
+        let mut wasi = wasi_ctx(Grants::default(), NetPolicy::Unrestricted, None, &vars);
+        let mut table = ResourceTable::new();
+        let mut view = WasiCliCtxView {
+            ctx: wasi.cli(),
+            table: &mut table,
+        };
+        assert_eq!(
+            Environment::get_environment(&mut view).expect("the environment"),
+            expected,
+            "the module's environment is the picked variables, unchanged"
+        );
+    }
+
+    #[test]
+    fn a_module_variable_that_is_not_unicode_is_an_error_naming_it() {
+        #[cfg(unix)]
+        let value = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff, 0xfe])
+        };
+        #[cfg(windows)]
+        let value = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        let err =
+            module_vars([(OsString::from("FFRWD_MODULE_RELAY"), value)]).expect_err("not unicode");
+        let message = err.to_string();
+        assert!(
+            message.contains("FFRWD_MODULE_RELAY") && message.contains("set it to text"),
+            "expected the variable and the fix, got: {message}"
+        );
+    }
+}
+
 // Proves the network grant end to end through this module's own `link()` +
 // `wasi_ctx()` path, and that it is per module. The subject is a wasip2
 // command component (built by the spike workspace under spikes/quinn-wasi)
@@ -8579,13 +8731,13 @@ mod udp_grant_test {
         let mut store = Store::new(
             engine(),
             Host {
-                wasi: wasi_ctx(granted(&module_path)?, policy),
+                wasi: wasi_ctx(granted(&module_path)?, policy, None, &[]),
                 table: ResourceTable::new(),
                 nn,
                 nn_scope,
                 models,
                 http: WasiHttpCtx::new(),
-                hooks: egress::Hooks::new(policy),
+                hooks: egress::Hooks::new(policy, None),
                 gpu,
                 gpu_tick: None,
                 gpu_emitted: Vec::new(),
