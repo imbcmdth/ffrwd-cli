@@ -1373,6 +1373,8 @@ impl AvFilter {
             i64::try_from(base.num).unwrap_or(i64::MAX),
             i64::try_from(base.den).unwrap_or(i64::MAX),
         );
+        // Off Windows FilterFeed is Infallible, so the Some arm never runs.
+        #[cfg_attr(not(all(feature = "gpu", windows)), allow(unreachable_code))]
         let (device, feed) = match on_gpu.then(filter_device).flatten() {
             Some((device, feed)) => (Some(device), Some(feed)),
             None => (None, None),

@@ -550,7 +550,7 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "sqlglot" },
+    { name = "sqlglot", specifier = "<30.32" },
     { name = "static-ffmpeg" },
     { name = "termaid", marker = "extra == 'diagram'", specifier = ">=0.8" },
 ]
