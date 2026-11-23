@@ -171,6 +171,11 @@ impl Endpoint {
                 Ok("201 Created")
             }
             "DELETE" => {
+                // A body it declares is read and dropped: a socket closed with
+                // bytes unread is reset on Linux, and the answer with it.
+                if head.chunked || head.length.is_some() {
+                    head.copy_body(reader, &mut io::sink())?;
+                }
                 match fs::remove_file(&path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
