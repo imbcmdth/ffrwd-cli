@@ -1338,8 +1338,8 @@ impl PacketSourceNode {
         if self.beats.is_some() {
             return Ok(());
         }
-        // The count of a track's leading packets with no dts is its decode
-        // delay; a data track has none to count.
+        // A data track reorders nothing; every other track's decode delay is
+        // read off its first packets (`settled_delay`).
         for (slot, track) in self.catalog.tracks.iter().enumerate() {
             if track.stream.format == CodedFormat::Data {
                 self.delays[slot] = Some(0);
@@ -1353,16 +1353,20 @@ impl PacketSourceNode {
                 break;
             };
             for (slot, packets) in pads.into_iter().enumerate() {
-                for packet in packets {
-                    if self.delays[slot].is_none() && packet.dts.is_some() {
-                        self.delays[slot] = Some(pending[slot].len() as u32);
-                    }
-                    pending[slot].push(packet);
+                pending[slot].extend(packets);
+                if self.delays[slot].is_none() {
+                    self.delays[slot] = settled_delay(&pending[slot]);
                 }
             }
         }
         for (slot, delay) in self.delays.iter_mut().enumerate() {
-            delay.get_or_insert(pending[slot].len() as u32);
+            // A track that ended first: its unsettled packets are its delay,
+            // and one that settled its first dts reorders nothing it showed.
+            let leading = pending[slot]
+                .iter()
+                .take_while(|one| one.dts.is_none())
+                .count();
+            delay.get_or_insert(leading as u32);
         }
         self.beats = Some(SourceBeats::new(&self.catalog.tracks, &pending));
         self.settled = Some(pending);
@@ -1526,5 +1530,83 @@ impl SourceBeats {
             *packets = placed;
         }
         pads
+    }
+}
+
+/// A track's decode delay from its first packets, as an output's NUT
+/// header carries it, or None while they do not settle it yet. NUT carries
+/// no dts, and a reader works each back out of the pts through a reorder
+/// buffer this deep, so a delay too shallow loses the dts of every
+/// reordered frame on the way.
+///
+/// A source that leaves its first packets with no dts, as ffmpeg's demuxers
+/// do, reorders by as many as it leaves. One that gives every packet its
+/// dts, as a fragmented MP4 track does, reorders by as many frames as its
+/// first packet's pts leads its dts: an encoder that reorders starts its
+/// decode times that many frames early. A frame is the step between the
+/// first two decode times, so a first packet that leads waits for the
+/// second.
+pub(crate) fn settled_delay(packets: &[Packet]) -> Option<u32> {
+    let first = packets.iter().position(|one| one.dts.is_some())?;
+    if first > 0 {
+        return Some(first as u32);
+    }
+    let opening = &packets[0];
+    let lead = opening.pts - opening.dts.expect("found above");
+    if lead <= 0 {
+        return Some(0);
+    }
+    let next = packets[1..].iter().find_map(|one| one.dts)?;
+    let step = next - opening.dts.expect("found above");
+    if step <= 0 {
+        return Some(0);
+    }
+    Some(((lead + step - 1) / step).min(i64::from(u32::MAX)) as u32)
+}
+
+#[cfg(test)]
+mod settled_delay_tests {
+    use super::*;
+
+    fn packet(pts: i64, dts: Option<i64>) -> Packet {
+        Packet {
+            pts,
+            dts,
+            duration: None,
+            keyframe: false,
+            data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn leading_packets_with_no_dts_are_the_delay() {
+        let packets = [packet(0, None), packet(3, None), packet(1, Some(-2))];
+        assert_eq!(settled_delay(&packets), Some(2));
+        assert_eq!(settled_delay(&packets[..2]), None);
+    }
+
+    #[test]
+    fn a_track_that_reorders_nothing_settles_on_its_first_packet() {
+        assert_eq!(settled_delay(&[packet(100, Some(100))]), Some(0));
+    }
+
+    #[test]
+    fn a_track_with_every_dts_reorders_by_its_first_packets_lead() {
+        // x264 with B-frames, as a fragmented MP4 track carries it: the
+        // keyframe at pts 6144 decodes two 2048-tick frames early.
+        let opening = packet(6144, Some(2048));
+        assert_eq!(settled_delay(&[opening.clone()]), None);
+        let packets = [
+            opening,
+            packet(14336, Some(4096)),
+            packet(10240, Some(6144)),
+        ];
+        assert_eq!(settled_delay(&packets), Some(2));
+    }
+
+    #[test]
+    fn a_lead_that_is_not_whole_frames_rounds_up() {
+        let packets = [packet(100, Some(0)), packet(300, Some(64))];
+        assert_eq!(settled_delay(&packets), Some(2));
     }
 }

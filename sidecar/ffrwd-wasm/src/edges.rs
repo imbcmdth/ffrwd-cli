@@ -534,12 +534,29 @@ fn time_of(out: &Out) -> Option<i64> {
     }
 }
 
+/// How many items an output holds back, waiting for a coded stream's first
+/// packets to say how deep it reorders, before it writes its header as it
+/// was given.
+const SETTLE_HELD: usize = 4096;
+/// The most packets of one stream it waits through for a dts: ffmpeg's own
+/// bound on how deep a stream reorders.
+const SETTLE_PACKETS: usize = 16;
+
 /// `live` where something reads the output as it is written, which is who
 /// a data stream's heartbeats are for; a file is read once it is whole, and
 /// carries the messages alone.
+///
+/// A coded stream whose header says it reorders nothing may be one its
+/// producer could not say of: a node module's packets output carries no
+/// decode delay, and its packets carry the dts the delay comes from. NUT
+/// carries no dts, and a reader works each back out of the pts through a
+/// reorder buffer of the header's depth, so a stream that reorders under a
+/// header of 0 loses its reordered frames' dts on the way. The header is
+/// held back until such a stream's first packets settle its delay
+/// (`adapters::settled_delay`), or it ends, and then written with it.
 fn write_nut<W: Write>(
     writer: W,
-    streams: Vec<nut::Stream>,
+    mut streams: Vec<nut::Stream>,
     live: bool,
     queue: &Queue,
     wake: &dyn Fn(),
@@ -563,7 +580,13 @@ fn write_nut<W: Write>(
             ended: false,
         })
         .collect();
-    let mut muxer = nut::Muxer::with_streams(writer, &streams).context("writing the NUT header")?;
+    let mut unsettled: Vec<bool> = streams
+        .iter()
+        .map(|s| s.codec_name().is_some() && !s.is_json() && s.decode_delay == 0)
+        .collect();
+    let mut first: Vec<Vec<Packet>> = streams.iter().map(|_| Vec::new()).collect();
+    let mut writer = Some(writer);
+    let mut muxer: Option<nut::Muxer<W>> = None;
     while !tracks.iter().all(|t| t.ended && t.held.is_empty()) {
         let Some((stream, out)) = next(queue, wake) else {
             break;
@@ -572,11 +595,45 @@ fn write_nut<W: Write>(
         if let Some(time) = time_of(&out) {
             track.settled = Some(track.settled.map_or(time, |s| s.max(time)));
         }
+        if unsettled[stream] {
+            match &out {
+                Out::Packet(packet) => {
+                    // Its times alone: the bytes are held to be written.
+                    first[stream].push(Packet {
+                        pts: packet.pts,
+                        dts: packet.dts,
+                        duration: None,
+                        keyframe: packet.keyframe,
+                        data: Vec::new(),
+                    });
+                    if let Some(delay) = crate::adapters::settled_delay(&first[stream]) {
+                        streams[stream].decode_delay = u64::from(delay);
+                        unsettled[stream] = false;
+                    } else if first[stream].len() > SETTLE_PACKETS {
+                        // Past any depth NUT carries with no dts yet: its
+                        // producer gives none, and the header stands.
+                        unsettled[stream] = false;
+                    }
+                }
+                Out::End => unsettled[stream] = false,
+                _ => {}
+            }
+        }
         match out {
             Out::End => track.ended = true,
             Out::Batch | Out::Trailing(_) => {}
             out => track.held.push_back(out),
         }
+        if muxer.is_none() {
+            let held: usize = tracks.iter().map(|t| t.held.len()).sum();
+            if unsettled.iter().any(|&u| u) && held < SETTLE_HELD {
+                continue;
+            }
+            let out = writer.take().expect("taken once");
+            muxer =
+                Some(nut::Muxer::with_streams(out, &streams).context("writing the NUT header")?);
+        }
+        let muxer = muxer.as_mut().expect("opened above");
         while let Some(index) = writable(&tracks) {
             let out = tracks[index]
                 .held
@@ -588,9 +645,27 @@ fn write_nut<W: Write>(
                 tracks[index].base.num,
                 tracks[index].base.den
             );
-            write_one(&mut muxer, index, &mut tracks[index], out, live)?;
+            write_one(muxer, index, &mut tracks[index], out, live)?;
         }
     }
+    let mut muxer = match muxer {
+        Some(muxer) => muxer,
+        // The input ended before a stream settled: what was held goes out
+        // now, under the header as it stands.
+        None => {
+            let out = writer.take().expect("not taken yet");
+            let mut muxer =
+                nut::Muxer::with_streams(out, &streams).context("writing the NUT header")?;
+            while let Some(index) = writable(&tracks) {
+                let out = tracks[index]
+                    .held
+                    .pop_front()
+                    .expect("writable has one held");
+                write_one(&mut muxer, index, &mut tracks[index], out, live)?;
+            }
+            muxer
+        }
+    };
     muxer.finish()?;
     Ok(muxer.into_inner())
 }
@@ -734,5 +809,140 @@ pub fn spawn_sink(
     Writer {
         queue,
         handle: Some(handle),
+    }
+}
+
+#[cfg(test)]
+mod settled_header_tests {
+    use super::*;
+
+    fn h264(decode_delay: u64) -> nut::Stream {
+        nut::Stream::coded_fourcc(
+            "video",
+            b"H264",
+            (64, 64),
+            nut::TimeBase { num: 1, den: 90000 },
+            Vec::new(),
+            decode_delay,
+        )
+        .expect("H264 is a coded tag")
+    }
+
+    fn packet(pts: i64, dts: i64, keyframe: bool) -> Out {
+        Out::Packet(Packet {
+            pts,
+            dts: Some(dts),
+            duration: Some(3000),
+            keyframe,
+            data: vec![0, 0, 0, 1, 0x65],
+        })
+    }
+
+    /// A node module's packets, two B-frames deep, each with its dts, under
+    /// a header that says they reorder nothing.
+    fn written(header: nut::Stream) -> (nut::Stream, Vec<(i64, Option<i64>)>) {
+        let queue = Queue {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        // Presentation 0, 9000, 3000, 6000, 18000, 12000, 15000; decode
+        // starts two frames early.
+        let times = [
+            (0, -6000),
+            (9000, -3000),
+            (3000, 0),
+            (6000, 3000),
+            (18000, 6000),
+        ];
+        for (index, (pts, dts)) in times.into_iter().enumerate() {
+            queue.push(0, packet(pts, dts, index == 0));
+        }
+        queue.push(0, Out::End);
+        let bytes = write_nut(Vec::new(), vec![header], false, &queue, &|| {})
+            .expect("the output is written");
+        let mut demuxer = PushDemuxer::new(Limits::default());
+        demuxer.feed(&bytes);
+        demuxer.finish();
+        let mut read = Vec::new();
+        while let Some(event) = demuxer.next_event().expect("the output reads back") {
+            match event {
+                Event::Frame { packet, .. } => read.push((packet.pts, packet.dts)),
+                Event::EndOfInput => break,
+                _ => {}
+            }
+        }
+        (demuxer.stream(0).expect("one stream").clone(), read)
+    }
+
+    #[test]
+    fn a_stream_that_reorders_under_a_header_of_none_is_written_with_its_depth() {
+        let (stream, read) = written(h264(0));
+        assert_eq!(stream.decode_delay, 2);
+        assert_eq!(
+            read,
+            [
+                (0, None),
+                (9000, None),
+                (3000, Some(0)),
+                (6000, Some(3000)),
+                (18000, Some(6000))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_header_that_states_a_depth_is_written_as_it_was_given() {
+        let (stream, _) = written(h264(3));
+        assert_eq!(stream.decode_delay, 3);
+    }
+}
+
+#[cfg(test)]
+mod unsettled_header_tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_whose_packets_carry_no_dts_is_written_under_its_header() {
+        let queue = Queue {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        for index in 0..20 {
+            queue.push(
+                0,
+                Out::Packet(Packet {
+                    pts: index * 1024,
+                    dts: None,
+                    duration: None,
+                    keyframe: true,
+                    data: vec![1],
+                }),
+            );
+        }
+        queue.push(0, Out::End);
+        let header = nut::Stream::coded_fourcc(
+            "audio",
+            b"mp4a",
+            (48000, 2),
+            nut::TimeBase { num: 1, den: 48000 },
+            Vec::new(),
+            0,
+        )
+        .expect("mp4a is a coded tag");
+        let bytes = write_nut(Vec::new(), vec![header], false, &queue, &|| {})
+            .expect("the output is written");
+        let mut demuxer = PushDemuxer::new(Limits::default());
+        demuxer.feed(&bytes);
+        demuxer.finish();
+        let mut frames = 0;
+        while let Some(event) = demuxer.next_event().expect("the output reads back") {
+            match event {
+                Event::Frame { .. } => frames += 1,
+                Event::EndOfInput => break,
+                _ => {}
+            }
+        }
+        assert_eq!(frames, 20);
+        assert_eq!(demuxer.stream(0).expect("one stream").decode_delay, 0);
     }
 }
