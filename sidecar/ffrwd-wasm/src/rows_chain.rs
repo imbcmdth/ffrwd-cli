@@ -1,6 +1,6 @@
 //! A chain of rows modules riding alongside a producer, each one `-m <path>
 //! -rows-from <index>` on the argv named. The rows a rows-bearing output
-//! would have written - `-f ndjson`, `-f srt` or `-f webvtt` - flow through
+//! would have written - `-f ndjson`, `-f srt`, `-f webvtt` or `-f webm` - flow through
 //! the hops between that output's own rows and the frames they were read
 //! off, producer first, and what the last hop returns is what the output
 //! actually gets. One line may write several such outputs, each with its own

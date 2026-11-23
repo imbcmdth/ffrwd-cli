@@ -76,7 +76,7 @@ const ROWS_FORMAT: &str = "ndjson";
 /// The one data codec the wire carries: a message is one UTF-8 JSON object.
 const DATA_CODEC: &str = runtime::DATA_CODEC;
 /// The `-f` values an output may carry, for a refusal listing them.
-const OUTPUT_FORMATS: [&str; 5] = [EDGE_FORMAT, ROWS_FORMAT, "srt", "webvtt", "null"];
+const OUTPUT_FORMATS: [&str; 6] = [EDGE_FORMAT, ROWS_FORMAT, "srt", "webvtt", "webm", "null"];
 /// The WIT package a module targets; identifies which host generation built
 /// this binary, independent of any one module's own name and version. Modules
 /// built against an older world load through an adapter.
@@ -1213,6 +1213,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args> {
                     ROWS_FORMAT => OutputKind::Rows,
                     "srt" => OutputKind::Subtitles(subtitles::Format::Srt),
                     "webvtt" => OutputKind::Subtitles(subtitles::Format::WebVtt),
+                    "webm" => OutputKind::Subtitles(subtitles::Format::WebM),
                     "null" => OutputKind::Null,
                     other => bail!(
                         "-f {other}: only {} are supported for output",
@@ -2024,9 +2025,9 @@ fn stamp_row(row: &str, pts: i64, time_base: nut::TimeBase) -> String {
     format!("{body}{separator}{}}}", added.join(","))
 }
 
-/// A subtitle output: where the document goes, and the cues gathered for it so
-/// far. A cue's end time is its own, so the whole document is written when the
-/// stream ends rather than a cue at a time.
+/// A subtitle output: where the cues go, and what has been made of them so
+/// far. A document's cues are written whole when the stream ends; a stream's
+/// go out as their rows arrive, after a header written when it opens.
 ///
 /// Generic only so a test can hand it a writer that records whether it was
 /// dropped; production code always gets the default, `RowOutput`.
@@ -2036,15 +2037,38 @@ struct SubtitleOutput<W: Write = RowOutput> {
     /// before it counts that input open, so a finished document whose writer
     /// stays open blocks every input after it.
     writer: Option<W>,
-    document: subtitles::Document,
+    cues: subtitles::Writer,
     /// The output as it was spelled, for a refusal that names it.
     spelling: String,
 }
 
 impl<W: Write> SubtitleOutput<W> {
+    fn open(writer: W, format: subtitles::Format, spelling: String) -> Result<Self> {
+        let mut output = SubtitleOutput {
+            writer: Some(writer),
+            cues: subtitles::Writer::new(format),
+            spelling,
+        };
+        let opening = output.cues.open();
+        output.write(&opening)?;
+        Ok(output)
+    }
+
     fn push(&mut self, rows: &[String]) -> Result<()> {
         for row in rows {
-            self.document.push_row(row, &self.spelling)?;
+            let block = self.cues.push_row(row, &self.spelling)?;
+            self.write(&block)?;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if let Some(writer) = self.writer.as_mut() {
+            writer.write_all(bytes)?;
+            writer.flush()?;
         }
         Ok(())
     }
@@ -2055,7 +2079,7 @@ impl<W: Write> SubtitleOutput<W> {
         let Some(mut writer) = self.writer.take() else {
             return Ok(());
         };
-        writer.write_all(self.document.render().as_bytes())?;
+        writer.write_all(&self.cues.finish())?;
         writer.flush()?;
         drop(writer);
         Ok(())
@@ -2080,9 +2104,9 @@ struct Sink {
     /// writes.
     time_base: nut::TimeBase,
     /// The rows module chain this sink's rows flow through before they are
-    /// written, when one is riding this process - a `-f ndjson`, `-f srt`
-    /// or `-f webvtt` output only, and never the edge (`self.frames`)
-    /// output's own annotation stream.
+    /// written, when one is riding this process - a `-f ndjson`, `-f srt`,
+    /// `-f webvtt` or `-f webm` output only, and never the edge
+    /// (`self.frames`) output's own annotation stream.
     rows_chain: Option<rows_chain::RowsChain>,
 }
 
@@ -2127,11 +2151,11 @@ impl Sink {
             }
             OutputKind::Rows => sink.rows = Some(RowOutput::open(&output.path)?),
             OutputKind::Subtitles(format) => {
-                sink.subtitles = Some(SubtitleOutput {
-                    writer: Some(RowOutput::open(&output.path)?),
-                    document: subtitles::Document::new(format),
-                    spelling: output.spelling.clone(),
-                });
+                sink.subtitles = Some(SubtitleOutput::open(
+                    RowOutput::open(&output.path)?,
+                    format,
+                    output.spelling.clone(),
+                )?);
             }
             // A null output opens nothing: the monotonic-pts check still runs.
             OutputKind::Null => {}
@@ -2294,7 +2318,7 @@ fn rows_hops(source: usize, specs: &[RowsModuleSpec]) -> Vec<String> {
 /// One sink per output, each bound to the node it writes and opened against
 /// that node's stream header.
 ///
-/// A rows-bearing output (`-f ndjson`, `-f srt` or `-f webvtt`) holds the
+/// A rows-bearing output (`-f ndjson`, `-f srt`, `-f webvtt` or `-f webm`) holds the
 /// rows its own `-rows` names, flowing through the hops between that module
 /// and the frames they were read off. Without a `-rows` it holds the rows of
 /// the node it maps -- except on a line writing ONE rows document, where it
@@ -2309,8 +2333,8 @@ fn open_sinks(
     let rows_bearing = args.outputs.iter().filter(|o| o.rows_bearing()).count();
     if !args.rows_chain.is_empty() && rows_bearing == 0 {
         bail!(
-            "a rows module chains onto -f ndjson, srt or webvtt, and this line writes none of \
-             those"
+            "a rows module chains onto -f ndjson, srt, webvtt or webm, and this line writes \
+             none of those"
         );
     }
     let whole: Vec<String> = args
@@ -4997,7 +5021,7 @@ mod stream_field_tests {
 
 #[cfg(test)]
 mod subtitle_output_tests {
-    use super::subtitles::{Document, Format};
+    use super::subtitles::Format;
     use super::SubtitleOutput;
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -5024,11 +5048,12 @@ mod subtitle_output_tests {
     #[test]
     fn finish_drops_the_writer_instead_of_holding_it_open() {
         let closed = Arc::new(AtomicBool::new(false));
-        let mut output = SubtitleOutput {
-            writer: Some(TrackedWriter(Arc::clone(&closed))),
-            document: Document::new(Format::WebVtt),
-            spelling: "sub.vtt".to_string(),
-        };
+        let mut output = SubtitleOutput::open(
+            TrackedWriter(Arc::clone(&closed)),
+            Format::WebVtt,
+            "sub.vtt".to_string(),
+        )
+        .expect("a document opens with nothing to write");
         output.finish().expect("finish renders and closes");
         assert!(
             closed.load(Ordering::SeqCst),

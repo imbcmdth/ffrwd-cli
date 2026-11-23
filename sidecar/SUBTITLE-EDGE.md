@@ -13,9 +13,12 @@ the same encoder writing Matroska keeps `duration=2000`, and writing NUT
 gives `duration=N/A`. Round-tripped back out, every cue ends where it
 starts.
 
-So subtitles do not ride the NUT edge. The sidecar gathers the cue rows -
-they are all known by the end of the stream - and writes a finished subtitle
-document to an output of its own.
+So subtitles do not ride the NUT edge. They go to an output of their own,
+in one of two forms. A document (`srt`, `webvtt`) gathers the cue rows and
+is written whole when the stream ends. ffmpeg reads such a file to its end
+before it opens the inputs after it, so a stream that never ends needs the
+other form: `webm`, WebVTT in WebM, each cue written the moment its row
+arrives, its end time in the block, which ffmpeg reads as it goes.
 
 ## The argv
 
@@ -25,6 +28,13 @@ it writes, exactly as an `-f nut` or `-f ndjson` output does. `-` and
 
     -map [out0] -f srt    subs.srt
     -map [out0] -f webvtt subs.vtt
+    -map [out0] -f webm   pipe:3
+
+A `webm` output writes its header when it opens, before any cue, so its
+reader can open it while the cues are still to come. The header names one
+track, `D_WEBVTT/SUBTITLES`, in a segment of unknown size; each cue is a
+cluster of its own, its block's data the cue's empty identifier and settings
+lines and then its text, its duration the cue's, in milliseconds.
 
 The rows output that already exists is spelled the same way, and writes one
 NDJSON line per row as the rows arrive:
@@ -63,7 +73,22 @@ A cue row is a JSON object with all three of:
     end_t    number, seconds from the start of the stream
     text     string
 
-Cues are written in the order the rows arrive, numbered from 1. A row object
+and two it may carry:
+
+    final    boolean, false for an utterance still growing
+    voice    string, who says the cue
+
+Only a finished cue is written: a row whose `final` is false is sent again
+as its utterance grows, and its earlier forms would be cues that overlap. A
+row with no `final` is a finished cue. A row's `voice` marks the cue in
+WebVTT as `<v Name>`; SRT has no such mark and writes the text alone. In
+WebVTT a cue's `&`, `<` and `>` are written as character references, and a
+blank line inside it, which would end the cue, is dropped.
+
+A document's cues are written in the order the rows arrive, numbered from 1.
+A `webm` stream's go out in the order they start, since its reader takes
+each as the next packet: a cue whose row arrives after a later cue's starts
+where that one did, and one that ended by then is dropped. A row object
 carrying none of the three names is skipped: that is the other arm of a
 module's `oneOf` rows schema, such as transcribe's trailing
 `{"transcript": ...}`. A row carrying some of them but not all, or one whose
@@ -77,6 +102,9 @@ an input and encodes it into the container:
 
     ffmpeg -i video.mp4 -i subs.srt -c:v copy -c:a copy \
       -c:s mov_text -metadata:s:s:0 language=eng out.mp4
+
+A `webm` stream is an input too, `-f webm -i <pipe>`, and an hls destination
+copies its cues into the WebVTT segments it cuts.
 
 The language tag is the compiler's to write; the sidecar does not put one in
 the document.

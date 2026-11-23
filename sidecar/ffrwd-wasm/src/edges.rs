@@ -201,7 +201,8 @@ pub enum Target {
     /// One data label, a message per line, stamped with its time in the
     /// label's time base where it has one.
     Ndjson(Option<TimeBase>),
-    /// One data label of cues, written whole once it ends.
+    /// One data label of cues: a document written whole once it ends, or a
+    /// stream written cue by cue.
     Subtitles(subtitles::Format),
     Null,
 }
@@ -431,18 +432,30 @@ fn write_all(
             Ok(writer.into_inner().map_err(|e| e.into_error())?)
         }
         Target::Subtitles(format) => {
-            let mut document = subtitles::Document::new(format);
+            let mut cues = subtitles::Writer::new(format);
+            let mut writer = writer;
+            // A stream's header goes out before any cue, so its reader can
+            // open it while the cues are still to come.
+            let opening = cues.open();
+            if !opening.is_empty() {
+                writer.write_all(&opening)?;
+                writer.flush()?;
+            }
             while let Some((_, out)) = next(queue, wake) {
                 match out {
                     Out::Message(m) => {
-                        document.push_row(&String::from_utf8_lossy(&m.data), format.name())?
+                        let block =
+                            cues.push_row(&String::from_utf8_lossy(&m.data), format.name())?;
+                        if !block.is_empty() {
+                            writer.write_all(&block)?;
+                            writer.flush()?;
+                        }
                     }
                     Out::End => break,
                     _ => {}
                 }
             }
-            let mut writer = writer;
-            writer.write_all(document.render().as_bytes())?;
+            writer.write_all(&cues.finish())?;
             Ok(writer.into_inner().map_err(|e| e.into_error())?)
         }
         Target::Null => {
