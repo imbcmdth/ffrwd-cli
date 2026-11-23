@@ -32,9 +32,13 @@ it writes, exactly as an `-f nut` or `-f ndjson` output does. `-` and
 
 A `webm` output writes its header when it opens, before any cue, so its
 reader can open it while the cues are still to come. The header names one
-track, `D_WEBVTT/SUBTITLES`, in a segment of unknown size; each cue is a
-cluster of its own, its block's data the cue's empty identifier and settings
-lines and then its text, its duration the cue's, in milliseconds.
+track, `D_WEBVTT/SUBTITLES`, in a segment of unknown size, and ends with an
+empty cluster: ffmpeg's matroska demuxer reads a header up to the first
+cluster, and would otherwise wait for the first cue before it opened the
+inputs after this one, which may be the picture the cues are said over.
+Each cue is a cluster of its own, its block's data the cue's empty identifier
+and settings lines and then its text, its duration the cue's, in
+milliseconds.
 
 The rows output that already exists is spelled the same way, and writes one
 NDJSON line per row as the rows arrive:

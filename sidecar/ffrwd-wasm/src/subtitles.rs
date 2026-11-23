@@ -264,9 +264,11 @@ impl Writer {
 
 /// WebVTT in WebM, as ffmpeg's matroska demuxer reads it from a pipe: an EBML
 /// header, a segment of unknown size whose one track is `D_WEBVTT/SUBTITLES`,
-/// and then a cluster per cue. A block's data is the cue's identifier line,
-/// its settings line, both empty here, and its text; its duration is the
-/// cue's. Times are milliseconds.
+/// an empty cluster, and then a cluster per cue. The demuxer reads its header
+/// up to the first cluster, so the empty one is what lets ffmpeg open the
+/// input, and go on to read its others, before any cue has been said. A
+/// block's data is the cue's identifier line, its settings line, both empty
+/// here, and its text; its duration is the cue's. Times are milliseconds.
 mod webm {
     const EBML: u32 = 0x1A45_DFA3;
     const EBML_VERSION: u32 = 0x4286;
@@ -373,6 +375,7 @@ mod webm {
         ]
         .concat();
         out.extend(element(TRACKS, &element(TRACK_ENTRY, &track)));
+        out.extend(element(CLUSTER, &uint(TIMESTAMP, 0)));
         out
     }
 
@@ -581,7 +584,10 @@ mod tests {
     #[test]
     fn a_webm_stream_writes_each_finished_cue_as_it_arrives() {
         let mut writer = Writer::new(Format::WebM);
-        assert!(writer.open().starts_with(&[0x1A, 0x45, 0xDF, 0xA3]));
+        let opening = writer.open();
+        assert!(opening.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]));
+        // An empty cluster closes the header, so a reader opens it at once.
+        assert!(opening.ends_with(&[0x1F, 0x43, 0xB6, 0x75, 0x83, 0xE7, 0x81, 0x00]));
         assert!(writer
             .push_row(
                 r#"{"start_t":1.0,"end_t":1.5,"text":"ho","final":false}"#,
