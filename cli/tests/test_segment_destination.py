@@ -168,14 +168,19 @@ def test_the_hls_window_and_numbering_reach_the_muxer() -> None:
         _copy(
             "hls/master.m3u8",
             "format 'hls', hls_time 4, hls_segment_type 'fmp4', "
-            "hls_list_size 150, hls_start_number_source 'epoch'",
+            "hls_list_size 150, hls_start_number_source 'epoch', "
+            "master_pl_publish_rate 1",
         )
     )
     assert _after(argv, "-hls_list_size") == "150"
     assert _after(argv, "-hls_start_number_source") == "epoch"
+    assert _after(argv, "-master_pl_publish_rate") == "1"
 
 
-@pytest.mark.parametrize("option", ["hls_list_size 150", "hls_start_number_source 'epoch'"])
+@pytest.mark.parametrize(
+    "option",
+    ["hls_list_size 150", "hls_start_number_source 'epoch'", "master_pl_publish_rate 1"],
+)
 def test_an_hls_window_option_is_refused_outside_hls(option: str) -> None:
     err = _rejects(_copy("out.mp4", option))
     assert err.code is ErrorCode.SINK_OPTION_TYPE

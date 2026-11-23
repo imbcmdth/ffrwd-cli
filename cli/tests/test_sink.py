@@ -55,6 +55,7 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "hls_fmp4_init_filename": ("container", "str"),
     "master_pl_name": ("container", "str"),
     "hls_list_size": ("container", "int"),
+    "master_pl_publish_rate": ("container", "int"),
     "hls_start_number_source": ("container", "str"),
     "segment_time": ("container", "num"),
     "segment_list": ("container", "str"),
@@ -69,7 +70,7 @@ _EXPECTED: dict[str, tuple[str, str]] = {
 
 
 def test_the_table_is_the_documented_options_with_their_scope_and_type() -> None:
-    assert len(SINK_OPTIONS) == 42
+    assert len(SINK_OPTIONS) == 43
     assert {name: (spec.scope, spec.type) for name, spec in SINK_OPTIONS.items()} == _EXPECTED
     assert [name for name, spec in SINK_OPTIONS.items() if spec.name != name] == []
 
