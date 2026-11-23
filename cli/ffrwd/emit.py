@@ -285,6 +285,7 @@ from .ir import (
     StreamType,
     UrlSource,
     dedup_inputs,
+    hls_relayed,
     is_src,
     src_parts,
 )
@@ -564,10 +565,21 @@ def reads_live_input(g: Graph) -> bool:
 
 
 def _output_group(g: Graph, unit: SinkUnit, labels: dict[str, str]) -> OutputGroup:
+    path = unit.path
+    options = dict(unit.options)
+    if unit.cue_mpegts is not None and path is not None:
+        # An hls destination writing a subtitle rendition: the muxer PUTs
+        # every file to the relay, which writes it, each WebVTT segment with
+        # its X-TIMESTAMP-MAP. Its paths are named for the run to resolve.
+        path = hls_relayed(path, unit.cue_mpegts)
+        segments = options.get("hls_segment_filename")
+        if isinstance(segments, str):
+            options["hls_segment_filename"] = hls_relayed(segments, unit.cue_mpegts)
+        options["method"] = "PUT"
     return OutputGroup(
         maps=[_output_map(g, output, labels) for output in unit.outputs],
-        path=unit.path,
-        options=dict(unit.options),
+        path=path,
+        options=options,
         tags=dict(unit.tags),
         window=unit.window,
         chapters=unit.chapters,

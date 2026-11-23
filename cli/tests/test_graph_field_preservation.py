@@ -18,6 +18,7 @@ import dataclasses
 
 from ffrwd.emit import _drop_input_slots
 from ffrwd.ir import (
+    Attachment,
     FeederCall,
     Graph,
     Lateral,
@@ -141,3 +142,28 @@ def test_every_field_not_touched_by_a_pass_survives_it() -> None:
         # a stale entry in `changes` would hide a field this test should
         # have covered.
         assert changes <= set(field_names)
+
+
+def test_every_field_of_a_sink_unit_but_its_outputs_survives_a_rewiring_pass() -> None:
+    """The passes that rewire a unit's outputs build the unit again; what
+    the file is, apart from what it maps, has to come through."""
+    unit = SinkUnit(
+        outputs=[Output(ref="n0", type="video", name=None, metadata={})],
+        path="out/%v/index.m3u8",
+        options={"format": "hls"},
+        tags={"title": "t"},
+        window=(1.0, 2.0),
+        chapters=3,
+        metadata=4,
+        attachments=[Attachment(path="font.ttf")],
+        cue_mpegts=126000,
+    )
+    kept = [f.name for f in dataclasses.fields(SinkUnit) if f.name != "outputs"]
+    for name, run in (("insert_splits", insert_splits), ("insert_pts_resets", insert_pts_resets)):
+        g = _sentinel_graph()
+        g.sinks = [unit]
+        (out,) = run(g).sinks
+        for field in kept:
+            assert getattr(out, field) == getattr(unit, field), (
+                f"{name} lost SinkUnit.{field}"
+            )

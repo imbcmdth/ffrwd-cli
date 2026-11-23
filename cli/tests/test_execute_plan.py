@@ -30,9 +30,11 @@ from ffrwd.execute import (
     _attribute,
     _broken_pipe,
     _cpu_seconds,
+    _HlsEndpoint,
     _Member,
     _pipe_buffer,
     _read_ahead,
+    _resolve_hls,
     _run_stage,
     _run_watched,
     _watch,
@@ -1797,3 +1799,39 @@ def test_a_watched_command_runs_in_a_session_of_its_own_off_windows(
     assert _EXECUTE._own_session() is True
     monkeypatch.setattr(_EXECUTE.sys, "platform", "win32")
     assert _EXECUTE._own_session() is False
+
+
+def test_an_hls_destinations_files_are_sent_to_the_relay_under_a_key_of_their_own() -> None:
+    """Each cue map is a destination of its own to the relay, asked for once,
+    under a key this run made; the path behind the placeholder is the file's."""
+
+    class _Relay:
+        def __init__(self) -> None:
+            self.asked: list[tuple[str, int]] = []
+
+        def hls(self, key: str, mpegts: int, deadline: float) -> tuple[str, int]:
+            self.asked.append((key, mpegts))
+            return ("127.0.0.1", 40123)
+
+    relay = _Relay()
+    endpoint = _HlsEndpoint(lambda: cast(Any, relay), lambda: 0.0)
+    argv = _resolve_hls(
+        [
+            "-hls_segment_filename",
+            "ffrwd:hls:126000/out/%v/segment_%d.ts",
+            "ffrwd:hls:126000/out/%v/index.m3u8",
+            "ffrwd:hls:0/C:/other/%v/index.m3u8",
+            "out.mp4",
+        ],
+        endpoint.url,
+    )
+    assert [mpegts for _, mpegts in relay.asked] == [126000, 0]
+    ts, fmp4 = (key for key, _ in relay.asked)
+    assert ts != fmp4 and len(ts) == 32
+    assert argv == [
+        "-hls_segment_filename",
+        f"http://127.0.0.1:40123/{ts}/out/%v/segment_%d.ts",
+        f"http://127.0.0.1:40123/{ts}/out/%v/index.m3u8",
+        f"http://127.0.0.1:40123/{fmp4}/C:/other/%v/index.m3u8",
+        "out.mp4",
+    ]

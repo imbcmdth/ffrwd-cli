@@ -457,6 +457,7 @@ from ffrwd.shapes import (
 from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
     COLOR_OPTIONS,
+    HLS_CUE_MPEGTS,
     MANIFEST_DEFAULT_SEGMENT,
     MANIFEST_FORMATS,
     MANIFEST_MAP_OPTION,
@@ -655,6 +656,39 @@ _STREAM_KINDS: frozenset[str] = frozenset({"video", "audio", "subtitle", "data"}
 # What an mp4 muxer stamps on an untagged stream: no information, so it is
 # never copied onto a passthrough Output.
 _UNDEFINED_LANGUAGE = "und"
+
+# The subtitle codecs an hls destination writes as WebVTT: WebVTT itself,
+# copied, and the text codecs ffmpeg's WebVTT encoder takes.
+_WEBVTT_SOURCE_CODECS: frozenset[str] = frozenset(
+    {"webvtt", "subrip", "srt", "ass", "ssa", "mov_text", "text"}
+)
+_WEBVTT_CODEC = "webvtt"
+
+# How the sidecar hands an hls destination the cue rows a module writes:
+# WebVTT in WebM, a cue at a time as each row arrives, which ffmpeg reads as
+# it goes. A WebVTT document is read whole before ffmpeg starts.
+_CUE_STREAM_FORMAT = "webm"
+
+# What a data stream's rows have to carry for an hls destination to write them
+# as cues: a cue row's three fields. `final` and `voice` are read where a row
+# has them.
+_CUE_ROWS_SCHEMA: Mapping[str, object] = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "start_t": {"type": "number"},
+        "end_t": {"type": "number"},
+    },
+    "required": ["text", "start_t", "end_t"],
+}
+
+# The group every video variant of an hls destination names its subtitle
+# renditions by.
+_SUBTITLE_GROUP = "subs"
+
+# A value the hls muxer's variant map can hold: its entries are split at
+# spaces and its keys at commas and colons.
+_MAP_TOKEN = re.compile(r"[A-Za-z0-9._-]+")
 
 _TIME_HINT = (
     "<alias>.t is only usable as WHERE <alias>.t BETWEEN <start> AND <end>, "
@@ -2353,6 +2387,22 @@ class _VariantRow:
     language: str | None = None
 
 
+@dataclass(frozen=True)
+class _SubtitleRendition:
+    """One subtitle column of an hls destination: a rendition of the whole
+    ladder, which every video variant names.
+
+    `name` is its NAME in the master playlist and `language` its LANGUAGE,
+    None where the stream says none; `default` marks the one rendition a
+    player shows unless its viewer picks another.
+    """
+
+    stream: _Stream
+    name: str
+    language: str | None
+    default: bool
+
+
 def _pad_rendition(
     pad: Mapping[str, object], kind: str, meta: Mapping[str, object], pictured: bool
 ) -> dict[str, object]:
@@ -2400,6 +2450,31 @@ def _compress_manifest_lists(
                 for element, row in zip(value, variant_rows)
                 if row.audio is not None
             ]
+
+
+def _subtitles_need_a_picture(subtitles: int, videos: int, anchor: exp.Expr) -> FfrwdError:
+    """The refusal for more subtitle columns than an hls destination has
+    video variants to carry them."""
+    return _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        "format 'hls' writes each subtitle rendition beside a video variant, "
+        f"and this COPY has {subtitles} subtitle column{'s' if subtitles != 1 else ''} "
+        f"and {videos} video variant{'s' if videos != 1 else ''}",
+        anchor,
+        hint="select a picture with the subtitles, and at most one subtitle "
+        "column for each video variant",
+    )
+
+
+def _subtitle_parts(index: int, rendition: _SubtitleRendition) -> list[str]:
+    """The keys a video variant's map entry carries for the subtitle
+    rendition riding it, the `index`-th subtitle stream of the output."""
+    parts = [f"s:{index}", f"sgroup:{_SUBTITLE_GROUP}", f"sname:{rendition.name}"]
+    if rendition.language is not None:
+        parts.append(f"language:{rendition.language}")
+    if rendition.default:
+        parts.append("default:yes")
+    return parts
 
 
 def _name_counts(*candidate_lists: list[str | None]) -> dict[str, int]:
@@ -4322,6 +4397,9 @@ class _Lowerer:
         # A node's data pad -> the function writing it and the schema of its
         # rows, which a reader's port is matched against.
         self._data_schemas: dict[FrameRef, tuple[str, Mapping[str, object]]] = {}
+        # The schema of each data stream a node read in FROM writes rows of,
+        # by the stream's source ref: what tells cue rows from other data.
+        self._source_rows: dict[FrameRef, Mapping[str, object]] = {}
         # A node's rows pad -> its declaration, its record and the call, for
         # the track or rows file a COPY selecting it writes.
         self._node_rows: dict[FrameRef, tuple[WasmFunction, Annotation, exp.Anonymous]] = {}
@@ -4522,6 +4600,12 @@ class _Lowerer:
         # is accepted -- each row one variant map entry -- and an outer
         # join's NULL row is that entry's absent stream kind.
         self.manifest: str | None = None
+        # The subtitle renditions of the hls destination currently lowering,
+        # in output order: each a subtitle column, riding a video variant.
+        self.manifest_subtitles: list[_SubtitleRendition] = []
+        # Where a cue time of zero lands in the segments of that destination,
+        # set once it has subtitle renditions (:attr:`SinkUnit.cue_mpegts`).
+        self.cue_mpegts: int | None = None
         # True while the COPY currently lowering targets a sink that reads
         # rows off the SELECT list rather than named stream parameters: a
         # multi-row relation is accepted here too, the way a manifest's is.
@@ -5107,6 +5191,8 @@ class _Lowerer:
         self.rows_file = self._rows_file(raw)
         self.feeder_sink = _feeder_destination(raw)
         self.manifest = _manifest_format(raw)
+        self.manifest_subtitles = []
+        self.cue_mpegts = None
         self._check_manifest_target(raw)
         self.row_reading_sink = bool(raw.module_sink) and self.res.wasm[
             raw.module_sink
@@ -5197,6 +5283,7 @@ class _Lowerer:
             chapters=self.chapters,
             metadata=self.metadata,
             attachments=list(self.attachments),
+            cue_mpegts=self.cue_mpegts,
         )
 
     def _feeder_copy(
@@ -5933,9 +6020,10 @@ class _Lowerer:
         possible is the title the column's alias wrote beside it. Matroska
         keeps it verbatim; mp4 renames it, so the file would come back
         nameless. An UNTITLED caption track is unaffected -- it says nothing
-        about itself to lose.
+        about itself to lose. An hls destination keeps it too, as the NAME of
+        the subtitle rendition.
         """
-        if path is None:
+        if path is None or self.manifest == "hls":
             return
         container = _container_of(options, path)
         if container in _MATROSKA_FORMATS:
@@ -6277,14 +6365,144 @@ class _Lowerer:
         an absent cell maps nothing, it only shapes the transcription.
         """
         cardinality = max(len(self.sink_rows), 1)
+        subject = f"a format '{self.manifest}' destination"
+        subtitles: list[_Column] = []
+        if self.manifest == "hls":
+            columns = [self._cue_rows_track(column) or column for column in columns]
+            subtitles = [column for column in columns if column.value.type == "subtitle"]
+            columns = [column for column in columns if column.value.type != "subtitle"]
+            if subtitles and not any(
+                column.value.type == "video" and column.value.streams for column in columns
+            ):
+                raise _subtitles_need_a_picture(len(subtitles), 0, raw.path_node)
         rows, stripped = self._row_cells(
             columns,
             cardinality,
             raw.path_node,
-            f"a format '{self.manifest}' destination",
+            subject,
+            kinds="video, audio and subtitle" if self.manifest == "hls" else "video and audio",
         )
         self._check_no_null_stream_feeds_a_filter(raw.path_node)
+        self.manifest_subtitles = self._subtitle_renditions(subtitles, rows, raw)
+        stripped += [
+            replace(column, value=_scalar(rendition.stream))
+            for column, rendition in zip(subtitles, self.manifest_subtitles)
+        ]
         return rows, stripped
+
+    def _cue_rows_track(self, column: _Column) -> _Column | None:
+        """A data column of an hls destination whose rows are cue rows, as the
+        subtitle track they make; None for any other column.
+
+        The rows are a node's, written as the run goes: a text track of a
+        source read in FROM, as `ffrwd.moq.subscribe` reads one. They become
+        what a module's rows become at this destination: the sidecar writes
+        them as WebVTT in WebM, and ffmpeg reads that as an input of its own.
+        """
+        if column.value.type != "data":
+            return None
+        refs = {stream.ref for stream in column.value.streams if stream.ref != _NULL_STREAM_REF}
+        if len(refs) != 1:
+            return None
+        (read,) = refs
+        schema = self._source_rows.get(read)
+        if schema is None:
+            written = self._written_rows(read)
+            schema = written[1] if written is not None else None
+        if schema is None or row_unfit(_CUE_ROWS_SCHEMA, schema) is not None:
+            return None
+        ref = self._mint_stream_input(CUES_COLUMN, PIPE, _CUE_STREAM_FORMAT, "subtitle")
+        self.minted_track_meta[ref] = (
+            {STREAM_TITLE_TAG: column.name} if column.name is not None else {}
+        )
+        self.graph.rows_sinks[read] = RowsSink(
+            container=_CUE_STREAM_FORMAT, alias=src_alias(ref)
+        )
+        self.rows_tracks.append(ref)
+        return replace(column, value=_scalar(_Stream(ref=ref, type="subtitle")))
+
+    def _subtitle_renditions(
+        self, columns: list[_Column], rows: list[_VariantRow], raw: RawSink
+    ) -> list[_SubtitleRendition]:
+        """Each subtitle column of an hls destination as a rendition.
+
+        A subtitle column is one rendition of the whole ladder, however many
+        rows repeat its cell: one stream, in text the WebVTT encoder takes.
+        Each rides a video variant of its own, the first column the first
+        variant's, because that is where the hls muxer writes one, and every
+        variant names the one group they share. A rendition is named by its
+        track's title (a written cue column's alias), as an audio rendition is
+        by its own name, else by its language, or positionally (``s0``) where
+        it has neither or shares one. The default is the one whose stream is
+        marked so, or else the first.
+        """
+        if not columns:
+            return []
+        anchor = raw.path_node
+        streams: list[_Stream] = []
+        for column in columns:
+            label = column.name or column.value.type
+            distinct = {
+                stream.ref: stream
+                for stream in column.value.streams
+                if stream.ref != _NULL_STREAM_REF
+            }
+            if len(distinct) != 1:
+                raise _error(
+                    ErrorCode.ROW_COUNT_MISMATCH,
+                    f"'{label}' holds {len(distinct)} subtitle streams, and a "
+                    "subtitle column of format 'hls' is one rendition",
+                    anchor,
+                    hint="select each subtitle track as a column of its own",
+                )
+            stream = next(iter(distinct.values()))
+            codec = stream.source.codec if stream.source is not None else None
+            if codec is not None and codec not in _WEBVTT_SOURCE_CODECS:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{label}' is {codec} subtitles, and format 'hls' writes "
+                    "WebVTT, which holds text",
+                    anchor,
+                    hint="select a text subtitle track (WebVTT, SubRip, ASS or "
+                    "mov_text), or cue rows",
+                )
+            streams.append(stream)
+        videos = sum(1 for row in rows if row.video is not None)
+        if len(streams) > videos:
+            raise _subtitles_need_a_picture(len(streams), videos, anchor)
+        languages = [
+            _stream_language(stream) or _rendition_language(stream) for stream in streams
+        ]
+        candidates = [
+            next(
+                (
+                    name
+                    for name in (self._track_title(stream), _rendition_name(stream), language)
+                    if name is not None and _MAP_TOKEN.fullmatch(name)
+                ),
+                None,
+            )
+            for stream, language in zip(streams, languages)
+        ]
+        names = _fallback_names(candidates, "s", _name_counts(candidates))
+        defaults = [
+            stream.source is not None and bool(stream.source.disposition.get("default"))
+            for stream in streams
+        ]
+        chosen = defaults.index(True) if any(defaults) else 0
+        return [
+            _SubtitleRendition(
+                stream=stream,
+                name=name,
+                language=language
+                if language is not None and _MAP_TOKEN.fullmatch(language)
+                else None,
+                default=position == chosen,
+            )
+            for position, (stream, name, language) in enumerate(
+                zip(streams, names, languages)
+            )
+        ]
 
     def _row_cells(
         self,
@@ -6292,10 +6510,12 @@ class _Lowerer:
         cardinality: int,
         anchor: exp.Expr,
         subject: str,
+        kinds: str = "video and audio",
     ) -> tuple[list[_VariantRow], list[_Column]]:
         """Every column's cells, read into rows of at most a video and an
         audio one -- the shape a manifest destination and a row-reading
-        sink share, `subject` naming which one a rejection is about.
+        sink share, `subject` naming which one a rejection is about and
+        `kinds` the columns it takes.
 
         Returns the rows plus the columns with every NULL cell dropped,
         which is what the caller's output list is built from: an absent
@@ -6311,12 +6531,12 @@ class _Lowerer:
                 continue
             label = column.name or value.type
             if value.type not in ("video", "audio"):
+                taken = "data tracks" if "subtitle" in kinds else "subtitle and data tracks"
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"{subject} takes video and audio columns, and '{label}' "
-                    f"is {value.type}",
+                    f"{subject} takes {kinds} columns, and '{label}' is {value.type}",
                     anchor,
-                    hint="write subtitle and data tracks to a file of their own",
+                    hint=f"write {taken} to a file of their own",
                 )
             if value.type in cells:
                 raise _error(
@@ -6502,9 +6722,13 @@ class _Lowerer:
 
         HLS spells it ``var_stream_map`` -- ``v:N``/``a:N`` per-kind indices
         in output order, an ``agroup`` binding the demuxed shape together,
-        names from the streams, ``default:yes`` on one rendition. DASH spells
-        the same analysis ``adaptation_sets``: video and audio each one set,
-        one representation per rung, by flat output stream index.
+        names from the streams, ``default:yes`` on one rendition. A subtitle
+        rendition rides a video variant's entry, ``s:N`` in the ``subs``
+        group: the hls muxer writes a SUBTITLES group line for each one, and
+        every video variant from the first to carry one names the group.
+        DASH spells the same analysis ``adaptation_sets``: video and audio
+        each one set, one representation per rung, by flat output stream
+        index.
         """
         if format_name == "dash":
             sets: list[str] = []
@@ -6537,6 +6761,10 @@ class _Lowerer:
                 parts.append("agroup:aud")
             if row.video is not None:
                 parts.append(f"name:{video_names[video_seen]}")
+                if video_seen < len(self.manifest_subtitles):
+                    parts += _subtitle_parts(
+                        video_seen, self.manifest_subtitles[video_seen]
+                    )
                 video_seen += 1
             elif row.audio is not None:
                 parts.append(f"name:{audio_names[audio_seen]}")
@@ -6653,7 +6881,46 @@ class _Lowerer:
         )
         if options.get("hls_segment_type") == "fmp4":
             options.setdefault("hls_fmp4_init_filename", "init.mp4")
+        if self.manifest_subtitles:
+            self._derive_subtitles(options, path, raw)
         return f"{prefix}%v/index.m3u8"
+
+    def _track_title(self, stream: _Stream) -> str | None:
+        """The title a subtitle track carries: the alias a minted one was
+        written under, or the tag an input's own track has."""
+        minted = self.minted_track_meta.get(stream.ref)
+        title = minted.get(STREAM_TITLE_TAG) if minted is not None else None
+        if title is None and stream.source is not None:
+            title = stream.source.metadata.get(STREAM_TITLE_TAG)
+        return str(title) if title is not None else None
+
+    def _derive_subtitles(self, options: dict[str, object], path: str, raw: RawSink) -> None:
+        """What an hls destination's subtitle renditions need of it: WebVTT,
+        copied where the cues are WebVTT already, and the relay writing its
+        files, so each segment carries the X-TIMESTAMP-MAP the muxer does not
+        write (:attr:`SinkUnit.cue_mpegts`).
+        """
+        if is_url(path):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "format 'hls' writes a subtitle rendition through the relay, "
+                f"which writes files, and '{path}' is a URL",
+                raw.path_node,
+                hint="write the destination to a local path and serve or "
+                "upload it from there",
+            )
+        options.setdefault(
+            _SUBTITLE_CODEC_OPTION,
+            [
+                COPY_CODEC
+                if rendition.stream.source is None
+                or rendition.stream.source.codec in (None, _WEBVTT_CODEC)
+                else _WEBVTT_CODEC
+                for rendition in self.manifest_subtitles
+            ],
+        )
+        segments = "fmp4" if options.get("hls_segment_type") == "fmp4" else "mpegts"
+        self.cue_mpegts = HLS_CUE_MPEGTS[segments]
 
     def _derive_segment(
         self, options: dict[str, object], path: str | None, raw: RawSink
@@ -9224,6 +9491,10 @@ class _Lowerer:
             )
         result = _node_source_probe(shape)
         self.probes[alias] = result
+        data = [output for output in shape.outputs if _output_kind(shape, output, {}) == "data"]
+        for index, output in enumerate(data):
+            if output.schema is not None:
+                self._source_rows[f"src:{alias}:d:{index}"] = output.schema
         env.bindings[alias] = _InputBinding(alias=alias)
         self._bind_renditions(alias, join, env, select)
         kinds = [_output_kind(shape, output, {}) for output in shape.outputs]
@@ -12848,12 +13119,13 @@ class _Lowerer:
             return _Value(type=kind, streams=(), is_array=False)
         self._check_no_vector_track(declared, annotation, node, select)
         tag = self._rows_language(declared, call, node, env, select)
-        ref = self._mint_stream_input(
-            CUES_COLUMN, PIPE, WEBVTT_FORMAT, "subtitle"
-        )
+        # An hls destination's subtitles are cut as the run goes, so its cues
+        # cross as a stream; anywhere else they are a document, read whole.
+        container = _CUE_STREAM_FORMAT if self.manifest == "hls" else WEBVTT_FORMAT
+        ref = self._mint_stream_input(CUES_COLUMN, PIPE, container, "subtitle")
         self.minted_track_meta[ref] = {}
         self.graph.rows_sinks[producer] = RowsSink(
-            container=WEBVTT_FORMAT, alias=src_alias(ref)
+            container=container, alias=src_alias(ref)
         )
         self.rows_tracks.append(ref)
         return _scalar(_Stream(ref=ref, type="subtitle", source=_rows_meta(tag)))

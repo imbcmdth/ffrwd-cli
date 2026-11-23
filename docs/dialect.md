@@ -701,6 +701,10 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     rows of a `.ndjson` destination, a WebVTT track anywhere else. A
     gather, `ARRAY(SELECT r FROM unnest(<call>) r WHERE ...)`, narrows
     them on their way, as it narrows a module's annotation column.
+    A track holds finished cues: a row whose `final` is false is an
+    utterance still growing, sent again as it grows, and is left out; a
+    row with no `final` counts as finished. A row's `voice` marks its cue
+    in WebVTT as `<v Name>`.
   - A node at a COPY's `TO` takes the SELECT's columns by kind: a
     picture on its video input, a sound on its audio input, and each
     data column on one of its rows inputs. With one rows input, or none
@@ -2213,6 +2217,46 @@ Under a manifest format the compiler owns what the format needs:
   `default:yes` on the first rendition unless a probed default
   disposition says otherwise. A hand-written map is refused, naming
   what the compiler would write.
+- **Subtitles** (hls). A subtitle column is a subtitle rendition of the
+  whole ladder: an input's own text track (`f.subtitle[1]`), a written
+  `cue[]` column, or the cue rows a module or a source writes. However
+  many rows repeat its cell, a column is one rendition. It rides a video
+  variant's entry in the map, `s:N` in the group `subs`, the first
+  column on the first video variant and the second on the second, so a
+  ladder takes at most as many subtitle columns as it has video
+  variants; every video variant names the group, `SUBTITLES="subs"`.
+  Its NAME is the track's title (a written column's alias), else its
+  language tag, else its position (`s0`); its LANGUAGE is the tag. The
+  column whose stream is marked default, or else the first, is
+  `DEFAULT=YES`, and each is `AUTOSELECT=YES`. The rendition's playlist
+  and WebVTT segments sit beside its variant's (`240p/index_vtt.m3u8`,
+  `240p/index0.vtt`), each segment cut where the variant's media
+  segment is cut. A WebVTT track is copied; SubRip, ASS and mov_text
+  are written as WebVTT, and a bitmap track is refused.
+
+Each WebVTT segment opens with an `X-TIMESTAMP-MAP` that puts its cue
+times on the media's timestamps: `MPEGTS:126000,LOCAL:00:00:00.000`
+under MPEG-TS segments, whose timestamps start 1.4 s after the cues'
+(twice ffmpeg's `-muxdelay`), and `MPEGTS:0` under fmp4 segments, which
+keep the cues' clock. A player places each cue on the picture it was
+written against. ffmpeg's hls muxer writes no map, so such a destination
+is written through the relay: the muxer sends each file over HTTP
+(`-method PUT`, its paths spelled `ffrwd:hls:<mpegts>/<path>`, which a run
+resolves to the relay's loopback address), and the relay writes it in
+place, a file at a time, each WebVTT segment with its map and each
+playlist after the files it names. A printed command carrying one reads
+rather than runs. A destination that is itself a URL is refused, since
+the relay writes files.
+
+The cue rows a module writes, and a source's data stream whose rows
+carry `text`, `start_t` and `end_t` (a text track `ffrwd.moq.subscribe`
+reads, say), cross from the sidecar as WebVTT in WebM, each cue written
+when its row arrives, so a live program's text reaches the playlist
+while the run goes on. ffmpeg muxes the cues in time order with the
+picture and sound, holding those up to 10 s for a cue still to come, so
+a cue that arrives late still lands in the segment of its time. Cues go
+out in the order they start: one whose row arrives after a later cue's
+starts where that one did, and one that ended by then is dropped.
 
 A live playlist names the newest five segments, ffmpeg's default;
 `hls_list_size` names more, and 0 names every one. A run of a live query

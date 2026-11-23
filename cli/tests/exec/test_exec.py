@@ -24,10 +24,11 @@ import imagehash
 import pytest
 from PIL import Image
 
-from ffrwd import cli, loudnorm
+from ffrwd import binaries, cli, loudnorm
 from ffrwd.compiler import compile_sql
 from ffrwd.emit import build_ffmpeg_args, build_ffmpeg_commands, emit
 from ffrwd.errors import FfrwdError
+from ffrwd.execute import execute
 from ffrwd.lower import lower_table
 from ffrwd.mcp import tools as mcp_tools
 from ffrwd.parser import parse, resolve
@@ -2579,6 +2580,96 @@ def test_the_hls_ladder_writes_an_accepted_master_and_aligned_segments(
     assert len(times) >= 2
     gaps = [round(b - a, 3) for a, b in zip(times, times[1:])]
     assert all(gap == 2.0 for gap in gaps), gaps
+
+
+# The cues an hls destination writes as subtitles, each (start, end, text).
+_CUES = ((0.5, 1.5, "one"), (1.8, 2.6, "two & a half"), (3.0, 3.5, "three"))
+
+
+def _ts_first_video_pts(segment: Path) -> int:
+    """The first picture's MPEG-TS timestamp in `segment`, 90 kHz ticks."""
+    args = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+        "-show_entries", "packet=pts", "-of", "json", str(segment),
+    ]
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    return int(json.loads(result.stdout)["packets"][0]["pts"])
+
+
+def _vtt_cues(text: str) -> list[tuple[float, str]]:
+    """Each cue of a WebVTT segment, its start in seconds and its text."""
+    cues: list[tuple[float, str]] = []
+    for block in text.split("\n\n"):
+        lines = block.strip().splitlines()
+        timing = next((line for line in lines if "-->" in line), None)
+        if timing is None:
+            continue
+        minutes, seconds = timing.split("-->")[0].strip().rsplit(":", 1)
+        start = float(seconds) + 60 * float(minutes.split(":")[-1])
+        cues.append((start, "\n".join(lines[lines.index(timing) + 1 :])))
+    return cues
+
+
+def test_an_hls_subtitle_rendition_places_each_cue_on_its_picture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cue rows into an hls destination: the master names a subtitle group
+    every variant names, the subtitle playlist is cut where the media is, each
+    WebVTT segment opens with the X-TIMESTAMP-MAP the relay writes, and each
+    cue lands on the MPEG-TS time of the picture it was written against,
+    within a frame."""
+    _require_fixture(_AV)
+    if binaries.ffrwd_wasm_path() is None:
+        pytest.skip("the relay is the ffrwd-wasm sidecar's, which is not installed")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    cues = ", ".join(
+        f"STRUCT({start} AS start_t, {end} AS end_t, '{text}' AS text)::cue"
+        for start, end, text in _CUES
+    )
+    query = (
+        f"COPY (SELECT f.video[1], f.audio[1], ARRAY[{cues}] AS captions "
+        f"FROM input('{_sql_path(_AV)}') f) TO 'out/master.m3u8' "
+        "WITH (format 'hls', hls_time 2, hls_playlist_type 'vod', "
+        "video_codec 'libx264', preset 'ultrafast', audio_codec 'aac')"
+    )
+    result = execute([emit(compile_sql(query))], capture_stderr=True)
+    assert result.exit_code == 0, result.commands[-1].stderr
+
+    master = (tmp_path / "out" / "master.m3u8").read_text(encoding="utf-8")
+    assert (
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="captions",DEFAULT=YES,'
+        'AUTOSELECT=YES,URI="240p/index_vtt.m3u8"'
+    ) in master
+    assert 'SUBTITLES="subs"' in master.split("#EXT-X-STREAM-INF:")[1]
+
+    variant = tmp_path / "out" / "240p"
+    media = (variant / "index.m3u8").read_text(encoding="utf-8")
+    subtitles = (variant / "index_vtt.m3u8").read_text(encoding="utf-8")
+
+    def lengths(playlist: str) -> list[str]:
+        return [line for line in playlist.splitlines() if line.startswith("#EXTINF")]
+
+    assert len(lengths(media)) == 2
+    assert lengths(subtitles) == lengths(media)
+
+    first = _ts_first_video_pts(variant / "segment_0.ts")
+    frame = 90000 / 15
+    placed: dict[str, int] = {}
+    for index in range(2):
+        segment = (variant / f"index{index}.vtt").read_text(encoding="utf-8")
+        head = segment.splitlines()
+        assert head[:2] == ["WEBVTT", "X-TIMESTAMP-MAP=MPEGTS:126000,LOCAL:00:00:00.000"]
+        for start, text in _vtt_cues(segment):
+            placed[text] = round(start * 90000) + 126000
+    written = {text.replace("&", "&amp;"): start for start, _, text in _CUES}
+    assert set(placed) == set(written)
+    for text, start in written.items():
+        picture = first + start * 90000
+        assert abs(placed[text] - picture) <= frame, (text, placed[text], picture)
 
 
 def test_a_ladder_function_writes_its_rungs_at_the_widths_it_declared(

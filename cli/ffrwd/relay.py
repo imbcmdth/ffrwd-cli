@@ -14,6 +14,11 @@ answers on its stderr with rows (:data:`~ffrwd.ir.STDERR_ROW`):
   listening, and only then is a process told to open one. A batch it could
   not set up is ``{"kind": "relay", "batch": N, "error": "..."}``.
 - ``{"stop": [ids]}`` ends those copies at once.
+- ``{"hls": {"key": KEY, "mpegts": N}}`` takes an hls destination's files over
+  HTTP on loopback and writes them, each WebVTT segment with an
+  ``X-TIMESTAMP-MAP`` putting a cue time of zero at MPEG-TS time N;
+  ``{"kind": "relay", "hls": [HOST, PORT]}`` says where the muxer sends them,
+  under ``/KEY/``.
 - ``{"listen": {"host": HOST, "keys": [...]}}`` opens the node's one data
   port for the cut edges arriving from other nodes (:mod:`ffrwd.nodes`);
   ``{"kind": "relay", "listening": [HOST, PORT]}`` says where it is. A
@@ -121,6 +126,7 @@ class Relay:
         self._answers: dict[int, str | None] = {}
         self._fault: str | None = None
         self._listening: tuple[str, int] | None = None
+        self._hls: tuple[str, int] | None = None
         self.refused: list[str] = []
         self._ended = False
         self._tail: deque[str] = deque(maxlen=_TAIL)
@@ -130,15 +136,20 @@ class Relay:
         self._reader.start()
 
     @classmethod
-    def start(cls, secret: str | None = None) -> Relay:
+    def start(
+        cls,
+        secret: str | None = None,
+        needed: str = "this plan joins processes by named pipes",
+    ) -> Relay:
         """A relay from the installed sidecar, or the refusal saying there is
-        none. `secret` is the job's, for a node's relay taking cut edges."""
+        none. `secret` is the job's, for a node's relay taking cut edges;
+        `needed` says what the run needs it for."""
         binary = binaries.ffrwd_wasm_path()
         if binary is None:
             raise FfrwdError(
                 ErrorCode.UNSUPPORTED_SQL,
-                "this plan joins processes by named pipes, which the ffrwd-wasm "
-                "relay carries, and the ffrwd-wasm sidecar is not installed",
+                f"{needed}, which the ffrwd-wasm relay carries, and the ffrwd-wasm "
+                "sidecar is not installed",
                 hint="reinstall ffrwd (the sidecar comes with it on supported "
                 f"platforms), or point {binaries.FFRWD_WASM_ENV} at an ffrwd-wasm binary",
             )
@@ -185,6 +196,23 @@ class Relay:
             if self._listening is None:
                 raise self._failure("it opened no data port")
             return self._listening
+
+    def hls(self, key: str, mpegts: int, deadline: float) -> tuple[str, int]:
+        """Take an hls destination's files under `key`, its WebVTT segments
+        mapping a cue time of zero to MPEG-TS time `mpegts`; the address the
+        muxer sends them to."""
+        with self._change:
+            self._hls = None
+        self._send({"hls": {"key": key, "mpegts": mpegts}})
+        with self._change:
+            while self._hls is None and self._fault is None and not self._ended:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise self._failure("it opened no HLS endpoint in time")
+                self._change.wait(min(remaining, 1.0))
+            if self._hls is None:
+                raise self._failure("it opened no HLS endpoint")
+            return self._hls
 
     def stop(self, ids: Sequence[str]) -> None:
         """End those copies at once, whatever they still hold."""
@@ -251,8 +279,11 @@ class Relay:
             error = row.get("error")
             listening = row.get("listening")
             refused = row.get("refused")
+            hls = row.get("hls")
             if isinstance(listening, list) and len(listening) == 2:
                 self._listening = (str(listening[0]), int(listening[1]))
+            elif isinstance(hls, list) and len(hls) == 2:
+                self._hls = (str(hls[0]), int(hls[1]))
             elif isinstance(refused, str):
                 self.refused.append(refused)
             elif isinstance(ready, int):

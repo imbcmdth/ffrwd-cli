@@ -134,6 +134,20 @@ TAP_DOCUMENT = "ffrwd:tap:"
 PARAMS_FILE = "ffrwd:params:"
 
 
+# Where an hls muxer sends a file the relay writes for it:
+# ``ffrwd:hls:<mpegts>/<path>``, the file's own path behind the MPEG-TS time a
+# cue time of zero lands on. A run resolves the prefix to the relay's HTTP
+# endpoint for that destination, ``http://<host>:<port>/<key>/``.
+HLS_RELAY = "ffrwd:hls:"
+
+
+def hls_relayed(path: str, mpegts: int) -> str:
+    """`path` as the placeholder an hls muxer writing through the relay
+    names it by."""
+    forward = path.replace("\\", "/")
+    return f"{HLS_RELAY}{mpegts}/{forward}"
+
+
 def is_rows_document(path: str) -> bool:
     """True for a path that is one of those placeholders."""
     return path.startswith(ROWS_DOCUMENT)
@@ -384,6 +398,11 @@ class SinkUnit:
       seeks and stream copy write corrupt files. Set only by a fan-out whose
       rows carry a time window; an input-wide window lives in
       :attr:`Graph.input_trims` instead.
+    * ``cue_mpegts`` is set for an hls destination that writes a subtitle
+      rendition: the MPEG-TS time (90 kHz) a cue time of zero lands on in its
+      segments. Its files go through the relay, which writes that into each
+      WebVTT segment as its ``X-TIMESTAMP-MAP``; emit names them by the
+      :data:`HLS_RELAY` placeholder.
 
     Filtergraph LABELS are graph-scoped, not file-scoped: one
     ``-filter_complex`` serves every unit, so emit keeps ``out<i>`` unique
@@ -398,6 +417,7 @@ class SinkUnit:
     chapters: int | None = None
     metadata: int | None = None
     attachments: list[Attachment] = field(default_factory=list)
+    cue_mpegts: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         d: dict[str, object] = {
@@ -417,6 +437,8 @@ class SinkUnit:
             d["metadata"] = self.metadata
         if self.attachments:
             d["attachments"] = [one.to_dict() for one in self.attachments]
+        if self.cue_mpegts is not None:
+            d["cue_mpegts"] = self.cue_mpegts
         return d
 
     @classmethod
@@ -429,6 +451,8 @@ class SinkUnit:
         raw_chapters = d.get("chapters")
         raw_metadata = d.get("metadata")
         raw_attachments = d.get("attachments")
+        raw_cue_mpegts = d.get("cue_mpegts")
+        assert raw_cue_mpegts is None or isinstance(raw_cue_mpegts, int)
         assert raw_chapters is None or isinstance(raw_chapters, int)
         assert raw_metadata is None or isinstance(raw_metadata, int)
         assert raw_attachments is None or isinstance(raw_attachments, list)
@@ -466,6 +490,7 @@ class SinkUnit:
                 for one in (raw_attachments or [])
                 if isinstance(one, dict)
             ],
+            cue_mpegts=raw_cue_mpegts,
         )
 
 

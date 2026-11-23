@@ -126,6 +126,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import signal
 import socket
@@ -147,6 +148,7 @@ from .emit import Emitted, build_ffmpeg_commands, build_process_args
 from .errors import ErrorCode, FfrwdError
 from .ir import (
     FEEDER_HOST,
+    HLS_RELAY,
     PARAMS_FILE,
     STDERR_ROW,
     TAP_DOCUMENT,
@@ -354,7 +356,50 @@ def execute(
     pass and not the work. That command's stderr is piped, whatever
     `capture_stderr` says, and comes back with the progress lines taken out. A
     command feeding a window reports nothing: its output is the window.
+
+    A destination writing its files through the relay (an hls destination
+    with a subtitle rendition) starts one for the run, ended once every
+    command has.
     """
+    relays: list[Relay] = []
+
+    def relay() -> Relay:
+        if not relays:
+            relays.append(Relay.start(needed=_HLS_NEEDS))
+        return relays[0]
+
+    hls = _HlsEndpoint(relay, lambda: time.monotonic() + _HLS_WAIT)
+    try:
+        return _execute(
+            emitted,
+            hls,
+            timeout=timeout,
+            overwrite=overwrite,
+            capture_stderr=capture_stderr,
+            echo=echo,
+            players=players,
+            show_only=show_only,
+            work=work,
+        )
+    finally:
+        for running in relays:
+            running.close()
+
+
+def _execute(
+    emitted: Sequence[Emitted],
+    hls: _HlsEndpoint,
+    *,
+    timeout: float | None,
+    overwrite: bool,
+    capture_stderr: bool,
+    echo: Callable[[list[str]], None] | None,
+    players: Sequence[list[str] | None],
+    show_only: bool,
+    work: WorkProgress | None,
+) -> ExecutionResult:
+    """:func:`execute`'s loop, `hls` naming the relay's address for each file
+    an hls destination writes through it."""
     results: list[CommandResult] = []
     measured: dict[str, str] = {}
 
@@ -370,7 +415,9 @@ def execute(
             reports = work if last and not measuring and player is None else None
             capture = capture_stderr or measuring
 
-            argv = [loudnorm.substitute(word, measured) for word in command]
+            argv = _resolve_hls(
+                [loudnorm.substitute(word, measured) for word in command], hls.url
+            )
             argv.insert(1, "-y" if overwrite else "-n")
             argv.insert(1, "-hide_banner")
             if reports is not None:
@@ -1047,6 +1094,7 @@ def plan_argv(
     apart: Callable[[PipeEdge], bool] | None = None,
     params_path: ParamsNamer | None = None,
     tap_path: Callable[[int], str] | None = None,
+    hls_url: Callable[[str], str] | None = None,
 ) -> dict[str, list[str]]:
     """The argv that runs each process of `plan`, keyed by process id.
 
@@ -1073,6 +1121,9 @@ def plan_argv(
 
     `tap_path` names the pipe a node region writes a run-time lateral's
     messages to, for each tap placeholder; without it they stay too.
+
+    `hls_url` names the relay's address for each file an hls destination
+    writes through it (:data:`~ffrwd.ir.HLS_RELAY`); without it they stay.
     """
     read: dict[PipeEdge, str] = {}
     write: dict[PipeEdge, str] = {}
@@ -1125,7 +1176,7 @@ def plan_argv(
             live=any(edge.live for edge in incoming),
             copyts=all(keeps_clock(edge, plan) for edge in incoming),
         )
-    return _resolve_placeholders(argv, plan, rows_path, params_path, tap_path)
+    return _resolve_placeholders(argv, plan, rows_path, params_path, tap_path, hls_url)
 
 
 def _resolve_taps(
@@ -1252,16 +1303,58 @@ def _resolve_placeholders(
     rows_path: RowsNamer | None,
     params_path: ParamsNamer | None,
     tap_path: Callable[[int], str] | None,
+    hls_url: Callable[[str], str] | None = None,
 ) -> dict[str, list[str]]:
     """Every placeholder in `argv` a namer is given for, named: the taps, then
-    the rows documents, then the nodes' params files."""
+    the rows documents, then the nodes' params files, then the files an hls
+    destination writes through the relay."""
     argv = _resolve_taps(argv, tap_path)
-    return _resolve_params_files(_resolve_rows_documents(argv, rows_path), plan, params_path)
+    argv = _resolve_params_files(_resolve_rows_documents(argv, rows_path), plan, params_path)
+    if hls_url is None:
+        return argv
+    return {pid: _resolve_hls(args, hls_url) for pid, args in argv.items()}
+
+
+def _resolve_hls(argv: list[str], hls_url: Callable[[str], str]) -> list[str]:
+    """`argv` with each file an hls destination writes through the relay named
+    by the relay's address for it."""
+    return [hls_url(word) if word.startswith(HLS_RELAY) else word for word in argv]
+
+
+class _HlsEndpoint:
+    """The relay's HTTP endpoint for the hls destinations of one run.
+
+    Each MPEG-TS time a cue time of zero lands on is a destination of its
+    own to the relay, under a key made for this run, so nothing else on the
+    machine writes through it. The relay is asked for once per key.
+    """
+
+    def __init__(self, relay: Callable[[], Relay], deadline: Callable[[], float]) -> None:
+        self._relay = relay
+        self._deadline = deadline
+        self._keys: dict[int, str] = {}
+        self._address: tuple[str, int] | None = None
+
+    def url(self, placeholder: str) -> str:
+        """The URL the hls muxer sends the file `placeholder` names to."""
+        mpegts, _, path = placeholder[len(HLS_RELAY) :].partition("/")
+        ticks = int(mpegts)
+        if ticks not in self._keys:
+            key = secrets.token_hex(16)
+            self._address = self._relay().hls(key, ticks, self._deadline())
+            self._keys[ticks] = key
+        assert self._address is not None  # set with the first key
+        host, port = self._address
+        return f"http://{host}:{port}/{self._keys[ticks]}/{path}"
 
 
 def _unresolved(word: str) -> bool:
-    """Whether `word` is still a tap or a params placeholder."""
-    return word.startswith(TAP_DOCUMENT) or word.partition("=")[2].startswith(PARAMS_FILE)
+    """Whether `word` is still a tap, a params or an hls placeholder."""
+    return (
+        word.startswith(TAP_DOCUMENT)
+        or word.startswith(HLS_RELAY)
+        or word.partition("=")[2].startswith(PARAMS_FILE)
+    )
 
 
 class _Placeholders:
@@ -1276,8 +1369,11 @@ class _Placeholders:
     the host reads, which the relay joins.
     """
 
-    def __init__(self, workspace: Callable[[], Path]) -> None:
+    def __init__(
+        self, workspace: Callable[[], Path], hls: _HlsEndpoint | None = None
+    ) -> None:
         self._workspace = workspace
+        self._hls = hls
         self.taps: dict[int, tuple[str, str]] = {}
 
     def rows_path(self, placeholder: str) -> str:
@@ -1305,7 +1401,14 @@ class _Placeholders:
 
     def resolve(self, argv: dict[str, list[str]], plan: ProcessPlan) -> dict[str, list[str]]:
         """`argv` with every placeholder in it named."""
-        return _resolve_placeholders(argv, plan, self.rows_path, self.params_path, self.tap_path)
+        return _resolve_placeholders(
+            argv,
+            plan,
+            self.rows_path,
+            self.params_path,
+            self.tap_path,
+            self._hls.url if self._hls is not None else None,
+        )
 
 
 def _sidecar_writes(
@@ -1436,6 +1539,11 @@ def _chain_order(members: Sequence[str], edges: Sequence[PipeEdge]) -> list[str]
 
 
 # `render_plan`'s honest fallback: no shell can paste this, and it says so.
+# How long the relay is given to open its HLS endpoint.
+_HLS_WAIT = 30.0
+# What a run writing an hls destination's subtitles needs the relay for.
+_HLS_NEEDS = "this run writes an hls destination's subtitles over HTTP to the relay"
+
 _COURTESY_NOTE = "# this listing is not a shell command -- run the plan with `ffrwd run`"
 
 
@@ -1673,7 +1781,8 @@ def execute_plan(
                 )
             return home[0]
 
-        placeholders = _Placeholders(workspace)
+        hls = _HlsEndpoint(relay, lambda: time.monotonic() + _HLS_WAIT)
+        placeholders = _Placeholders(workspace, hls)
 
         def pipe_path(edge: PipeEdge, side: Side) -> str:
             # Named here, made by the relay when the edge's stage starts.
@@ -1688,6 +1797,7 @@ def execute_plan(
             rows_path=placeholders.rows_path,
             params_path=placeholders.params_path,
             tap_path=placeholders.tap_path,
+            hls_url=hls.url,
         )
         assigned = wires(plan)
         terminal = terminal_member(plan) if work is not None else None

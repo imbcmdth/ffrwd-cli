@@ -7448,6 +7448,7 @@ def _rewrite_unit(unit: SinkUnit, rewrite: Callable[[FrameRef], FrameRef]) -> Si
         chapters=unit.chapters,
         metadata=unit.metadata,
         attachments=list(unit.attachments),
+        cue_mpegts=unit.cue_mpegts,
     )
 
 

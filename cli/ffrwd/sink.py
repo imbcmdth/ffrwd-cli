@@ -477,6 +477,13 @@ MANIFEST_SEGMENT_OPTION: dict[str, str] = {"hls": "hls_time", "dash": "seg_durat
 # COPY's rows, written by the compiler and refused when hand-written.
 MANIFEST_MAP_OPTION: dict[str, str] = {"hls": "var_stream_map", "dash": "adaptation_sets"}
 
+# Where an hls destination's segments put a cue time of zero, in MPEG-TS
+# ticks (90 kHz), per segment type: what the X-TIMESTAMP-MAP of each WebVTT
+# segment says. The mpegts muxer starts every timestamp twice ffmpeg's
+# -muxdelay late, 0.7 s by default, and the WebVTT muxer beside it does not;
+# an fmp4 segment keeps the clock the cues are on.
+HLS_CUE_MPEGTS: dict[str, int] = {"mpegts": 126_000, "fmp4": 0}
+
 # Options that were sink options and are SELECT columns now, with the spelling
 # that replaced each. Named separately so the rejection can say where to go.
 REPLACED_OPTIONS = {
@@ -587,6 +594,16 @@ _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         type="str",
         doc="The DASH adaptation sets, transcribed from the COPY's rows.",
         flag="-adaptation_sets",
+        per_stream=False,
+    ),
+    # An hls destination with a subtitle rendition is written over HTTP to
+    # the relay, which writes its files: the muxer PUTs each one.
+    "method": SinkOptionSpec(
+        name="method",
+        scope="container",
+        type="str",
+        doc="How the hls muxer sends its files over HTTP: PUT, to the relay.",
+        flag="-method",
         per_stream=False,
     ),
     # A cut destination's derived surface: each file's clock starts at zero,

@@ -220,6 +220,26 @@ def _ticker(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, obj
     )
 
 
+def _program(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
+    """A live program read back: one rendition row, its picture, and the cue
+    rows of a text track on that row, as ffrwd/moq's subscribe hands them."""
+    canvas = {"kind": "video", "width": 1280, "height": 720, "pix_fmt": "rgba"}
+    outputs = [
+        {"name": "v", "kind": "video", "format": canvas, "latency": 0},
+        _output("captions", "data", schema={**_CUE, "required": ["text"]}),
+        _output("boxes", "data", schema=_BOX),
+    ]
+    for output in outputs:
+        output["row"] = 0
+    return _shape(
+        [],
+        outputs,
+        {"kind": "rate", "rate": {"num": 30, "den": 1}},
+        bounded=False,
+        relation=[json.dumps({"width": 1280, "height": 720})],
+    )
+
+
 def _box(params: Mapping[str, object], bound: Sequence[str]) -> dict[str, object]:
     """A node holding its picture on the GPU, or not, as its params say."""
     clock = _clock("v")
@@ -241,6 +261,7 @@ SHAPES: dict[str, Callable[..., dict[str, object]]] = {
     "tile.wasm": _tile,
     "matte.wasm": _matte,
     "ticker.wasm": _ticker,
+    "program.wasm": _program,
 }
 
 _PARAMS = {
@@ -314,6 +335,8 @@ _DECLARATIONS = {
     "matte": "CREATE FUNCTION matte(v video_stream, every number DEFAULT 30) "
     "RETURNS STRUCT(mask video_stream, spots STRUCT(start_t number, id number, "
     "x number, y number, w number, h number)[]) AS 'matte.wasm', 'matte' LANGUAGE wasm;",
+    "program": "CREATE FUNCTION program() RETURNS source "
+    "AS 'program.wasm', 'program' LANGUAGE wasm;",
     "ticker": "CREATE FUNCTION ticker(text text, width number DEFAULT 1280, "
     "height number DEFAULT 720, fps number DEFAULT 30) RETURNS source "
     "AS 'ticker.wasm', 'ticker' LANGUAGE wasm;",
@@ -648,6 +671,57 @@ def test_a_nodes_rows_anywhere_but_a_feeder_connection_are_still_a_track(
     )
     (hear,) = [node for node in graph.nodes.values() if node.filter == "hear.wasm"]
     assert graph.rows_sinks[hear.id].container == "webvtt"
+
+
+def _formats(argv: Sequence[str]) -> list[str]:
+    """Each ``-f`` a process names, an input's or an output's, in order."""
+    return [argv[i + 1] for i, word in enumerate(argv) if word == "-f"]
+
+
+def test_a_nodes_rows_at_an_hls_destination_cross_as_a_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An hls destination cuts its subtitles as the run goes, so the rows
+    cross as WebVTT in WebM, a cue as each row arrives; ffmpeg would read a
+    WebVTT document whole before it started."""
+    argv = _plan_argv(
+        "COPY (SELECT f.video[1], f.audio[1], hear(f.audio[1]) AS loudness "
+        "FROM input('f.mp4') f) TO 'out/master.m3u8' WITH (format 'hls')",
+        monkeypatch,
+    )
+    (sidecar,) = [args for args in argv.values() if args[0] == "ffrwd-wasm"]
+    assert _formats(sidecar)[-1] == "webm"
+    (muxer,) = [args for args in argv.values() if "hls" in args]
+    assert _formats(muxer) == ["webm", "hls"]
+    stream_map = muxer[muxer.index("-var_stream_map") + 1]
+    assert stream_map == "v:0,a:0,name:240p,s:0,sgroup:subs,sname:loudness,default:yes"
+
+
+def test_a_sources_cue_rows_are_an_hls_subtitle_rendition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The egress's shape: a source's text track, a data stream of cue rows,
+    is a subtitle rendition at an hls destination, its rows written as WebVTT
+    in WebM beside the picture's NUT and read on the plan's clock. A data
+    stream of any other rows stays refused there."""
+    argv = _plan_argv(
+        "COPY (SELECT s.video[1], s.data[1] FROM program() s) "
+        "TO 'out/master.m3u8' WITH (format 'hls')",
+        monkeypatch,
+    )
+    sidecar = argv["sidecar0"]
+    assert _formats(sidecar) == ["nut", "webm"]
+    muxer = argv["ffmpeg0"]
+    assert muxer[1] == "-copyts"
+    assert _formats(muxer) == ["webm", "nut", "hls"]
+    assert muxer[muxer.index("-var_stream_map") + 1] == (
+        "v:0,name:720p,s:0,sgroup:subs,sname:s0,default:yes"
+    )
+    err = _refused(
+        "COPY (SELECT s.video[1], s.data[2] FROM program() s) "
+        "TO 'out/master.m3u8' WITH (format 'hls')"
+    )
+    assert "takes video, audio and subtitle columns" in err.message
 
 
 def test_kinds_mix_in_one_call_and_a_left_out_port_is_unbound() -> None:

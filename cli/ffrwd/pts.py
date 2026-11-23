@@ -127,6 +127,7 @@ def insert_pts_resets(g: Graph) -> Graph:
             chapters=unit.chapters,
             metadata=unit.metadata,
             attachments=list(unit.attachments),
+            cue_mpegts=unit.cue_mpegts,
         )
         for unit in g.sinks
     ]

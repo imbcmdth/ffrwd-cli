@@ -254,3 +254,16 @@ from.
   annotation column. A CTE column bound to either, and a rows
   function's result, are refused - the rejection names what it does
   read. Merge the rows where they are produced instead.
+- **An hls subtitle segment holds the cues that start in it.** ffmpeg's
+  hls muxer writes each cue once, into the WebVTT segment open when the
+  cue starts, so a cue running past its segment's end is not repeated in
+  the next one. A player that plays on shows it whole; one that joins or
+  seeks into that next segment shows it from the cue after.
+- **A live input's cue rows cannot come back to the ffmpeg that read
+  it.** The ffmpeg reading a live input once opens every input before it
+  writes the picture a module reads, and the module's cues are one of
+  those inputs, so a query muxing a live input's own picture with the
+  cues a module writes over it is refused as a startup deadlock. A
+  source's cue rows, as `ffrwd.moq.subscribe` hands a program's text
+  track on, reach an hls destination while the run goes on; so do a
+  file's.

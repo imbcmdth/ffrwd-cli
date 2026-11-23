@@ -369,26 +369,155 @@ def test_a_gathered_array_does_not_transcribe() -> None:
     assert "one variant map entry" in err.message
 
 
-def test_a_subtitle_column_is_refused_at_a_manifest(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    subtitle = StreamMeta(
+def _subtitle(
+    index: int,
+    language: str,
+    codec: str = "subrip",
+    default: bool = False,
+    title: str | None = None,
+) -> StreamMeta:
+    metadata = {"language": language}
+    if title is not None:
+        metadata["title"] = title
+    return StreamMeta(
         type="subtitle",
-        index=0,
-        metadata={"language": "eng"},
+        index=index,
+        metadata=metadata,
         width=None,
         height=None,
         fps=None,
         sample_rate=None,
-        codec="subrip",
+        codec=codec,
+        disposition={"default": default},
     )
-    _stub(monkeypatch, _video(), _audio(0, "eng"), subtitle)
-    err = _rejects(
-        f"COPY (SELECT f.subtitle[1] FROM input('{SRC}') f) "
-        "TO 'm.m3u8' WITH (format 'hls')"
+
+
+# ---------------------------------------------------------------------------
+# subtitle renditions
+# ---------------------------------------------------------------------------
+
+
+def test_a_subtitle_column_is_a_rendition_the_variants_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subtitle track rides the first video variant's map entry, in the
+    one group, coded as WebVTT; the files go through the relay, which writes
+    each segment's X-TIMESTAMP-MAP, 1.4 s on for MPEG-TS segments."""
+    _stub(monkeypatch, _video(), _audio(0, "eng"), _subtitle(0, "eng"))
+    sql = (
+        f"COPY (SELECT f.video[1], f.audio[1], f.subtitle[1] FROM input('{SRC}') f) "
+        "TO 'out/master.m3u8' WITH (format 'hls', hls_time 2)"
     )
+    unit = _unit(sql)
+    assert unit.options["var_stream_map"] == (
+        "v:0,a:0,name:480p,s:0,sgroup:subs,sname:eng,language:eng,default:yes"
+    )
+    assert [output.type for output in unit.outputs] == ["video", "audio", "subtitle"]
+    assert unit.options["subtitle_codec"] == ["webvtt"]
+    assert unit.cue_mpegts == 126000
+    assert unit.path == "out/%v/index.m3u8"
+    argv = _argv(sql)
+    assert argv[-3:] == ["-method", "PUT", "ffrwd:hls:126000/out/%v/index.m3u8"]
+    segments = argv[argv.index("-hls_segment_filename") + 1]
+    assert segments == "ffrwd:hls:126000/out/%v/segment_%d.ts"
+    assert argv[argv.index("-c:2") + 1] == "webvtt"
+
+
+def test_a_ladder_carries_its_subtitles_on_the_first_rung() -> None:
+    unit = _unit(
+        _muxed(_HLS).replace(
+            "SELECT vid.v, aud.t FROM",
+            "SELECT vid.v, aud.t, ARRAY[STRUCT(1.0 AS start_t, 2.0 AS end_t, "
+            "'hola' AS text)::cue] AS captions FROM",
+        )
+    )
+    assert unit.options["var_stream_map"] == (
+        "v:0,a:0,name:480p,s:0,sgroup:subs,sname:captions,default:yes "
+        "v:1,a:1,name:240p"
+    )
+    # A written cue array is WebVTT already, so it is copied.
+    assert unit.options["subtitle_codec"] == ["copy"]
+    assert [output.type for output in unit.outputs].count("subtitle") == 1
+
+
+def test_fmp4_segments_keep_the_cues_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub(monkeypatch, _video(), _audio(0, "eng"), _subtitle(0, "eng", codec="webvtt"))
+    unit = _unit(
+        f"COPY (SELECT f.video[1], f.audio[1], f.subtitle[1] FROM input('{SRC}') f) "
+        "TO 'out/master.m3u8' WITH (format 'hls', hls_segment_type 'fmp4')"
+    )
+    assert unit.cue_mpegts == 0
+    assert unit.options["subtitle_codec"] == ["copy"]
+
+
+def test_two_languages_ride_two_rungs_named_by_title_or_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub(
+        monkeypatch,
+        _video(),
+        _audio(0, "eng"),
+        _subtitle(0, "eng", title="English SDH"),
+        _subtitle(1, "spa", default=True, title="Castellano"),
+    )
+    unit = _unit(
+        "COPY (WITH vid AS ("
+        "  SELECT scale(f.video[1], ARRAY[640, 320][i.i], -2) AS v"
+        f"  FROM input('{SRC}') f, generate_series(1, 2) i"
+        f") SELECT vid.v, g.subtitle[1], g.subtitle[2] FROM vid, input('{SRC}') g) "
+        "TO 'out/master.m3u8' WITH (format 'hls', video_codec 'libx264')"
+    )
+    # A title with a space cannot ride the map, so that one takes its language.
+    assert unit.options["var_stream_map"] == (
+        "v:0,name:480p,s:0,sgroup:subs,sname:eng,language:eng "
+        "v:1,name:240p,s:1,sgroup:subs,sname:Castellano,language:spa,default:yes"
+    )
+
+
+@pytest.mark.parametrize(
+    ("select", "destination", "said"),
+    [
+        (
+            "f.video[1], f.subtitle[1]",
+            "'m.mpd' WITH (format 'dash')",
+            "format 'dash' destination takes video and audio columns",
+        ),
+        (
+            "f.audio[1], f.subtitle[1]",
+            "'m.m3u8' WITH (format 'hls')",
+            "1 subtitle column and 0 video variants",
+        ),
+        (
+            "f.video[1], f.subtitle[1], f.subtitle[2]",
+            "'m.m3u8' WITH (format 'hls')",
+            "2 subtitle columns and 1 video variant",
+        ),
+        (
+            "f.video[1], f.subtitle[3]",
+            "'m.m3u8' WITH (format 'hls')",
+            "hdmv_pgs_subtitle subtitles, and format 'hls' writes WebVTT",
+        ),
+        (
+            "f.video[1], f.subtitle[1]",
+            "'http://origin.example/live/m.m3u8' WITH (format 'hls')",
+            "through the relay, which writes files",
+        ),
+    ],
+)
+def test_a_subtitle_rendition_format_hls_cannot_write_is_refused(
+    monkeypatch: pytest.MonkeyPatch, select: str, destination: str, said: str
+) -> None:
+    _stub(
+        monkeypatch,
+        _video(),
+        _audio(0, "eng"),
+        _subtitle(0, "eng"),
+        _subtitle(1, "fra"),
+        _subtitle(2, "deu", codec="hdmv_pgs_subtitle"),
+    )
+    err = _rejects(f"COPY (SELECT {select} FROM input('{SRC}') f) TO {destination}")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "video and audio columns" in err.message
+    assert said in err.message
 
 
 def test_a_null_stream_cannot_be_filtered() -> None:
