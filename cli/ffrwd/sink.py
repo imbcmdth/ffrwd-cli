@@ -335,15 +335,6 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-hls_list_size",
         per_stream=False,
     ),
-    "master_pl_publish_rate": SinkOptionSpec(
-        name="master_pl_publish_rate",
-        scope="container",
-        type="int",
-        doc="Write the master playlist again every this many segments, which a copy "
-        "needs to name its variants before the end (format 'hls' only).",
-        flag="-master_pl_publish_rate",
-        per_stream=False,
-    ),
     "hls_start_number_source": SinkOptionSpec(
         name="hls_start_number_source",
         scope="container",
@@ -456,7 +447,6 @@ MANIFEST_OPTION_FORMATS: dict[str, str] = {
     "hls_fmp4_init_filename": "hls",
     "master_pl_name": "hls",
     "hls_list_size": "hls",
-    "master_pl_publish_rate": "hls",
     "hls_start_number_source": "hls",
     "seg_duration": "dash",
     "use_template": "dash",

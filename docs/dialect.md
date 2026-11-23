@@ -2218,10 +2218,7 @@ A live playlist names the newest five segments, ffmpeg's default;
 `hls_list_size` names more, and 0 names every one. A run of a live query
 that starts again numbers its segments from 0, over the names the last
 one wrote, unless `hls_start_number_source 'epoch'` numbers them from
-the time it started. A copy states no bitrate, and ffmpeg writes a
-master playlist that names no variant until it knows one, which on a
-live input is the end: `master_pl_publish_rate 1` writes the master
-again after every segment, with the bitrate the segments measure.
+the time it started.
 
 `WITH (format 'segment')` cuts a file destination into files, one name
 numbering them all: `TO 'rec/part-%06d.mp4'`. A file ends at the first
@@ -2253,7 +2250,7 @@ COPY (SELECT s.* FROM input('srt://0.0.0.0:9000?mode=listener') s)
 The format-specific options (`hls_time`, `hls_playlist_type`,
 `hls_flags`, `hls_segment_type`, `hls_segment_filename`,
 `hls_fmp4_init_filename`, `master_pl_name`, `hls_list_size`,
-`master_pl_publish_rate`, `hls_start_number_source`; `seg_duration`, `use_template`,
+`hls_start_number_source`; `seg_duration`, `use_template`,
 `use_timeline`, `init_seg_name`, `media_seg_name`, `single_file`;
 `segment_time`, `segment_list`; `strftime` for `segment` and `image2`)
 are refused outside their format. Sink options (`WITH
