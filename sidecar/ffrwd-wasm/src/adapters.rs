@@ -1595,7 +1595,7 @@ mod settled_delay_tests {
         // x264 with B-frames, as a fragmented MP4 track carries it: the
         // keyframe at pts 6144 decodes two 2048-tick frames early.
         let opening = packet(6144, Some(2048));
-        assert_eq!(settled_delay(&[opening.clone()]), None);
+        assert_eq!(settled_delay(std::slice::from_ref(&opening)), None);
         let packets = [
             opening,
             packet(14336, Some(4096)),
