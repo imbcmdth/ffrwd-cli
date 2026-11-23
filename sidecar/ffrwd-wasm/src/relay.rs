@@ -15,8 +15,13 @@
 //! {"listen": {"host": HOST, "keys": [KEY, ...]}}
 //!     opens the node's data port for the cut edges other nodes send here,
 //!     and answers {"kind":"relay","listening":[HOST, PORT]}
+//! {"hls": {"key": KEY, "mpegts": N}}
+//!     takes an HLS destination's files over HTTP on loopback, opening the
+//!     endpoint the first time, and answers {"kind":"relay","hls":[HOST, PORT]}
+//!     (see [`crate::hls_put`])
 //! stdin closed
-//!     aborts every edge still open, unlinks every FIFO, and exits 0
+//!     waits for the HLS files still arriving, aborts every edge still open,
+//!     unlinks every FIFO, and exits 0
 //! ```
 //!
 //! An END is a pipe PATH the relay makes and serves, or one side of an edge
@@ -71,6 +76,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::hls_put;
 use crate::leaky::ROW_PREFIX;
 
 /// The most one read takes off a pipe, and the size of every buffer the
@@ -213,6 +219,16 @@ enum Command {
     /// Where to open the data port and the keys it takes, or what is wrong
     /// with the command.
     Listen(Result<(String, Vec<String>), String>),
+    /// An HLS destination's key and the MPEG-TS time its WebVTT segments map
+    /// a cue time of zero to, or what is wrong with the command.
+    Hls(Result<(String, u64), String>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HlsLine {
+    key: String,
+    mpegts: u64,
 }
 
 #[derive(Deserialize)]
@@ -231,7 +247,7 @@ fn parse_command(line: &str) -> Result<Command, String> {
     let Value::Object(mut fields) = value else {
         return Err("a command that is not a JSON object".to_string());
     };
-    for only in ["stop", "listen"] {
+    for only in ["stop", "listen", "hls"] {
         if fields.contains_key(only) && fields.len() > 1 {
             return Err(format!(
                 "a \"{only}\" command takes nothing else, and this one has {}",
@@ -250,9 +266,16 @@ fn parse_command(line: &str) -> Result<Command, String> {
             .map_err(|e| format!("\"listen\" is {{\"host\": HOST, \"keys\": [KEY, ...]}}: {e}"));
         return Ok(Command::Listen(listen));
     }
+    if let Some(hls) = fields.remove("hls") {
+        let hls = serde_json::from_value::<HlsLine>(hls)
+            .map(|line| (line.key, line.mpegts))
+            .map_err(|e| format!("\"hls\" is {{\"key\": KEY, \"mpegts\": N}}: {e}"));
+        return Ok(Command::Hls(hls));
+    }
     let Some(batch) = fields.remove("batch") else {
         return Err(
-            "a command that is none of a batch (\"batch\" and \"edges\"), a \"stop\" or a \"listen\""
+            "a command that is none of a batch (\"batch\" and \"edges\"), a \"stop\", a \
+             \"listen\" or an \"hls\""
                 .to_string(),
         );
     };
@@ -384,6 +407,8 @@ struct Said<'a> {
     edge: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     listening: Option<(&'a str, u16)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hls: Option<(&'a str, u16)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     refused: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1429,6 +1454,8 @@ pub fn main(args: &[String]) -> i32 {
         ..Relay::default()
     });
 
+    let mut hls_endpoint: Option<Arc<hls_put::Endpoint>> = None;
+
     let watched = Arc::clone(&relay);
     spawn_or_fault("relay-report".to_string(), move || loop {
         thread::sleep(REPORT_EVERY);
@@ -1474,11 +1501,33 @@ pub fn main(args: &[String]) -> i32 {
                     Err(error) => say_fault(&error),
                 }
             }
+            Ok(Command::Hls(hls)) => {
+                let opened = hls.and_then(|(key, mpegts)| {
+                    if hls_endpoint.is_none() {
+                        let endpoint = hls_put::Endpoint::open(say_fault)
+                            .map_err(|e| format!("opening the HLS endpoint: {e}"))?;
+                        hls_endpoint = Some(endpoint);
+                    }
+                    let endpoint = hls_endpoint.as_ref().expect("opened above");
+                    endpoint.add(key, mpegts);
+                    Ok(endpoint.address())
+                });
+                match opened {
+                    Ok(address) => say(Said {
+                        hls: Some((&address.ip().to_string(), address.port())),
+                        ..Said::default()
+                    }),
+                    Err(error) => say_fault(&error),
+                }
+            }
             Err(error) => {
                 say_fault(&error);
                 return relay.shut(1);
             }
         }
+    }
+    if let Some(endpoint) = &hls_endpoint {
+        endpoint.drain(hls_put::DRAIN_WAIT);
     }
     relay.shut(0)
 }

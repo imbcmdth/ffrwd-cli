@@ -20,6 +20,7 @@ mod edges;
 mod feeds;
 mod graph;
 mod heartbeat;
+mod hls_put;
 mod hold;
 mod host_nodes;
 mod lanes;
