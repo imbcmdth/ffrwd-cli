@@ -462,7 +462,10 @@ from ffrwd.sink import (
     MANIFEST_MAP_OPTION,
     MANIFEST_OPTION_FORMATS,
     MANIFEST_SEGMENT_OPTION,
+    SEGMENT_FORMAT,
+    SEGMENT_OPTIONS,
     SINK_OPTIONS,
+    STRFTIME_FORMATS,
     TWO_PASS_CODECS,
     bits_per_second,
     copy_suppressed_scopes,
@@ -2274,6 +2277,22 @@ def _validated_option(name: str, written: object, *, line: int, col: int) -> obj
                 ) from None
         return checked
     return validate_sink_option(name, written, line=line, col=col)
+
+
+# A conversion in a file name: `%d` or `%06d` as the segment muxer numbers
+# files, or one of strftime's letters.
+_NAME_CONVERSION = re.compile(r"%(\d*)([A-Za-z])")
+
+
+def _names_files(path: str, *, timed: bool) -> bool:
+    """Whether a cut destination's name tells its files apart: one `%d`,
+    padded or not and nothing else, which the muxer numbers; or under
+    strftime any of strftime's conversions, which it fills with the time
+    each file opened."""
+    found = _NAME_CONVERSION.findall(path.replace("%%", ""))
+    if timed:
+        return bool(found)
+    return [letter for _, letter in found] == ["d"]
 
 
 def _manifest_format(raw: RawSink) -> str | None:
@@ -5159,6 +5178,8 @@ class _Lowerer:
             path = self._derive_manifest(
                 options, option_nodes, columns, variant_rows, outputs, path, raw
             )
+        if options.get("format") == SEGMENT_FORMAT:
+            self._derive_segment(options, path, raw)
         self._derive_time_keyframes(options, outputs)
         colorimetry = self._place_encoders(raw, encoders, options, outputs, path)
         self._place_packet_filters(raw, options, outputs, first_filter)
@@ -6420,6 +6441,26 @@ class _Lowerer:
         hand-written map spelling is refused the way the option itself is.
         """
         for name in options:
+            if name in SEGMENT_OPTIONS and options.get("format") != SEGMENT_FORMAT:
+                raise _error(
+                    ErrorCode.SINK_OPTION_TYPE,
+                    f"option '{name}' belongs to format '{SEGMENT_FORMAT}', which cuts "
+                    "the destination into files",
+                    option_nodes.get(name),
+                    fallback=raw.path_node,
+                    hint=f"set format '{SEGMENT_FORMAT}' and number the files with %d "
+                    f"in the name, or drop {name}",
+                )
+            if name == "strftime" and options.get("format") not in STRFTIME_FORMATS:
+                formats = " or ".join(f"'{one}'" for one in sorted(STRFTIME_FORMATS))
+                raise _error(
+                    ErrorCode.SINK_OPTION_TYPE,
+                    f"option 'strftime' names the files of format {formats}, and this "
+                    "COPY writes no such files",
+                    option_nodes.get(name),
+                    fallback=raw.path_node,
+                    hint=f"set format {formats}, or drop strftime",
+                )
             wanted = MANIFEST_OPTION_FORMATS.get(name)
             if wanted is None or wanted == self.manifest:
                 continue
@@ -6613,6 +6654,37 @@ class _Lowerer:
         if options.get("hls_segment_type") == "fmp4":
             options.setdefault("hls_fmp4_init_filename", "init.mp4")
         return f"{prefix}%v/index.m3u8"
+
+    def _derive_segment(
+        self, options: dict[str, object], path: str | None, raw: RawSink
+    ) -> None:
+        """What ``format 'segment'`` owns: each file's clock starting at
+        zero, and the options of each file's own muxer handed to it.
+
+        The destination names every file at once, so its name has to
+        number them, or under ``strftime`` hold the time each was opened.
+        Each file's muxer is the one its extension names, and the segment
+        muxer takes no ``-movflags`` of its own: ``movflags`` and
+        ``faststart`` reach the mp4 or mov muxer of each file through
+        ``segment_format_options``, where they would otherwise be dropped
+        with a warning.
+        """
+        timed = options.get("strftime") is True
+        if path is not None and not _names_files(path, timed=timed):
+            raise _error(
+                ErrorCode.SINK_OPTION_TYPE,
+                f"format '{SEGMENT_FORMAT}' writes many files, and '{path}' names one",
+                raw.path_node,
+                hint="number the files with %d in the name, e.g. 'rec/part-%06d.mp4', "
+                "or name them by when each opened with strftime true and "
+                "'rec/%Y%m%dT%H%M%S.mp4'",
+            )
+        options["reset_timestamps"] = True
+        flags = options.pop("movflags", None)
+        if options.pop("faststart", None) is True:
+            flags = "+faststart"
+        if isinstance(flags, str):
+            options["segment_format_options"] = f"movflags={flags}"
 
     def _derive_keyframes(
         self,

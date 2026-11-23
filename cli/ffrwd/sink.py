@@ -326,6 +326,53 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-master_pl_name",
         per_stream=False,
     ),
+    "hls_list_size": SinkOptionSpec(
+        name="hls_list_size",
+        scope="container",
+        type="int",
+        doc="How many of the newest segments a live HLS playlist names; 0 names "
+        "every one (format 'hls' only; default 5).",
+        flag="-hls_list_size",
+        per_stream=False,
+    ),
+    "hls_start_number_source": SinkOptionSpec(
+        name="hls_start_number_source",
+        scope="container",
+        type="str",
+        doc="What HLS numbers its first segment from: 'generic' (0), 'epoch', "
+        "'epoch_us' or 'datetime' (format 'hls' only).",
+        flag="-hls_start_number_source",
+        per_stream=False,
+    ),
+    "segment_time": SinkOptionSpec(
+        name="segment_time",
+        scope="container",
+        type="num",
+        doc="Seconds each file of a cut destination runs before the next starts, "
+        "at the first keyframe past them (format 'segment' only; default 2).",
+        flag="-segment_time",
+        per_stream=False,
+    ),
+    "segment_list": SinkOptionSpec(
+        name="segment_list",
+        scope="container",
+        type="str",
+        doc="A list a cut destination adds each file to once it is finished; a "
+        ".csv gives each file's start and end times (format 'segment' only).",
+        flag="-segment_list",
+        per_stream=False,
+    ),
+    "strftime": SinkOptionSpec(
+        name="strftime",
+        scope="container",
+        type="bool",
+        doc="Name each file by the local time it was opened, the name's %Y, %m, "
+        "%d, %H, %M and %S filled in as strftime fills them (format 'segment' "
+        "or 'image2' only).",
+        flag="-strftime",
+        per_stream=False,
+        value_template="1",
+    ),
     "seg_duration": SinkOptionSpec(
         name="seg_duration",
         scope="container",
@@ -399,6 +446,8 @@ MANIFEST_OPTION_FORMATS: dict[str, str] = {
     "hls_segment_filename": "hls",
     "hls_fmp4_init_filename": "hls",
     "master_pl_name": "hls",
+    "hls_list_size": "hls",
+    "hls_start_number_source": "hls",
     "seg_duration": "dash",
     "use_template": "dash",
     "use_timeline": "dash",
@@ -406,6 +455,16 @@ MANIFEST_OPTION_FORMATS: dict[str, str] = {
     "media_seg_name": "dash",
     "single_file": "dash",
 }
+
+# The format that cuts a file destination into files, and the options that
+# belong to it alone. Its destination is one name that tells the files
+# apart: a `%d` numbering them, or under strftime the time each opened.
+SEGMENT_FORMAT = "segment"
+SEGMENT_OPTIONS: frozenset[str] = frozenset({"segment_time", "segment_list"})
+
+# The formats whose files `strftime` names by the time each was opened: a
+# cut destination's files, and an image sequence's pictures.
+STRFTIME_FORMATS: frozenset[str] = frozenset({SEGMENT_FORMAT, "image2"})
 
 # The muxer's own default segment length, per manifest format: what the
 # keyframe-alignment derivation reads when the query leaves the length unset.
@@ -528,6 +587,28 @@ _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         type="str",
         doc="The DASH adaptation sets, transcribed from the COPY's rows.",
         flag="-adaptation_sets",
+        per_stream=False,
+    ),
+    # A cut destination's derived surface: each file's clock starts at zero,
+    # as a file played alone should, and the options of each file's own
+    # muxer reach it through the segment muxer, which takes no -movflags of
+    # its own.
+    "reset_timestamps": SinkOptionSpec(
+        name="reset_timestamps",
+        scope="container",
+        type="bool",
+        doc="Each file of a cut destination starts its timestamps at zero.",
+        flag="-reset_timestamps",
+        per_stream=False,
+        value_template="1",
+        false_template="0",
+    ),
+    "segment_format_options": SinkOptionSpec(
+        name="segment_format_options",
+        scope="container",
+        type="str",
+        doc="The options of each file's own muxer, as key=value:key=value.",
+        flag="-segment_format_options",
         per_stream=False,
     ),
     "keyint_min": SinkOptionSpec(

@@ -2214,11 +2214,46 @@ Under a manifest format the compiler owns what the format needs:
   disposition says otherwise. A hand-written map is refused, naming
   what the compiler would write.
 
+A live playlist names the newest five segments, ffmpeg's default;
+`hls_list_size` names more, and 0 names every one. A run of a live query
+that starts again numbers its segments from 0, over the names the last
+one wrote, unless `hls_start_number_source 'epoch'` numbers them from
+the time it started.
+
+`WITH (format 'segment')` cuts a file destination into files, one name
+numbering them all: `TO 'rec/part-%06d.mp4'`. A file ends at the first
+keyframe once `segment_time` seconds have passed (2 when unset), so on
+a copy each file starts on a keyframe and runs as long as the groups
+that fill it. Each file's muxer is the one its extension names, and the
+compiler owns the rest: each file's timestamps start at zero, as a
+file played alone should, and `movflags` or `faststart` reach each
+file's mp4 or mov muxer (`-segment_format_options`) instead of the
+segment muxer, which has none of its own. `segment_list` names a list
+the muxer adds each file to as it finishes it; a `.csv` gives each
+file's name and its start and end in the stream. A name that is not one
+`%d` and nothing else is refused, since it names one file or none the
+muxer can fill in.
+
+`strftime true` names each file by the local time it was opened
+instead, filling the name's `%Y`, `%m`, `%d`, `%H`, `%M` and `%S` as
+strftime does: on a live input that is when the file's first frame
+arrived. It names the files of `format 'segment'` and the pictures of
+`format 'image2'`, and is refused anywhere else.
+
+```sql
+COPY (SELECT s.* FROM input('srt://0.0.0.0:9000?mode=listener') s)
+  TO 'rec/%Y%m%dT%H%M%S.mp4'
+  WITH (format 'segment', segment_time 300, strftime true,
+        movflags '+frag_keyframe+empty_moov+default_base_moof')
+```
+
 The format-specific options (`hls_time`, `hls_playlist_type`,
 `hls_flags`, `hls_segment_type`, `hls_segment_filename`,
-`hls_fmp4_init_filename`, `master_pl_name`; `seg_duration`,
-`use_template`, `use_timeline`, `init_seg_name`, `media_seg_name`,
-`single_file`) are refused outside their format. Sink options (`WITH
+`hls_fmp4_init_filename`, `master_pl_name`, `hls_list_size`,
+`hls_start_number_source`; `seg_duration`, `use_template`,
+`use_timeline`, `init_seg_name`, `media_seg_name`, `single_file`;
+`segment_time`, `segment_list`; `strftime` for `segment` and `image2`)
+are refused outside their format. Sink options (`WITH
 (...)`) cover codecs, quality, bitrate control, metadata copying,
 two-pass - the full table is generated into the prompt (`ffrwd
 prompt`) and validated per option with typed errors; a sink function
