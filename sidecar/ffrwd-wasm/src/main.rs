@@ -2063,6 +2063,12 @@ impl<W: Write> SubtitleOutput<W> {
         Ok(())
     }
 
+    /// A stream's heartbeat once the host's time has reached `seconds`.
+    fn progress(&mut self, seconds: f64) -> Result<()> {
+        let beat = self.cues.progress(seconds);
+        self.write(&beat)
+    }
+
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
@@ -2214,6 +2220,12 @@ impl Sink {
             if let Some(w) = self.subtitles.as_mut() {
                 w.push(&routed)?;
             }
+        }
+        // The cues ride these frames, so a stream of them has reached the
+        // last one's time.
+        if let (Some(w), Some(last)) = (self.subtitles.as_mut(), frames.last()) {
+            let base = self.time_base;
+            w.progress(last.pts as f64 * base.num as f64 / base.den.max(1) as f64)?;
         }
         if frames.is_empty() {
             return Ok(());

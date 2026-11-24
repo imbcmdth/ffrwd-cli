@@ -268,7 +268,8 @@ message's own text, which is otherwise written as the node made it),
 progress dropped; a self-clocked node with inputs ticks on the host's clock, so its
 rows are left as it wrote them. `-f srt` and `-f webvtt` take one
 data label of cues each and write the document whole once it ends; `-f
-webm` takes one and writes each cue as its row arrives (see
+webm` takes one and writes each cue as its row arrives, and a heartbeat
+lasting no time as the node's time moves on between them (see
 SUBTITLE-EDGE.md); `-f null` takes any.
 
 A network with no `-i` at all is a source: it runs until its nodes finish
@@ -621,7 +622,7 @@ carries the sound and the picture in one NUT.
 
     ffrwd-wasm -f nut -i pipe:0 -m hear=hear.wasm -m burn=burn.wasm -filter_complex \
       '[a=0:a]hear[cues=out1];[v=0:v][words=out1]burn[v=out0]' -map '[out0]' -f nut \
-      '<named pipe n2>' -map '[out1]' -f webvtt '<named pipe cues>'
+      '<named pipe n2>' -map '[out1]' -f webm '<named pipe cues>'
 
 **148.** Mixed kinds in one call. The input carries a sound, the picture
 and the same sound again; `[a=0:a:1]` is the second.

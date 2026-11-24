@@ -907,7 +907,7 @@ fn open(
                     );
                 }
                 match output.kind {
-                    OutputKind::Subtitles(format) => Target::Subtitles(format),
+                    OutputKind::Subtitles(format) => Target::Subtitles(format, def.base),
                     _ if host_timed(&lanes, *id) => Target::Ndjson(None),
                     _ => Target::Ndjson(Some(def.base)),
                 }

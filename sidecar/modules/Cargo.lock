@@ -2192,6 +2192,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "speaker"
+version = "0.1.0"
+dependencies = [
+ "ffrwd-node",
+ "serde",
+ "stand-ins",
+]
+
+[[package]]
 name = "spm_precompiled"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

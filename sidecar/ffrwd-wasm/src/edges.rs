@@ -202,8 +202,9 @@ pub enum Target {
     /// label's time base where it has one.
     Ndjson(Option<TimeBase>),
     /// One data label of cues: a document written whole once it ends, or a
-    /// stream written cue by cue.
-    Subtitles(subtitles::Format),
+    /// stream written cue by cue, beating in the label's time base as the
+    /// host's time moves on.
+    Subtitles(subtitles::Format, TimeBase),
     Null,
 }
 
@@ -431,7 +432,7 @@ fn write_all(
             }
             Ok(writer.into_inner().map_err(|e| e.into_error())?)
         }
-        Target::Subtitles(format) => {
+        Target::Subtitles(format, base) => {
             let mut cues = subtitles::Writer::new(format);
             let mut writer = writer;
             // A stream's header goes out before any cue, so its reader can
@@ -448,6 +449,14 @@ fn write_all(
                             cues.push_row(&String::from_utf8_lossy(&m.data), format.name())?;
                         if !block.is_empty() {
                             writer.write_all(&block)?;
+                            writer.flush()?;
+                        }
+                    }
+                    Out::Progress(pts) => {
+                        let seconds = pts as f64 * base.num as f64 / base.den.max(1) as f64;
+                        let beat = cues.progress(seconds);
+                        if !beat.is_empty() {
+                            writer.write_all(&beat)?;
                             writer.flush()?;
                         }
                     }

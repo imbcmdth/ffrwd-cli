@@ -8,6 +8,13 @@
 //! form: WebVTT in WebM, each cue written the moment its row arrives with its
 //! end time in the block, which ffmpeg reads as it goes.
 //!
+//! ffmpeg reads no input more than a tenth of a second ahead of an output's
+//! furthest-behind stream, and a cue stream falls behind between
+//! utterances, so a stream also carries heartbeats: a cue lasting no time
+//! at the time the host has reached, written as that time moves on. ffmpeg
+//! counts them, and the compiler drops them before the muxer
+//! (`noise=drop=not(duration)`), so no file holds one.
+//!
 //! Only a finished cue is written. A row whose `final` is false is an
 //! utterance still growing, sent again as it grows, and would make cues that
 //! overlap; a row with no `final` counts as finished. A row's `voice` names
@@ -19,6 +26,10 @@
 
 use anyhow::{bail, Result};
 use serde_json::{Map, Value};
+
+/// What a heartbeat says: a space, since ffmpeg's matroska demuxer refuses a
+/// WebVTT block with no text.
+const HEARTBEAT: &str = " ";
 
 /// The names a cue row carries: two bounds and its text, and whether it is
 /// finished and who says it where the producer knows.
@@ -187,6 +198,8 @@ pub struct Writer {
     cues: Vec<Cue>,
     /// The start of the last cue a stream wrote, in milliseconds.
     last_start: u64,
+    /// The time of the last heartbeat a stream wrote, in milliseconds.
+    last_beat: Option<u64>,
 }
 
 impl Writer {
@@ -195,7 +208,25 @@ impl Writer {
             format,
             cues: Vec::new(),
             last_start: 0,
+            last_beat: None,
         }
+    }
+
+    /// What a stream writes once the host's time has reached `seconds`: a
+    /// heartbeat, a cue lasting no time, when that time is past the last one.
+    /// A cue still to come keeps its own start, however far back that is,
+    /// since a heartbeat orders nothing: it never reaches a file. A document
+    /// writes nothing until it ends.
+    pub fn progress(&mut self, seconds: f64) -> Vec<u8> {
+        if self.format != Format::WebM {
+            return Vec::new();
+        }
+        let at = millis(seconds);
+        if self.last_beat.is_some_and(|last| at <= last) {
+            return Vec::new();
+        }
+        self.last_beat = Some(at);
+        webm::cue(at, 0, HEARTBEAT)
     }
 
     /// What the output starts with, written before any row arrives: a
@@ -617,5 +648,23 @@ mod tests {
             .expect("a row")
             .is_empty());
         assert!(writer.finish().is_empty());
+    }
+
+    #[test]
+    fn a_stream_beats_as_time_moves_on_and_a_late_cue_keeps_its_start() {
+        let mut writer = Writer::new(Format::WebM);
+        assert_eq!(writer.progress(1.0), webm::cue(1000, 0, " "));
+        // Time standing still beats no more.
+        assert!(writer.progress(1.0).is_empty());
+        assert_eq!(writer.progress(9.5), webm::cue(9500, 0, " "));
+        // A cue said at 5 s, finished only now, is written at 5 s.
+        assert_eq!(
+            writer
+                .push_row(r#"{"start_t":5.0,"end_t":6.0,"text":"tarde"}"#, OUT)
+                .expect("a row"),
+            webm::cue(5000, 1000, "tarde")
+        );
+        // A document has nothing to beat.
+        assert!(Writer::new(Format::WebVtt).progress(1.0).is_empty());
     }
 }

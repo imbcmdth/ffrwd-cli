@@ -40,6 +40,17 @@ Each cue is a cluster of its own, its block's data the cue's empty identifier
 and settings lines and then its text, its duration the cue's, in
 milliseconds.
 
+Between cues a `webm` output writes heartbeats: each time the node's time
+moves on, a block at that time lasting no time, its text a single space
+(ffmpeg's matroska demuxer refuses an empty WebVTT block). ffmpeg reads no
+input more than a tenth of a second ahead of an output's furthest-behind
+stream, so a cue stream with nothing to say would stop it reading the
+picture beside it, and the picture's pipe would fill. The heartbeats keep the
+cue stream level with the picture. Every cue lasts, so the reading ffmpeg
+drops the heartbeats by their duration before its muxer:
+
+    -c:s copy -bsf:s noise=drop=not(duration)
+
 The rows output that already exists is spelled the same way, and writes one
 NDJSON line per row as the rows arrive:
 
@@ -92,7 +103,9 @@ blank line inside it, which would end the cue, is dropped.
 A document's cues are written in the order the rows arrive, numbered from 1.
 A `webm` stream's go out in the order they start, since its reader takes
 each as the next packet: a cue whose row arrives after a later cue's starts
-where that one did, and one that ended by then is dropped. A row object
+where that one did, and one that ended by then is dropped. Heartbeats take no
+part in that order: a cue whose row arrives late keeps its own start however
+far the heartbeats have gone. A row object
 carrying none of the three names is skipped: that is the other arm of a
 module's `oneOf` rows schema, such as transcribe's trailing
 `{"transcript": ...}`. A row carrying some of them but not all, or one whose
@@ -107,8 +120,9 @@ an input and encodes it into the container:
     ffmpeg -i video.mp4 -i subs.srt -c:v copy -c:a copy \
       -c:s mov_text -metadata:s:s:0 language=eng out.mp4
 
-A `webm` stream is an input too, `-f webm -i <pipe>`, and an hls destination
-copies its cues into the WebVTT segments it cuts.
+A `webm` stream is an input too, `-f webm -i <pipe>`, and the one the compiler
+hands a module's cue track over: a file's muxer copies or encodes its cues,
+and an hls destination copies them into the WebVTT segments it cuts.
 
 The language tag is the compiler's to write; the sidecar does not put one in
 the document.
