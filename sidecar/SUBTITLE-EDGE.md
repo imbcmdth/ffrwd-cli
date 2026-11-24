@@ -40,16 +40,24 @@ Each cue is a cluster of its own, its block's data the cue's empty identifier
 and settings lines and then its text, its duration the cue's, in
 milliseconds.
 
-Between cues a `webm` output writes heartbeats: each time the node's time
-moves on, a block at that time lasting no time, its text a single space
-(ffmpeg's matroska demuxer refuses an empty WebVTT block). ffmpeg reads no
-input more than a tenth of a second ahead of an output's furthest-behind
-stream, so a cue stream with nothing to say would stop it reading the
-picture beside it, and the picture's pipe would fill. The heartbeats keep the
-cue stream level with the picture. Every cue lasts, so the reading ffmpeg
-drops the heartbeats by their duration before its muxer:
+Between cues a `webm` output writes heartbeats: a block lasting no time, its
+text a single space (ffmpeg's matroska demuxer refuses an empty WebVTT
+block), each time the node writing the cues moves on. ffmpeg reads no input
+more than a tenth of a second ahead of an output's furthest-behind stream,
+so a cue stream with nothing to say would stop it reading the picture beside
+it, and the picture's pipe would fill. The heartbeats keep the cue stream
+level with the picture. Every cue lasts, so the reading ffmpeg drops the
+heartbeats by their duration before its muxer:
 
     -c:s copy -bsf:s noise=drop=not(duration)
+
+A heartbeat is at the newest time the node has handed on any of its outputs,
+its picture's where it writes one, as well as at the cue label's own
+progress. A text track can run seconds behind the picture beside it, as one
+ffrwd/moq's `subscribe` reads runs three seconds behind, held there by its
+publisher, and a cue stream beating on the text track's time would hold the
+picture back by as much. Only the cue stream hears these beats: a node
+reading the same cue label still waits on the label's own progress.
 
 The rows output that already exists is spelled the same way, and writes one
 NDJSON line per row as the rows arrive:

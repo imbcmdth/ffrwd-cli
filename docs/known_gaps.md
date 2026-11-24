@@ -262,7 +262,11 @@ from.
   row is finished only after its segment was cut is written into the
   segment open when the row arrives, still at its own time, which a
   player shows only if it loads that segment before it plays past that
-  time.
+  time. A text track `ffrwd.moq.subscribe` reads runs three seconds
+  behind its picture, so most of its cues land one segment late. A live
+  viewer still sees each on time: a live player stays three target
+  durations or more behind the newest segment, as the HLS specification
+  asks of it, so it loads that segment before it plays the cue's time.
 - **A live input's cue rows cannot come back to the ffmpeg that read
   it.** The ffmpeg reading a live input once opens every input before it
   writes the picture a module reads, and the module's cues are one of

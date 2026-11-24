@@ -40,7 +40,7 @@ use ffrwd_wasm_runtime::runtime::{Frame, Message, TimeBase};
 use crate::adapters::frames_tick;
 use crate::edges::{Out, Queue};
 use crate::hold::SourceInfo;
-use crate::tick::{Assembler, Item, Lockstep};
+use crate::tick::{compare, Assembler, Item, Lockstep};
 
 /// Opens one more instance of a lane's node.
 pub type Opener = Arc<dyn Fn() -> Result<Box<dyn Node>> + Send + Sync>;
@@ -334,6 +334,8 @@ struct State {
     /// Every lane has ended, or every output has stopped taking anything.
     finished: bool,
     cap: usize,
+    /// Some output is a cue stream beating on its producer's clock.
+    beating: bool,
 }
 
 struct Shared {
@@ -1230,6 +1232,10 @@ impl State {
             }
             leaving.extend(deliveries);
         }
+        let newest = match self.beating {
+            true => self.newest(i, &leaving),
+            false => None,
+        };
         for (stream, delivery) in superseded_progress_dropped(leaving) {
             match delivery {
                 Delivery::Item(item) => self.arrive(stream, item)?,
@@ -1245,10 +1251,71 @@ impl State {
                 }
             }
         }
+        if let (Some((at, base)), false) = (newest, self.lanes[i].ended) {
+            self.beat(i, at, base);
+        }
         if self.lanes.iter().all(|l| l.ended) {
             self.finished = true;
         }
         Ok(())
+    }
+
+    /// The newest time lane `i` hands on in `leaving`, on any port, with
+    /// the base of the port it is on.
+    fn newest(&self, i: usize, leaving: &[(u32, Delivery)]) -> Option<(i64, TimeBase)> {
+        let lane = &self.lanes[i];
+        let mut newest: Option<(i64, TimeBase)> = None;
+        for (stream, delivery) in leaving {
+            let at = match delivery {
+                Delivery::Item(Item::Frame(f)) => f.pts,
+                Delivery::Item(Item::Packet(p)) => p.pts,
+                Delivery::Item(Item::Message(m)) => m.pts,
+                Delivery::Progress(at) => *at,
+                Delivery::End | Delivery::Trailing(_) | Delivery::Batch => continue,
+            };
+            let Some(port) = lane
+                .ports
+                .iter()
+                .flatten()
+                .find(|p| p.out.stream == *stream)
+            else {
+                continue;
+            };
+            let base = port.out.base;
+            if newest.is_none_or(|(n, nb)| compare(at, base, n, nb).is_gt()) {
+                newest = Some((at, base));
+            }
+        }
+        newest
+    }
+
+    /// Lane `i` has handed on as far as `at`: every cue stream it feeds
+    /// beats there, and nothing else hears of it. Its other readers go by
+    /// the lane's own progress, which on a text port can run seconds behind
+    /// its picture.
+    fn beat(&mut self, i: usize, at: i64, base: TimeBase) {
+        let ports: Vec<PortOut> = self.lanes[i]
+            .ports
+            .iter()
+            .flatten()
+            .map(|p| p.out)
+            .collect();
+        for port in ports {
+            self.beat_stream(port.stream, model::rescale(at, base, port.base));
+        }
+    }
+
+    fn beat_stream(&mut self, stream: u32, pts: i64) {
+        for mirror in self.mirrors(stream) {
+            self.beat_stream(mirror, pts);
+        }
+        for consumer in self.consumers(stream) {
+            if let Consumer::Writer(w, s) = consumer {
+                if self.writers[w].beats_with_its_producer() {
+                    self.writers[w].push(s, Out::Progress(pts));
+                }
+            }
+        }
     }
 
     /// Whether every output has stopped taking anything: the run has no
@@ -1430,6 +1497,7 @@ impl Scheduler {
                 unbuffered: spec.unbuffered,
             });
         }
+        let beating = writers.iter().any(|w| w.beats_with_its_producer());
         let mut state = State {
             lanes,
             consumers,
@@ -1438,6 +1506,7 @@ impl Scheduler {
             error: None,
             finished: false,
             cap: workers * 2 + 2,
+            beating,
         };
         for j in 0..state.lanes.len() {
             state.cut(j)?;
@@ -2012,6 +2081,162 @@ mod tests {
             .expect("the run");
         writer.join();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A program read back: a packet of picture a call, and on its text
+    /// port a progress mark three seconds behind it, as ffrwd/moq's
+    /// subscribe hands on a text track its publisher held back.
+    struct Program {
+        shape: NodeShape,
+        made: i64,
+    }
+
+    const PROGRAM_PICTURES: i64 = 120;
+
+    impl Node for Program {
+        fn name(&self) -> &str {
+            "program"
+        }
+
+        fn shape(&self) -> &NodeShape {
+            &self.shape
+        }
+
+        fn set_params(&mut self, _params: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn process(&mut self, tick: Tick) -> Result<Emitted> {
+            if tick.last {
+                return Ok(Emitted::default());
+            }
+            let k = self.made;
+            self.made += 1;
+            let mut items = vec![model::Emission {
+                port: 0,
+                payload: Payload::Packet(ffrwd_wasm_runtime::runtime::Packet {
+                    pts: k,
+                    dts: Some(k),
+                    duration: Some(1),
+                    keyframe: true,
+                    data: vec![0],
+                }),
+            }];
+            if k >= 90 {
+                items.push(model::Emission {
+                    port: 1,
+                    payload: Payload::Message(Message {
+                        pts: (k - 90) * 1000 / 30,
+                        data: Vec::new(),
+                    }),
+                });
+            }
+            Ok(Emitted {
+                items,
+                finished: self.made >= PROGRAM_PICTURES,
+                ..Emitted::default()
+            })
+        }
+    }
+
+    /// A cue stream beats at the newest picture its producer has handed on,
+    /// not only at its own label's marks, which run three seconds behind:
+    /// ffmpeg would read the picture no further than the cue stream had got.
+    #[test]
+    fn a_cue_stream_beats_at_the_newest_picture_its_producer_handed_on() {
+        let shape = NodeShape {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            clock: Clock::SelfClocked,
+            pure: false,
+            one_to_one: false,
+            bounded: true,
+            relation: Vec::new(),
+        };
+        let assembler = Assembler::new(&shape, &[], "program", &[]).expect("an assembler");
+        let slot = Arc::new(WakeSlot::new());
+        let wake: Arc<dyn Fn() + Send + Sync> = {
+            let slot = Arc::clone(&slot);
+            Arc::new(move || {
+                if let Some(wake) = slot.get() {
+                    wake();
+                }
+            })
+        };
+        let dir = std::env::temp_dir().join(format!("ffrwd-lanes-beats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let cues = dir.join("cues.webm");
+        let ms = TimeBase { num: 1, den: 1000 };
+        let frames = TimeBase { num: 1, den: 30 };
+        let mut writers = [
+            crate::edges::spawn_writer(
+                crate::OutputPath::File(cues.display().to_string()),
+                "the cue stream".to_string(),
+                crate::edges::Target::Subtitles(crate::subtitles::Format::WebM, ms),
+                Arc::clone(&wake),
+                Arc::new(crate::edges::Ending::default()),
+            ),
+            crate::edges::spawn_writer(
+                crate::OutputPath::File(dir.join("picture").display().to_string()),
+                "the picture".to_string(),
+                crate::edges::Target::Null,
+                Arc::clone(&wake),
+                Arc::new(crate::edges::Ending::default()),
+            ),
+        ];
+        let plan = Plan {
+            lanes: vec![LaneSpec {
+                gpu: HashMap::new(),
+                name: "program".to_string(),
+                shape: shape.clone(),
+                intake: Intake::Assembled(Box::new(assembler)),
+                bound: Vec::new(),
+                state: Vec::new(),
+                tick_base: frames,
+                runners: vec![Box::new(Program { shape, made: 0 })],
+                opener: None,
+                ports: vec![
+                    Some(PortOut {
+                        stream: 0,
+                        base: frames,
+                        latency: 0.0,
+                    }),
+                    Some(PortOut {
+                        stream: 1,
+                        base: ms,
+                        latency: 0.0,
+                    }),
+                ],
+                rows: None,
+                unbuffered: false,
+            }],
+            consumers: HashMap::from([
+                (0, vec![Consumer::Writer(1, 0)]),
+                (1, vec![Consumer::Writer(0, 0)]),
+            ]),
+            writers: writers.iter().map(|w| Arc::clone(&w.queue)).collect(),
+            mirrors: HashMap::new(),
+        };
+        let scheduler = Scheduler::start(plan, 1, &slot).expect("the lanes");
+        scheduler.finish().expect("the run");
+        for writer in &mut writers {
+            writer.join();
+        }
+        let written = std::fs::read(&cues).expect("the cue stream");
+        let _ = std::fs::remove_dir_all(&dir);
+        let beat = |ms: i64| {
+            crate::subtitles::Writer::new(crate::subtitles::Format::WebM).progress(ms as f64 / 1e3)
+        };
+        let beats = |ms: i64| {
+            let beat = beat(ms);
+            written.windows(beat.len()).any(|w| w == beat.as_slice())
+        };
+        assert!(
+            beats(1000),
+            "a beat at the picture's 1 s, before the first mark"
+        );
+        let last = (PROGRAM_PICTURES - 1) * 1000 / 30;
+        assert!(beats(last), "a beat at the last picture's time");
     }
 
     /// Opens when told to, for a node to wait on in its first call.

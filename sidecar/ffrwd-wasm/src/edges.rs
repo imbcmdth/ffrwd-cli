@@ -225,9 +225,28 @@ struct QueueState {
 pub struct Queue {
     state: Mutex<QueueState>,
     ready: Condvar,
+    /// A WebM cue stream, which beats at the newest time its producer has
+    /// handed on any output as well as at its own label's progress.
+    beats: bool,
 }
 
 impl Queue {
+    fn new(beats: bool) -> Queue {
+        Queue {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+            beats,
+        }
+    }
+
+    /// Whether this output is a cue stream that beats on its producer's
+    /// clock: a text track can run seconds behind the picture beside it, as
+    /// ffrwd/moq's publish holds one, and ffmpeg reads the picture no further
+    /// than the cue stream has got.
+    pub fn beats_with_its_producer(&self) -> bool {
+        self.beats
+    }
+
     fn lock(&self) -> MutexGuard<'_, QueueState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -322,10 +341,8 @@ pub fn spawn_writer(
     wake: Arc<dyn Fn() + Send + Sync>,
     ending: Arc<Ending>,
 ) -> Writer {
-    let queue = Arc::new(Queue {
-        state: Mutex::new(QueueState::default()),
-        ready: Condvar::new(),
-    });
+    let beats = matches!(target, Target::Subtitles(subtitles::Format::WebM, _));
+    let queue = Arc::new(Queue::new(beats));
     let shared = Arc::clone(&queue);
     let name = format!(
         "write {}",
@@ -794,10 +811,7 @@ pub fn spawn_sink(
     module: String,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> Writer {
-    let queue = Arc::new(Queue {
-        state: Mutex::new(QueueState::default()),
-        ready: Condvar::new(),
-    });
+    let queue = Arc::new(Queue::new(false));
     let shared = Arc::clone(&queue);
     let handle = crate::named(format!("sink {module}"), move || {
         let mut batch: Vec<runtime::Frame> = Vec::new();
@@ -863,10 +877,7 @@ mod settled_header_tests {
     /// A node module's packets, two B-frames deep, each with its dts, under
     /// a header that says they reorder nothing.
     fn written(header: nut::Stream) -> (nut::Stream, Vec<(i64, Option<i64>)>) {
-        let queue = Queue {
-            state: Mutex::new(QueueState::default()),
-            ready: Condvar::new(),
-        };
+        let queue = Queue::new(false);
         // Presentation 0, 9000, 3000, 6000, 18000, 12000, 15000; decode
         // starts two frames early.
         let times = [
@@ -925,10 +936,7 @@ mod unsettled_header_tests {
 
     #[test]
     fn a_stream_whose_packets_carry_no_dts_is_written_under_its_header() {
-        let queue = Queue {
-            state: Mutex::new(QueueState::default()),
-            ready: Condvar::new(),
-        };
+        let queue = Queue::new(false);
         for index in 0..20 {
             queue.push(
                 0,

@@ -268,9 +268,9 @@ message's own text, which is otherwise written as the node made it),
 progress dropped; a self-clocked node with inputs ticks on the host's clock, so its
 rows are left as it wrote them. `-f srt` and `-f webvtt` take one
 data label of cues each and write the document whole once it ends; `-f
-webm` takes one and writes each cue as its row arrives, and a heartbeat
-lasting no time as the node's time moves on between them (see
-SUBTITLE-EDGE.md); `-f null` takes any.
+webm` takes one and writes each cue as its row arrives, and between them a
+heartbeat lasting no time at the newest time the node has handed on any of
+its outputs (see SUBTITLE-EDGE.md); `-f null` takes any.
 
 A network with no `-i` at all is a source: it runs until its nodes finish
 or every output's reader has closed, and a reader closing is a clean end.

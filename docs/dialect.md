@@ -713,14 +713,18 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     destination while the run goes on. Cues go out in the order they
     start: one whose row arrives after a later cue's starts where that
     one did, and one that ended by then is dropped. Between cues the
-    sidecar writes heartbeats, cues lasting no time, as the node's time
-    moves on. ffmpeg reads no input more than a tenth of a second ahead
-    of an output's furthest-behind stream, so a cue stream with nothing
-    to say would hold the picture back until its pipe filled and the
-    run stopped. The output drops the heartbeats before its muxer
-    (`-bsf:<n> noise=drop=not(duration)`), and the muxer waits at most a
-    tenth of a second for a cue before it writes the picture and sound
-    beside it (`-max_interleave_delta 100000`).
+    sidecar writes heartbeats, cues lasting no time, at the newest time
+    the node writing the cues has handed on any of its outputs: its
+    picture's, where it writes one. ffmpeg reads no input more than a
+    tenth of a second ahead of an output's furthest-behind stream, so a
+    cue stream with nothing to say would hold the picture back until its
+    pipe filled and the run stopped, and so would one beating on its
+    rows' own time where those run behind the picture: a text track
+    `ffrwd.moq.subscribe` reads runs three seconds behind its picture,
+    as the publisher holds it. The output drops the heartbeats before
+    its muxer (`-bsf:<n> noise=drop=not(duration)`), and the muxer waits
+    at most a tenth of a second for a cue before it writes the picture
+    and sound beside it (`-max_interleave_delta 100000`).
   - A node at a COPY's `TO` takes the SELECT's columns by kind: a
     picture on its video input, a sound on its audio input, and each
     data column on one of its rows inputs. With one rows input, or none
