@@ -704,7 +704,23 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     A track holds finished cues: a row whose `final` is false is an
     utterance still growing, sent again as it grows, and is left out; a
     row with no `final` counts as finished. A row's `voice` marks its cue
-    in WebVTT as `<v Name>`.
+    in WebVTT as `<v Name>`. A node's data output of cue rows (`text`,
+    `start_t` and `end_t`), such as a text track `ffrwd.moq.subscribe`
+    reads, is a WebVTT track the same way at any file but a NUT, which
+    keeps it as the data stream it is.
+  - The cues cross from the sidecar to ffmpeg as WebVTT in WebM, each
+    written when its row arrives, so a live run's text reaches its
+    destination while the run goes on. Cues go out in the order they
+    start: one whose row arrives after a later cue's starts where that
+    one did, and one that ended by then is dropped. Between cues the
+    sidecar writes heartbeats, cues lasting no time, as the node's time
+    moves on. ffmpeg reads no input more than a tenth of a second ahead
+    of an output's furthest-behind stream, so a cue stream with nothing
+    to say would hold the picture back until its pipe filled and the
+    run stopped. The output drops the heartbeats before its muxer
+    (`-bsf:<n> noise=drop=not(duration)`), and the muxer waits at most a
+    tenth of a second for a cue before it writes the picture and sound
+    beside it (`-max_interleave_delta 100000`).
   - A node at a COPY's `TO` takes the SELECT's columns by kind: a
     picture on its video input, a sound on its audio input, and each
     data column on one of its rows inputs. With one rows input, or none
@@ -2250,13 +2266,9 @@ the relay writes files.
 
 The cue rows a module writes, and a source's data stream whose rows
 carry `text`, `start_t` and `end_t` (a text track `ffrwd.moq.subscribe`
-reads, say), cross from the sidecar as WebVTT in WebM, each cue written
-when its row arrives, so a live program's text reaches the playlist
-while the run goes on. ffmpeg muxes the cues in time order with the
-picture and sound, holding those up to 10 s for a cue still to come, so
-a cue that arrives late still lands in the segment of its time. Cues go
-out in the order they start: one whose row arrives after a later cue's
-starts where that one did, and one that ended by then is dropped.
+reads, say), are a subtitle rendition too, each cue reaching the
+playlist while the run goes on. A cue whose row arrives after its time
+is written into the segment open when it arrives, at its own time.
 
 A live playlist names the newest five segments, ffmpeg's default;
 `hls_list_size` names more, and 0 names every one. A run of a live query

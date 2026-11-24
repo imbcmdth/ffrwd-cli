@@ -421,6 +421,8 @@ def test_a_subtitle_column_is_a_rendition_the_variants_name(
     segments = argv[argv.index("-hls_segment_filename") + 1]
     assert segments == "ffrwd:hls:126000/out/%v/segment_%d.ts"
     assert argv[argv.index("-c:2") + 1] == "webvtt"
+    # A file's subtitle track is read whole and beats no heartbeats.
+    assert "-bsf:2" not in argv and "-max_interleave_delta" not in argv
 
 
 def test_a_ladder_carries_its_subtitles_on_the_first_rung() -> None:

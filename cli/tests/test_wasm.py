@@ -3008,10 +3008,11 @@ def test_the_recipe_renders_every_argv() -> None:
     assert _rows_argv(RECIPE) == {
         "ffmpeg0": [
             "ffmpeg", "-i", "angel-one.mp4",
-            "-f", "webvtt", "-i", "pipe:0",
+            "-f", "webm", "-i", "pipe:0",
             "-map", "0:v:0", "-c:0", "copy",
             "-map", "0:a:0", "-c:1", "copy",
             "-map", "1:s:0", "-metadata:s:2", "language=eng", "-c:2", "mov_text",
+            "-bsf:2", "noise=drop=not(duration)", "-max_interleave_delta", "100000",
             "subbed.mp4",
         ],
         "ffmpeg1": [
@@ -3023,7 +3024,7 @@ def test_the_recipe_renders_every_argv() -> None:
             "ffrwd-wasm", "-f", "nut", "-i", "pipe:0",
             "-m", TRANSCRIBER,
             "-params", '{"language": "es", "language_to": "en"}',
-            "-f", "webvtt", "pipe:1",
+            "-f", "webm", "pipe:1",
         ],
     }
 
@@ -3042,7 +3043,7 @@ def test_the_minted_track_is_an_edge_from_the_sidecar() -> None:
     assert plan is not None
     (edge,) = plan.rows_edges
     assert (edge.source, edge.target, edge.container) == (
-        "sidecar0", "ffmpeg0", "webvtt",
+        "sidecar0", "ffmpeg0", "webm",
     )
     (document,) = plan.sidecars[0].rows
     assert document.sink.alias == edge.alias
@@ -3066,7 +3067,7 @@ def test_a_rows_edge_says_what_it_carries_when_written_out() -> None:
         "source": "sidecar0",
         "target": "ffmpeg0",
         "alias": plan.rows_edges[0].alias,
-        "container": "webvtt",
+        "container": "webm",
     } in written
 
 
@@ -3102,7 +3103,7 @@ def test_a_region_of_two_modules_maps_the_label_its_rows_come_off() -> None:
         "-m", f"denoise={DENOISER}",
         "-m", f"transcribe={TRANSCRIBER}",
         "-filter_complex", "[0:a]denoise[n1];[n1]transcribe=language=es[out0]",
-        "-map", "[out0]", "-f", "webvtt", "pipe:1",
+        "-map", "[out0]", "-f", "webm", "pipe:1",
     ]
 
 
@@ -4630,7 +4631,7 @@ def test_filtered_cue_rows_still_mint_a_subtitle_track() -> None:
     assert argv[argv.index("-filter_complex") + 1] == (
         f"[0:a]transcribe=language=en[n1];[n1]rowfilter=pred={START_PRED}[out0]"
     )
-    assert argv[-3:] == ["-f", "webvtt", "pipe:1"]
+    assert argv[-3:] == ["-f", "webm", "pipe:1"]
 
 
 def test_filtered_rows_go_to_an_ndjson_file() -> None:
@@ -4654,7 +4655,7 @@ def test_merged_rows_mint_a_merge_node_beside_the_module() -> None:
     assert argv[argv.index("-filter_complex") + 1] == (
         "[0:a]transcribe=language=en[n1];[n1]rowmerge=max_distance=0.5[out0]"
     )
-    assert argv[-3:] == ["-f", "webvtt", "pipe:1"]
+    assert argv[-3:] == ["-f", "webm", "pipe:1"]
     assert "rowmerge" not in [argv[i + 1].split("=")[0] for i, a in enumerate(argv) if a == "-m"]
 
 
@@ -7228,7 +7229,7 @@ def test_the_rows_leave_the_consumer_not_the_producer() -> None:
     graph = _rows_module_plan(ROWS_RECIPE).graphs[0]
     consumer = next(n for n in graph.nodes.values() if n.filter == ROWS_MODULE)
     assert list(graph.rows_sinks) == [consumer.id]
-    assert graph.rows_sinks[consumer.id].container == "webvtt"
+    assert graph.rows_sinks[consumer.id].container == "webm"
 
 
 _VECTOR_ROWS: dict[str, object] = {
@@ -7290,10 +7291,12 @@ def test_the_rows_module_recipe_renders_every_argv() -> None:
     assert plan is not None
     assert plan_argv(plan, sidecar_argv=wasm.shown_argv) == {
         "ffmpeg0": [
-            "ffmpeg", "-i", "angel-one.mp4", "-f", "webvtt", "-i", "pipe:0",
+            "ffmpeg", "-i", "angel-one.mp4", "-f", "webm", "-i", "pipe:0",
             "-map", "0:v:0", "-c:0", "copy",
             "-map", "0:a:0", "-c:1", "copy",
-            "-map", "1:s:0", "-c:2", "copy", "out.mkv",
+            "-map", "1:s:0", "-c:2", "copy",
+            "-bsf:2", "noise=drop=not(duration)", "-max_interleave_delta", "100000",
+            "out.mkv",
         ],
         "ffmpeg1": [
             "ffmpeg", "-i", "angel-one.mp4",
@@ -7304,7 +7307,7 @@ def test_the_rows_module_recipe_renders_every_argv() -> None:
             "ffrwd-wasm", "-f", "nut", "-i", "pipe:0",
             "-m", CAPTIONER,
             "-m", ROWS_MODULE, "-rows-from", "0",
-            "-f", "webvtt", "pipe:1",
+            "-f", "webm", "pipe:1",
         ],
     }
 
@@ -7419,7 +7422,7 @@ def test_a_producer_and_a_rows_function_over_it_are_two_documents() -> None:
     plan = _plan_of(CTE_ROWS_RECIPE)
     (sidecar,) = plan.sidecars
     assert [document.source for document in sidecar.rows] == [0, 1]
-    assert [e.container for e in plan.rows_edges] == ["webvtt", "webvtt"]
+    assert [e.container for e in plan.rows_edges] == ["webm", "webm"]
 
 
 def test_two_documents_leave_over_two_pipes_of_their_own() -> None:
@@ -7430,8 +7433,8 @@ def test_two_documents_leave_over_two_pipes_of_their_own() -> None:
         "ffrwd-wasm", "-f", "nut", "-i", "pipe:0",
         "-m", CAPTIONER,
         "-m", ROWS_MODULE, "-rows-from", "0",
-        "-rows", "0", "-f", "webvtt", "pipe<sidecar0-ffmpeg0 write>",
-        "-rows", "1", "-f", "webvtt", "pipe<sidecar0-ffmpeg0 write>",
+        "-rows", "0", "-f", "webm", "pipe<sidecar0-ffmpeg0 write>",
+        "-rows", "1", "-f", "webm", "pipe<sidecar0-ffmpeg0 write>",
     ]  # fmt: skip
 
 

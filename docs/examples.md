@@ -876,9 +876,10 @@ $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut pipe:1 | \
   ffrwd-wasm -f nut -i pipe:0 -m \
   ../sidecar/modules/target/wasm32-wasip2/release/captions.wasm -m \
-  ../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm -rows-from 0 -f webvtt \
-  pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i pipe:0 -map 0:v:0 -c:0 copy -map \
-  0:a:0 -c:1 copy -map 1:s:0 -c:2 copy fauxlated.mkv
+  ../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm -rows-from 0 -f webm \
+  pipe:1 | ffmpeg -i tests/fixtures/av.mp4 -f webm -i pipe:0 -map 0:v:0 -c:0 copy -map \
+  0:a:0 -c:1 copy -map 1:s:0 -c:2 copy -bsf:2 'noise=drop=not(duration)' \
+  -max_interleave_delta 100000 fauxlated.mkv
 ```
 
 `-rows-from 0` is the edge: it names the module whose rows arrive here by its position in the `-m` table, and nothing about it is a pad, so the filtergraph never mentions it. `fauxlate` is a stand-in for a real translator - every word gains `-a` and `-o` in turn, so `Cue one.` comes back `Cue-a one-o.` - and the result is the producer's column read one module later: selected here it is a subtitle track, and at a `.ndjson` destination it is the rows themselves.
@@ -1253,10 +1254,11 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 # named pipes: ffmpeg0 reads sidecar0, sidecar0; sidecar0 feeds ffmpeg0, ffmpeg0
-1. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i \
+1. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -f webm -i \
   '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 read>' -f nut -analyzeduration 0 \
   -fpsprobesize 3 -i '<named pipe sidecar0-ffmpeg0 n2 read>' -map 2:v:0 -map 0:a:0 -map \
-  1:s:0 -c:2 copy -c:0 libx264 -crf:0 20 -c:1 copy heard.mkv
+  1:s:0 -c:2 copy -c:0 libx264 -crf:0 20 -c:1 copy -bsf:2 'noise=drop=not(duration)' \
+  -max_interleave_delta 100000 heard.mkv
 2. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -map 0:a:0 -map 0:v:0 -ar:0 48000 -c:0 \
   pcm_f32le -c:1 rawvideo -pix_fmt:1 rgba -f nut pipe:1
 3. sidecar: ffrwd-wasm -f nut -i pipe:0 -pad \
@@ -1267,7 +1269,7 @@ $ ffrwd compile -f query.sql
   'hear=[{"input":"a","streams":[{"rate":{"num":48000,"den":1}}]}]' -bound \
   'burn=[{"input":"v","streams":[{"rate":{"num":15,"den":1}}]},{"input":"words",'\
 '"streams":[{"rate":null}]}]' -map '[out0]' -f nut \
-  '<named pipe sidecar0-ffmpeg0 n2 write>' -map '[out1]' -f webvtt \
+  '<named pipe sidecar0-ffmpeg0 n2 write>' -map '[out1]' -f webm \
   '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 write>'
 # this listing is not a shell command -- run the plan with `ffrwd run`
 ```

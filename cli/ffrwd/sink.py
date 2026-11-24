@@ -477,6 +477,10 @@ MANIFEST_SEGMENT_OPTION: dict[str, str] = {"hls": "hls_time", "dash": "seg_durat
 # COPY's rows, written by the compiler and refused when hand-written.
 MANIFEST_MAP_OPTION: dict[str, str] = {"hls": "var_stream_map", "dash": "adaptation_sets"}
 
+# The internal option naming the bitstream filters a subtitle stream passes
+# before its muxer: what drops a cue stream's heartbeats.
+SUBTITLE_BSF_OPTION = "subtitle_bsf"
+
 # Where an hls destination's segments put a cue time of zero, in MPEG-TS
 # ticks (90 kHz), per segment type: what the X-TIMESTAMP-MAP of each WebVTT
 # segment says. The mpegts muxer starts every timestamp twice ffmpeg's
@@ -595,6 +599,16 @@ _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         doc="The DASH adaptation sets, transcribed from the COPY's rows.",
         flag="-adaptation_sets",
         per_stream=False,
+    ),
+    # An output fed by a cue stream: the stream's heartbeats dropped before
+    # the muxer.
+    SUBTITLE_BSF_OPTION: SinkOptionSpec(
+        name=SUBTITLE_BSF_OPTION,
+        scope="subtitle",
+        type="str",
+        doc="The bitstream filters a subtitle stream passes before the muxer.",
+        flag="-bsf",
+        per_stream=True,
     ),
     # An hls destination with a subtitle rendition is written over HTTP to
     # the relay, which writes its files: the muxer PUTs each one.

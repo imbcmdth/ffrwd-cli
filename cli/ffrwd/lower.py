@@ -467,6 +467,7 @@ from ffrwd.sink import (
     SEGMENT_OPTIONS,
     SINK_OPTIONS,
     STRFTIME_FORMATS,
+    SUBTITLE_BSF_OPTION,
     TWO_PASS_CODECS,
     bits_per_second,
     copy_suppressed_scopes,
@@ -664,10 +665,17 @@ _WEBVTT_SOURCE_CODECS: frozenset[str] = frozenset(
 )
 _WEBVTT_CODEC = "webvtt"
 
-# How the sidecar hands an hls destination the cue rows a module writes:
-# WebVTT in WebM, a cue at a time as each row arrives, which ffmpeg reads as
-# it goes. A WebVTT document is read whole before ffmpeg starts.
+# How the sidecar hands ffmpeg the cue rows a module writes: WebVTT in WebM,
+# a cue at a time as each row arrives, which ffmpeg reads as it goes. ffmpeg
+# reads a WebVTT document to its end before it opens the inputs after it,
+# and a run that goes on never ends one.
 _CUE_STREAM_FORMAT = "webm"
+
+# What an output fed by such a stream drops before its muxer: the stream's
+# heartbeats, cues lasting no time that the sidecar writes as its time moves
+# on. ffmpeg's scheduler counts them and no file should hold them; every
+# real cue lasts.
+_HEARTBEAT_DROP = "noise=drop=not(duration)"
 
 # What a data stream's rows have to carry for an hls destination to write them
 # as cues: a cue row's three fields. `final` and `voice` are read where a row
@@ -2450,6 +2458,28 @@ def _compress_manifest_lists(
                 for element, row in zip(value, variant_rows)
                 if row.audio is not None
             ]
+
+
+def _drop_heartbeats(
+    options: dict[str, object], outputs: Sequence[Output], streamed: set[FrameRef]
+) -> None:
+    """An output fed by a cue stream drops the stream's heartbeats before its
+    muxer.
+
+    ffmpeg reads no input more than a tenth of a second ahead of an
+    output's furthest-behind stream, so a cue stream with nothing to say
+    would hold the picture back for as long as it stayed quiet: the
+    sidecar's heartbeats keep it level with the picture, and `noise` drops
+    them once they are counted.
+    The muxer then sees a sparse stream, and emit cuts how long it waits on
+    one (:func:`ffrwd.emit._render_interleave`).
+    """
+    cues = [output for output in outputs if output.type == "subtitle"]
+    if not any(output.ref in streamed for output in cues):
+        return
+    options[SUBTITLE_BSF_OPTION] = [
+        _HEARTBEAT_DROP if output.ref in streamed else None for output in cues
+    ]
 
 
 def _subtitles_need_a_picture(subtitles: int, videos: int, anchor: exp.Expr) -> FfrwdError:
@@ -5235,6 +5265,8 @@ class _Lowerer:
             option_nodes[option.name] = option.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
         self._check_manifest_options(options, option_nodes, columns, variant_rows, raw)
+        if variant_rows is None and self._holds_no_json(options, raw):
+            columns = [self._cue_rows_track(column) or column for column in columns]
         outputs = _outputs(
             columns,
             self._layered_tags(),
@@ -5272,6 +5304,7 @@ class _Lowerer:
         self._check_metadata_track_container(options, outputs, path, raw)
         self._check_json_container(options, outputs, path, raw)
         self._codec_for_rows_track(options, outputs, path)
+        _drop_heartbeats(options, outputs, set(self.rows_tracks))
         self._feeder_copy(options, outputs, path)
         options.update(colorimetry)
         return SinkUnit(
@@ -6085,6 +6118,14 @@ class _Lowerer:
         meta = self._stream_meta(alias, "data", int(index)) if index.isdigit() else None
         return meta is not None and meta.codec == JSON_CODEC
 
+    def _holds_no_json(self, options: dict[str, object], raw: RawSink) -> bool:
+        """Whether this COPY writes a file whose container holds no data stream
+        of JSON messages: a written path, not a NUT and not a feeder's
+        connection, where a data column of cue rows is a subtitle track."""
+        if raw.path is None or self.feeder_sink or self.rows_file:
+            return False
+        return _container_of(options, raw.path) != _NUT_FORMAT
+
     def _codec_for_rows_track(
         self, options: dict[str, object], outputs: list[Output], path: str | None
     ) -> None:
@@ -6391,13 +6432,14 @@ class _Lowerer:
         return rows, stripped
 
     def _cue_rows_track(self, column: _Column) -> _Column | None:
-        """A data column of an hls destination whose rows are cue rows, as the
-        subtitle track they make; None for any other column.
+        """A data column whose rows are cue rows, as the subtitle track they
+        make at a destination that holds no data stream of JSON messages (an
+        hls ladder, any file but a NUT); None for any other column.
 
         The rows are a node's, written as the run goes: a text track of a
         source read in FROM, as `ffrwd.moq.subscribe` reads one. They become
-        what a module's rows become at this destination: the sidecar writes
-        them as WebVTT in WebM, and ffmpeg reads that as an input of its own.
+        what a module's rows become there: the sidecar writes them as WebVTT
+        in WebM, and ffmpeg reads that as an input of its own.
         """
         if column.value.type != "data":
             return None
@@ -13119,13 +13161,10 @@ class _Lowerer:
             return _Value(type=kind, streams=(), is_array=False)
         self._check_no_vector_track(declared, annotation, node, select)
         tag = self._rows_language(declared, call, node, env, select)
-        # An hls destination's subtitles are cut as the run goes, so its cues
-        # cross as a stream; anywhere else they are a document, read whole.
-        container = _CUE_STREAM_FORMAT if self.manifest == "hls" else WEBVTT_FORMAT
-        ref = self._mint_stream_input(CUES_COLUMN, PIPE, container, "subtitle")
+        ref = self._mint_stream_input(CUES_COLUMN, PIPE, _CUE_STREAM_FORMAT, "subtitle")
         self.minted_track_meta[ref] = {}
         self.graph.rows_sinks[producer] = RowsSink(
-            container=container, alias=src_alias(ref)
+            container=_CUE_STREAM_FORMAT, alias=src_alias(ref)
         )
         self.rows_tracks.append(ref)
         return _scalar(_Stream(ref=ref, type="subtitle", source=_rows_meta(tag)))

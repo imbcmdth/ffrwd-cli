@@ -629,7 +629,7 @@ def test_one_call_read_twice_is_one_node() -> None:
     (burn,) = [node for node in graph.nodes.values() if node.filter == "burn.wasm"]
     assert burn.inputs == ["src:f:v:0", hears[0].id]
     assert burn.ports == ["v", "words"]
-    assert graph.rows_sinks[hears[0].id].container == "webvtt"
+    assert graph.rows_sinks[hears[0].id].container == "webm"
 
 
 def test_a_nodes_rows_under_a_pinned_track_row_are_a_track_of_the_file() -> None:
@@ -638,7 +638,7 @@ def test_a_nodes_rows_under_a_pinned_track_row_are_a_track_of_the_file() -> None
         "WHERE v.index = 1) TO 'out.mkv'"
     )
     (spot,) = [node for node in graph.nodes.values() if node.filter == "spot.wasm"]
-    assert graph.rows_sinks[spot.id].container == "webvtt"
+    assert graph.rows_sinks[spot.id].container == "webm"
     assert [output.type for output in graph.sinks[0].outputs] == ["video", "subtitle"]
 
 
@@ -670,7 +670,7 @@ def test_a_nodes_rows_anywhere_but_a_feeder_connection_are_still_a_track(
         f"TO {destination}"
     )
     (hear,) = [node for node in graph.nodes.values() if node.filter == "hear.wasm"]
-    assert graph.rows_sinks[hear.id].container == "webvtt"
+    assert graph.rows_sinks[hear.id].container == "webm"
 
 
 def _formats(argv: Sequence[str]) -> list[str]:
@@ -678,23 +678,44 @@ def _formats(argv: Sequence[str]) -> list[str]:
     return [argv[i + 1] for i, word in enumerate(argv) if word == "-f"]
 
 
-def test_a_nodes_rows_at_an_hls_destination_cross_as_a_stream(
+def test_a_nodes_rows_at_an_hls_destination_are_a_subtitle_rendition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An hls destination cuts its subtitles as the run goes, so the rows
-    cross as WebVTT in WebM, a cue as each row arrives; ffmpeg would read a
-    WebVTT document whole before it started."""
     argv = _plan_argv(
         "COPY (SELECT f.video[1], f.audio[1], hear(f.audio[1]) AS loudness "
         "FROM input('f.mp4') f) TO 'out/master.m3u8' WITH (format 'hls')",
         monkeypatch,
     )
-    (sidecar,) = [args for args in argv.values() if args[0] == "ffrwd-wasm"]
-    assert _formats(sidecar)[-1] == "webm"
     (muxer,) = [args for args in argv.values() if "hls" in args]
     assert _formats(muxer) == ["webm", "hls"]
     stream_map = muxer[muxer.index("-var_stream_map") + 1]
     assert stream_map == "v:0,a:0,name:240p,s:0,sgroup:subs,sname:loudness,default:yes"
+
+
+@pytest.mark.parametrize(
+    "destination", ["'out/master.m3u8' WITH (format 'hls')", "'out.mkv'", "'out.mp4'"]
+)
+def test_a_nodes_rows_cross_as_a_stream_whose_heartbeats_the_output_drops(
+    destination: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rows cross as WebVTT in WebM: a cue as each row arrives, and a
+    heartbeat lasting no time as the sidecar's time moves on between them.
+    ffmpeg reads no input more than a tenth of a second ahead of an
+    output's furthest-behind stream, so the heartbeats keep the picture
+    moving; the output drops them before its muxer, which holds the picture
+    back for a cue a tenth of a second at most."""
+    argv = _plan_argv(
+        "COPY (SELECT f.video[1], f.audio[1], hear(f.audio[1]) "
+        f"FROM input('f.mp4') f) TO {destination}",
+        monkeypatch,
+    )
+    (sidecar,) = [args for args in argv.values() if args[0] == "ffrwd-wasm"]
+    assert _formats(sidecar)[-1] == "webm"
+    (muxer,) = [
+        args for args in argv.values() if args[0] == "ffmpeg" and "webm" in _formats(args)
+    ]
+    assert muxer[muxer.index("-bsf:2") + 1] == "noise=drop=not(duration)"
+    assert muxer[muxer.index("-max_interleave_delta") + 1] == "100000"
 
 
 def test_a_sources_cue_rows_are_an_hls_subtitle_rendition(
@@ -722,6 +743,35 @@ def test_a_sources_cue_rows_are_an_hls_subtitle_rendition(
         "TO 'out/master.m3u8' WITH (format 'hls')"
     )
     assert "takes video, audio and subtitle columns" in err.message
+
+
+@pytest.mark.parametrize(("path", "codec"), [("out.mkv", "copy"), ("out.mp4", "mov_text")])
+def test_a_sources_cue_rows_are_a_subtitle_track_of_a_file(
+    path: str, codec: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The egress's shape written to a file: a source's text track is a
+    subtitle track of any container but NUT, its rows written as WebVTT in
+    WebM beside the picture's NUT, its heartbeats dropped before the muxer."""
+    argv = _plan_argv(
+        f"COPY (SELECT s.video[1], s.data[1] FROM program() s) TO '{path}'", monkeypatch
+    )
+    assert _formats(argv["sidecar0"]) == ["nut", "webm"]
+    muxer = argv["ffmpeg0"]
+    assert _formats(muxer) == ["webm", "nut"]
+    assert muxer[muxer.index("0:s:0") + 1 : muxer.index("0:s:0") + 3] == ["-c:1", codec]
+    assert muxer[muxer.index("-bsf:1") + 1] == "noise=drop=not(duration)"
+
+
+def test_a_sources_cue_rows_stay_a_data_stream_of_a_nut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = _plan_argv(
+        "COPY (SELECT s.video[1], s.data[1] FROM program() s) TO 'out.nut'", monkeypatch
+    )
+    assert _formats(argv["sidecar0"]) == ["nut"]
+    muxer = argv["ffmpeg0"]
+    assert "0:d:0" in muxer
+    assert not [word for word in muxer if word.startswith("-bsf")]
 
 
 def test_kinds_mix_in_one_call_and_a_left_out_port_is_unbound() -> None:
@@ -802,7 +852,7 @@ def test_every_field_of_a_struct_return_is_an_output_of_one_node() -> None:
     (dim,) = [node for node in graph.nodes.values() if node.filter == "dim.wasm"]
     assert matte.out_ports == ["mask", "spots"]
     assert dim.inputs == [f"{matte.id}:0", f"{matte.id}:1"]
-    assert graph.rows_sinks[f"{matte.id}:1"].container == "webvtt"
+    assert graph.rows_sinks[f"{matte.id}:1"].container == "webm"
 
 
 def test_a_declared_port_the_shape_has_none_for_is_refused_bound() -> None:

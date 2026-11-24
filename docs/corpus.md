@@ -1662,12 +1662,13 @@ $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/av.mp4 -map 0:a:0 -ar:0 16000 -ac:0 1 -c:0 pcm_f32le -f nut \
   pipe:1 | ffrwd-wasm -f nut -i pipe:0 -m \
   ../sidecar/modules/target/wasm32-wasip2/release/transcribe.wasm -params \
-  '{"language": "es", "language_to": "en"}' -f webvtt pipe:1 | ffmpeg -i \
-  tests/fixtures/av.mp4 -f webvtt -i pipe:0 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
-  -map 1:s:0 -metadata:s:2 language=eng -c:2 mov_text subbed.mp4
+  '{"language": "es", "language_to": "en"}' -f webm pipe:1 | ffmpeg -i \
+  tests/fixtures/av.mp4 -f webm -i pipe:0 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map \
+  1:s:0 -metadata:s:2 language=eng -c:2 mov_text -bsf:2 'noise=drop=not(duration)' \
+  -max_interleave_delta 100000 subbed.mp4
 ```
 
-The module asked for 16kHz mono, so the feeding ffmpeg conforms the stream before the pcm edge - nothing in the query says so. The sidecar writes the cues as a WebVTT document on its own output, and the far ffmpeg encodes it per container: `mov_text` here because the destination is mp4, copied through untouched for mkv. `-metadata:s:2 language=eng` is the computed tag - `language_to` first, `language` when no conversion is asked for. Swap the destination for `'words.ndjson'` and drop the streams to get the rows themselves instead of a track.
+The module asked for 16kHz mono, so the feeding ffmpeg conforms the stream before the pcm edge - nothing in the query says so. The sidecar writes the cues as WebVTT in WebM on its own output, and the far ffmpeg encodes them per container: `mov_text` here because the destination is mp4, copied through untouched for mkv. `-metadata:s:2 language=eng` is the computed tag - `language_to` first, `language` when no conversion is asked for. Swap the destination for `'words.ndjson'` and drop the streams to get the rows themselves instead of a track.
 
 ## 93. Depth of field, from the scene's own geometry
 
@@ -2434,17 +2435,18 @@ COPY (
 ```
 $ ffrwd compile -f query.sql
 # named pipes: ffmpeg0 reads sidecar0, sidecar0; sidecar0 feeds ffmpeg0, ffmpeg0
-1. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i \
-  '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 read>' -f webvtt -i \
+1. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -f webm -i \
+  '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 read>' -f webm -i \
   '<named pipe sidecar0-ffmpeg0 ffrwd.cues#3 read>' -map 0:v:0 -c:0 copy -map 1:s:0 -c:1 \
   copy -metadata:s:1 title=speech -map 2:s:0 -c:2 copy -metadata:s:2 title=translated \
-  spoken.mkv
+  -bsf:1 'noise=drop=not(duration)' -bsf:2 'noise=drop=not(duration)' \
+  -max_interleave_delta 100000 spoken.mkv
 2. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f \
   nut pipe:1
 3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
   ../sidecar/modules/target/wasm32-wasip2/release/captions.wasm -m \
   ../sidecar/modules/target/wasm32-wasip2/release/fauxlate.wasm -rows-from 0 -rows 0 -f \
-  webvtt '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 write>' -rows 1 -f webvtt \
+  webm '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 write>' -rows 1 -f webm \
   '<named pipe sidecar0-ffmpeg0 ffrwd.cues#3 write>'
 # this listing is not a shell command -- run the plan with `ffrwd run`
 ```
@@ -2735,9 +2737,10 @@ $ ffrwd compile -f query.sql
 ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut pipe:1 | \
   ffrwd-wasm -f nut -i pipe:0 -m \
   captions=../sidecar/modules/target/wasm32-wasip2/release/captions.wasm -filter_complex \
-  '[0:v]captions[n1];[n1]rowmerge=max_distance=0[out0]' -map '[out0]' -f webvtt pipe:1 | \
-  ffmpeg -i tests/fixtures/av.mp4 -f webvtt -i pipe:0 -map 0:v:0 -c:0 copy -map 1:s:0 \
-  -c:1 copy -metadata:s:1 title=speech merged.mkv
+  '[0:v]captions[n1];[n1]rowmerge=max_distance=0[out0]' -map '[out0]' -f webm pipe:1 | \
+  ffmpeg -i tests/fixtures/av.mp4 -f webm -i pipe:0 -map 0:v:0 -c:0 copy -map 1:s:0 -c:1 \
+  copy -metadata:s:1 title=speech -bsf:1 'noise=drop=not(duration)' \
+  -max_interleave_delta 100000 merged.mkv
 ```
 
 `rowmerge` is a node the host provides, like the `rowfilter` a run-time
