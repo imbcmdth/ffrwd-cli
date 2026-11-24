@@ -57,14 +57,15 @@ def _require_tools() -> None:
         pytest.skip(f"module missing: {_SPEAKER} (cargo build --target wasm32-wasip2 --release)")
 
 
-def _run(destination: str, with_block: str) -> None:
+def _run(destination: str, with_block: str, args: str = "late => 3, seconds => 40") -> None:
     sql = (
         "CREATE FUNCTION speaker(fps number DEFAULT 15, every number DEFAULT 12,\n"
-        "                        late number DEFAULT 0, seconds number DEFAULT 0)\n"
+        "                        late number DEFAULT 0, seconds number DEFAULT 0,\n"
+        "                        start number DEFAULT 0)\n"
         f"  RETURNS source AS '{_SPEAKER.as_posix()}', 'speaker' LANGUAGE wasm;\n"
         "COPY (\n"
         "  SELECT s.video[1], s.data[1] AS captions\n"
-        "  FROM speaker(late => 3, seconds => 40) s\n"
+        f"  FROM speaker({args}) s\n"
         f") TO '{destination}' WITH ({with_block})"
     )
     compiled = compile_all(sql)
@@ -159,3 +160,58 @@ def test_a_quiet_cue_stream_into_hls_holds_no_picture_back(
         assert text.startswith("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:126000,LOCAL:00:00:00.000\n")
         cues += _cues(text)
     _check_said(cues, first)
+
+
+def _mp4_box(data: bytes, path: tuple[bytes, ...]) -> bytes | None:
+    """The body of the first box down `path` in `data`, or None."""
+    at = 0
+    while at + 8 <= len(data):
+        size = int.from_bytes(data[at : at + 4], "big")
+        if size < 8:
+            return None
+        if data[at + 4 : at + 8] == path[0]:
+            body = data[at + 8 : at + size]
+            return body if len(path) == 1 else _mp4_box(body, path[1:])
+        at += size
+    return None
+
+
+def _first_decode_time(init: Path, segment: Path) -> float:
+    """When the picture of an fMP4 segment starts decoding, in seconds, as a
+    browser's media source reads it: the fragment's own decode time over the
+    track's timescale, with no edit list applied."""
+    mdhd = _mp4_box(init.read_bytes(), (b"moov", b"trak", b"mdia", b"mdhd"))
+    tfdt = _mp4_box(segment.read_bytes(), (b"moof", b"traf", b"tfdt"))
+    assert mdhd is not None and tfdt is not None
+    scale = int.from_bytes(mdhd[20:24] if mdhd[0] == 1 else mdhd[12:16], "big")
+    time = int.from_bytes(tfdt[4:12] if tfdt[0] == 1 else tfdt[4:8], "big")
+    return time / scale
+
+
+def test_fmp4_segments_keep_the_clock_of_a_program_joined_late(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A program joined 600 s in, as a live piece joins one, into fmp4 hls,
+    its picture encoded on the way: each fragment's decode time is on the
+    program's clock, since a browser's media source plays the fragments by
+    those and ignores the init segment's edit list, and the cues sit on that
+    clock as their map (MPEGTS:0) says. The picture copied from subscribe is
+    test_exec_moq_cues.py's."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "out").mkdir()
+    _run(
+        "out/master.m3u8",
+        "format 'hls', hls_time 4, hls_segment_type 'fmp4', hls_playlist_type 'vod', "
+        "video_codec 'libx264', preset 'ultrafast'",
+        "every => 6, seconds => 20, start => 600",
+    )
+    variant = tmp_path / "out" / "180p"
+    first = _first_decode_time(variant / "init.mp4", variant / "segment_0.m4s")
+    assert 599 < first < 601, first
+    cues = []
+    for segment in sorted(variant.glob("index*.vtt")):
+        text = segment.read_text(encoding="utf-8")
+        assert text.startswith("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n")
+        cues += _cues(text)
+    said = [600.25 + 6 * n for n in range(4)]
+    assert [round(start, 2) for start, _, _ in cues] == said, cues

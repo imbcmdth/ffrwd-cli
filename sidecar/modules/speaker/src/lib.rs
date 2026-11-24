@@ -4,7 +4,8 @@
 //! starts, a quarter of a second in, and lasts 1.2 s; it is sent growing
 //! (`final` false) half a second in, and whole (`final` true) `late` seconds
 //! after it ends, Ann and Bob speaking in turn. It ends after `seconds`, or
-//! never when that is 0.
+//! never when that is 0. Its clock reads `start` at its first picture, as a
+//! program's does for a reader that joins it that far in.
 
 use ffrwd_node::{Bound, Init, Node, Out, Output, Rational, Result, Shape, Tick};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ struct Params {
     every: f64,
     late: f64,
     seconds: f64,
+    start: f64,
 }
 
 #[derive(Default, Serialize)]
@@ -37,6 +39,7 @@ struct Speaker {
     every: f64,
     late: f64,
     seconds: f64,
+    start: f64,
     /// The next utterance to send whole, and the next to send growing.
     said: u32,
     grown: u32,
@@ -44,7 +47,7 @@ struct Speaker {
 
 impl Speaker {
     fn utterance(&self, n: u32) -> (f64, f64, &'static str) {
-        let start = f64::from(n) * self.every + OPENS;
+        let start = self.start + f64::from(n) * self.every + OPENS;
         let voice = if n.is_multiple_of(2) { "Ann" } else { "Bob" };
         (start, start + LASTS, voice)
     }
@@ -53,7 +56,7 @@ impl Speaker {
 impl Node for Speaker {
     const NAME: &'static str = "speaker";
     const VERSION: &'static str = "0.1.0";
-    const PARAMS_SCHEMA: &'static str = r#"{"type":"object","properties":{"fps":{"type":"number","exclusiveMinimum":0,"default":15},"every":{"type":"number","exclusiveMinimum":0,"default":12},"late":{"type":"number","minimum":0,"default":0},"seconds":{"type":"number","minimum":0,"default":0}},"additionalProperties":false}"#;
+    const PARAMS_SCHEMA: &'static str = r#"{"type":"object","properties":{"fps":{"type":"number","exclusiveMinimum":0,"default":15},"every":{"type":"number","exclusiveMinimum":0,"default":12},"late":{"type":"number","minimum":0,"default":0},"seconds":{"type":"number","minimum":0,"default":0},"start":{"type":"number","minimum":0,"default":0}},"additionalProperties":false}"#;
     type Params = Params;
 
     fn shape(params: &Params, _: &Bound) -> Result<Shape> {
@@ -75,20 +78,24 @@ impl Node for Speaker {
             every: params.every,
             late: params.late,
             seconds: params.seconds,
+            start: params.start,
             said: 0,
             grown: 0,
         })
     }
 
     fn process(&mut self, tick: &Tick, out: &mut Out) -> Result<()> {
-        let now = tick.seconds();
-        if self.seconds > 0.0 && now >= self.seconds {
+        if self.seconds > 0.0 && tick.seconds() >= self.seconds {
             out.finish();
             return Ok(());
         }
+        let base = tick.time_base();
+        let pts =
+            tick.pts() + (self.start * f64::from(base.den) / f64::from(base.num)).round() as i64;
+        let now = base.seconds(pts);
         let mut canvas = Picture::filled(WIDTH as usize, HEIGHT as usize, [16, 24, 48, 255]);
         canvas.text(10, 80, 2, &format!("{now:.2}"), [255, 255, 255, 255]);
-        out.frame("video", tick.pts(), Some(1), canvas.data)?;
+        out.frame("video", pts, Some(1), canvas.data)?;
         let (start, _, voice) = self.utterance(self.grown);
         if now >= start + 0.5 {
             let row = Said {
@@ -98,7 +105,7 @@ impl Node for Speaker {
                 finished: false,
                 voice: voice.into(),
             };
-            out.row("captions", tick.pts(), &row)?;
+            out.row("captions", pts, &row)?;
             self.grown += 1;
         }
         let (start, end, voice) = self.utterance(self.said);
@@ -110,7 +117,7 @@ impl Node for Speaker {
                 finished: true,
                 voice: voice.into(),
             };
-            out.row("captions", tick.pts(), &row)?;
+            out.row("captions", pts, &row)?;
             self.said += 1;
         }
         Ok(())

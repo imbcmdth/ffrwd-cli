@@ -250,10 +250,11 @@ def _package_module(name: str) -> str:
 
 
 def _run_piece(
-    tmp_path: Path, program: Path, piece: str, master: Path, *variables: str
+    tmp_path: Path, program: Path, piece: str, master: Path, *variables: str, joins: float = 0
 ) -> None:
-    """Publishes `program` and runs `piece` over it to its end: the
-    publisher's tracks finish with the program, and subscribe with them."""
+    """Publishes `program` and runs `piece` over it to its end, joining it
+    `joins` seconds after it is up: the publisher's tracks finish with the
+    program, and subscribe with them."""
     certs = tmp_path / "certs"
     certs.mkdir()
     cert = _certificate(certs)
@@ -288,6 +289,7 @@ def _run_piece(
             assert publisher.poll() is None, published.read_text(encoding="utf-8")[-3000:]
             assert time.monotonic() < until, "the broadcast never came up"
             time.sleep(0.5)
+        time.sleep(joins)
         (tmp_path / "piece.sql").write_text(piece, encoding="utf-8")
         named = [word for variable in variables for word in ("-v", variable)]
         said = [
@@ -336,14 +338,53 @@ def _cues(webvtt: str) -> list[tuple[float, float, str]]:
     return cues
 
 
-def _check_said(cues: list[tuple[float, float, str]]) -> None:
+def _mp4_box(data: bytes, path: tuple[bytes, ...]) -> bytes | None:
+    """The body of the first box down `path` in `data`, or None."""
+    at = 0
+    while at + 8 <= len(data):
+        size = int.from_bytes(data[at : at + 4], "big")
+        if size < 8:
+            return None
+        if data[at + 4 : at + 8] == path[0]:
+            body = data[at + 8 : at + size]
+            return body if len(path) == 1 else _mp4_box(body, path[1:])
+        at += size
+    return None
+
+
+def _first_decode_time(init: Path, segment: Path) -> float:
+    """When the picture of an fMP4 segment starts decoding, in seconds, as a
+    browser's media source reads it: the fragment's own decode time over the
+    track's timescale, with no edit list applied."""
+    mdhd = _mp4_box(init.read_bytes(), (b"moov", b"trak", b"mdia", b"mdhd"))
+    tfdt = _mp4_box(segment.read_bytes(), (b"moof", b"traf", b"tfdt"))
+    assert mdhd is not None and tfdt is not None
+    scale = int.from_bytes(mdhd[20:24] if mdhd[0] == 1 else mdhd[12:16], "big")
+    time = int.from_bytes(tfdt[4:12] if tfdt[0] == 1 else tfdt[4:8], "big")
+    return time / scale
+
+
+def _first_picture(path: Path) -> float:
+    """The first picture's presentation time in `path`, as ffprobe reads it,
+    edit list and all."""
+    args = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+        "-show_entries", "packet=pts_time", "-of", "json", str(path),
+    ]  # fmt: skip
+    result = subprocess.run(args, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    return float(json.loads(result.stdout)["packets"][0]["pts_time"])
+
+
+def _check_said(cues: list[tuple[float, float, str]], joined: float = 0) -> None:
     """Every utterance said after the reader joined, at its own time on the
     program's timeline, said by the one who said it, and nothing else."""
     starts = {round(start, 2): text for start, end, text in cues if end > start}
     assert len(cues) == len(starts), cues
-    said = {start: voice for start, voice in _SAID.items() if start in starts}
-    assert said == _SAID, cues
-    for start, voice in _SAID.items():
+    expected = {start: voice for start, voice in _SAID.items() if start > joined}
+    said = {start: voice for start, voice in expected.items() if start in starts}
+    assert said == expected, cues
+    for start, voice in expected.items():
         assert starts[start] == f"<v {voice}>cue {int(start // _EVERY)} said at {start:.2f}"
 
 
@@ -351,17 +392,32 @@ def _check_said(cues: list[tuple[float, float, str]]) -> None:
 def test_a_live_programs_captions_reach_hls_as_the_cluster_reads_them(
     tmp_path: Path, programs: dict[str, Path], program_name: str
 ) -> None:
+    """The cluster's piece, joining 20 s in as a live join does, so the
+    stream's clock starts well above zero. A browser's media source plays
+    each fmp4 fragment by its own decode time and ignores the init segment's
+    edit list, so the decode times have to be the clock the cues' map
+    (MPEGTS:0) puts the cues on: hls.js 1.5.17 and Shaka 5.3.6 place every
+    cue as late as the join otherwise."""
     hls = tmp_path / "hls"
     hls.mkdir()
-    _run_piece(tmp_path, programs[program_name], _HLS, hls / "master.m3u8", "init=init.mp4")
+    _run_piece(
+        tmp_path, programs[program_name], _HLS, hls / "master.m3u8", "init=init.mp4", joins=20
+    )
     variant = next(path for path in hls.iterdir() if path.is_dir())
-    assert len(list(variant.glob("segment_*.m4s"))) >= 10
+    assert len(list(variant.glob("segment_*.m4s"))) >= 6
+    playlist = (variant / "index.m3u8").read_text(encoding="utf-8")
+    first = variant / next(line for line in playlist.splitlines() if line.endswith(".m4s"))
+    joined = tmp_path / "first.mp4"
+    joined.write_bytes((variant / "init.mp4").read_bytes() + first.read_bytes())
+    picture = _first_picture(joined)
+    assert picture > 15, picture
+    assert abs(_first_decode_time(variant / "init.mp4", first) - picture) < 0.5
     cues: list[tuple[float, float, str]] = []
     for segment in sorted(variant.glob("index*.vtt")):
         text = segment.read_text(encoding="utf-8")
         assert text.startswith("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n")
         cues += _cues(text)
-    _check_said(cues)
+    _check_said(cues, joined=picture)
 
 
 def test_a_live_programs_captions_reach_a_file_as_a_subtitle_track(
