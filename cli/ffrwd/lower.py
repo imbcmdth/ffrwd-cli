@@ -435,6 +435,8 @@ from ffrwd.processes import (
     NUT,
     RAWVIDEO,
     SETPARAMS_COLOR,
+    is_live,
+    is_live_probe,
     ref_type,
     stream_colorimetry,
 )
@@ -458,6 +460,7 @@ from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
     COLOR_OPTIONS,
     HLS_CUE_MPEGTS,
+    INTERLEAVE_OPTION,
     MANIFEST_DEFAULT_SEGMENT,
     MANIFEST_FORMATS,
     MANIFEST_MAP_OPTION,
@@ -676,6 +679,10 @@ _CUE_STREAM_FORMAT = "webm"
 # on. ffmpeg's scheduler counts them and no file should hold them; every
 # real cue lasts.
 _HEARTBEAT_DROP = "noise=drop=not(duration)"
+
+# How long, in microseconds, a live run's output fed by such a stream holds
+# the picture back for a cue: a tenth of a second, a data stream's wait.
+_CUE_INTERLEAVE_DELTA = 100_000
 
 # What a data stream's rows have to carry for an hls destination to write them
 # as cues: a cue row's three fields. `final` and `voice` are read where a row
@@ -2461,18 +2468,24 @@ def _compress_manifest_lists(
 
 
 def _drop_heartbeats(
-    options: dict[str, object], outputs: Sequence[Output], streamed: set[FrameRef]
+    options: dict[str, object], outputs: Sequence[Output], streamed: set[FrameRef], live: bool
 ) -> None:
     """An output fed by a cue stream drops the stream's heartbeats before its
-    muxer.
+    muxer, and in a live run holds the picture back for a cue only briefly.
 
     ffmpeg reads no input more than a tenth of a second ahead of an
     output's furthest-behind stream, so a cue stream with nothing to say
     would hold the picture back for as long as it stayed quiet: the
     sidecar's heartbeats keep it level with the picture, and `noise` drops
-    them once they are counted.
-    The muxer then sees a sparse stream, and emit cuts how long it waits on
-    one (:func:`ffrwd.emit._render_interleave`).
+    them once they are counted. The muxer then sees a sparse stream, which
+    it waits on up to ten seconds, ffmpeg's default, and a cue finished late
+    is late by seconds anyway, so a live run's output, read as it is
+    written, waits a tenth. Any other run's output is read once it is whole
+    and keeps the default, which also lets its muxer see every stream's
+    first packet before it chooses how far to move the file's timestamps
+    (`avoid_negative_ts`). With a tenth it can choose before the first packet
+    of sound copied from a file that starts before zero arrives, and leave
+    that sound where it was.
     """
     cues = [output for output in outputs if output.type == "subtitle"]
     if not any(output.ref in streamed for output in cues):
@@ -2480,6 +2493,8 @@ def _drop_heartbeats(
     options[SUBTITLE_BSF_OPTION] = [
         _HEARTBEAT_DROP if output.ref in streamed else None for output in cues
     ]
+    if live and any(output.type in ("video", "audio") for output in outputs):
+        options.setdefault(INTERLEAVE_OPTION, _CUE_INTERLEAVE_DELTA)
 
 
 def _subtitles_need_a_picture(subtitles: int, videos: int, anchor: exp.Expr) -> FfrwdError:
@@ -5304,7 +5319,7 @@ class _Lowerer:
         self._check_metadata_track_container(options, outputs, path, raw)
         self._check_json_container(options, outputs, path, raw)
         self._codec_for_rows_track(options, outputs, path)
-        _drop_heartbeats(options, outputs, set(self.rows_tracks))
+        _drop_heartbeats(options, outputs, set(self.rows_tracks), self._runs_live())
         self._feeder_copy(options, outputs, path)
         options.update(colorimetry)
         return SinkUnit(
@@ -6117,6 +6132,24 @@ class _Lowerer:
         alias, _, index = ref[len("src:") :].rpartition(":d:")
         meta = self._stream_meta(alias, "data", int(index)) if index.isdigit() else None
         return meta is not None and meta.codec == JSON_CODEC
+
+    def _runs_live(self) -> bool:
+        """Whether the run reads a live input or a source that never ends, so
+        what it writes is read as it is written."""
+        g = self.graph
+        for alias, index in g.sources.items():
+            if index < len(g.input_paths) and is_live(
+                g.input_paths[index], g.input_options.get(alias)
+            ):
+                return True
+        if any(is_live_probe(result) for result in self.probes.values()):
+            return True
+        if any(not source.bounded for source in g.module_sources.values()):
+            return True
+        return any(
+            g.node_shapes.get(name, {}).get("bounded") is False
+            for name in g.node_sources.values()
+        )
 
     def _holds_no_json(self, options: dict[str, object], raw: RawSink) -> bool:
         """Whether this COPY writes a file whose container holds no data stream

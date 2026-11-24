@@ -290,12 +290,21 @@ def _run_piece(
             time.sleep(0.5)
         (tmp_path / "piece.sql").write_text(piece, encoding="utf-8")
         named = [word for variable in variables for word in ("-v", variable)]
+        said = [
+            "-f", str(tmp_path / "piece.sql"),
+            "-v", f"subscribe_relay={relay_url}", "-v", f"subscribe_broadcast={_BROADCAST}",
+            "-v", f"subscribe_cert={cert}", "-v", f"master={master}", *named,
+        ]  # fmt: skip
+        # subscribe never ends, so the run is live: its muxer holds the
+        # picture back for a cue a tenth of a second at most.
+        compiled = subprocess.run(
+            _ffrwd("compile", "-q", *said), capture_output=True, text=True, env=env,
+            cwd=tmp_path, timeout=120,
+        )  # fmt: skip
+        assert compiled.returncode == 0, compiled.stderr[-3000:]
+        assert "-max_interleave_delta 100000" in compiled.stdout, compiled.stdout
         run = _spawn(
-            _ffrwd(
-                "run", "-q", "-f", str(tmp_path / "piece.sql"), "-y",
-                "-v", f"subscribe_relay={relay_url}", "-v", f"subscribe_broadcast={_BROADCAST}",
-                "-v", f"subscribe_cert={cert}", "-v", f"master={master}", *named,
-            ),
+            _ffrwd("run", "-q", "-y", *said),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env, cwd=tmp_path,
         )  # fmt: skip
         _, stderr = run.communicate(timeout=_SECONDS + 120)

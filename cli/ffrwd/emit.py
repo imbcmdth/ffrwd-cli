@@ -307,9 +307,9 @@ from .processes import (
 )
 from .sink import (
     CODEC_PARAMS_FLAGS,
+    INTERLEAVE_OPTION,
     PASSLOGFILE_FLAG,
     SINK_OPTIONS,
-    SUBTITLE_BSF_OPTION,
     SinkOptionSpec,
     copy_suppressed_scopes,
     option_spec,
@@ -1275,20 +1275,20 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
 
 def _render_interleave(group: OutputGroup) -> list[str]:
     """``-max_interleave_delta`` for a file carrying a data stream beside
-    media, or a cue stream whose heartbeats it drops.
+    media.
 
     A data stream is sparse: its next message may be seconds away, and the
     muxer holds every other stream back waiting for it, up to ten seconds by
     default. A message announcing what the picture is about to do has to
     arrive ahead of that picture, so the wait is cut to a tenth of a second.
-    A cue stream is as sparse once its heartbeats are dropped, and a cue
-    whose row is finished late is late by seconds, more than a live picture
-    can wait, so it takes the same tenth. A file with neither, or nothing
-    else beside it, waits on nothing.
+    A file with no data stream, or nothing else beside it, waits on nothing,
+    and one whose wait the compiler set already (a live run's cue stream,
+    :func:`ffrwd.lower._drop_heartbeats`) takes that one.
     """
     kinds = {mapping.type for mapping in group.maps}
-    sparse = "data" in kinds or SUBTITLE_BSF_OPTION in group.options
-    if not sparse or not kinds & {"video", "audio"}:
+    if "data" not in kinds or not kinds & {"video", "audio"}:
+        return []
+    if INTERLEAVE_OPTION in group.options:
         return []
     return [MAX_INTERLEAVE_DELTA_FLAG, str(_DATA_INTERLEAVE_DELTA)]
 

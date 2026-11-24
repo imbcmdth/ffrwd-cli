@@ -722,9 +722,11 @@ dest    := 'path' | STDOUT | ( value-expression ) | sink(value, ...)
     rows' own time where those run behind the picture: a text track
     `ffrwd.moq.subscribe` reads runs three seconds behind its picture,
     as the publisher holds it. The output drops the heartbeats before
-    its muxer (`-bsf:<n> noise=drop=not(duration)`), and the muxer waits
-    at most a tenth of a second for a cue before it writes the picture
-    and sound beside it (`-max_interleave_delta 100000`).
+    its muxer (`-bsf:<n> noise=drop=not(duration)`). In a live run, whose
+    output is read as it is written, the muxer waits at most a tenth of
+    a second for a cue before it writes the picture and sound beside it
+    (`-max_interleave_delta 100000`); any other run's file is read once
+    it is whole and keeps ffmpeg's own wait.
   - A node at a COPY's `TO` takes the SELECT's columns by kind: a
     picture on its video input, a sound on its audio input, and each
     data column on one of its rows inputs. With one rows input, or none

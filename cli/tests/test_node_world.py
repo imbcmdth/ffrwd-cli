@@ -702,8 +702,8 @@ def test_a_nodes_rows_cross_as_a_stream_whose_heartbeats_the_output_drops(
     heartbeat lasting no time as the sidecar's time moves on between them.
     ffmpeg reads no input more than a tenth of a second ahead of an
     output's furthest-behind stream, so the heartbeats keep the picture
-    moving; the output drops them before its muxer, which holds the picture
-    back for a cue a tenth of a second at most."""
+    moving, and the output drops them before its muxer. A file run's muxer
+    keeps ffmpeg's own wait for a cue: its file is read once it is whole."""
     argv = _plan_argv(
         "COPY (SELECT f.video[1], f.audio[1], hear(f.audio[1]) "
         f"FROM input('f.mp4') f) TO {destination}",
@@ -715,7 +715,7 @@ def test_a_nodes_rows_cross_as_a_stream_whose_heartbeats_the_output_drops(
         args for args in argv.values() if args[0] == "ffmpeg" and "webm" in _formats(args)
     ]
     assert muxer[muxer.index("-bsf:2") + 1] == "noise=drop=not(duration)"
-    assert muxer[muxer.index("-max_interleave_delta") + 1] == "100000"
+    assert "-max_interleave_delta" not in muxer
 
 
 def test_a_sources_cue_rows_are_an_hls_subtitle_rendition(
@@ -751,7 +751,9 @@ def test_a_sources_cue_rows_are_a_subtitle_track_of_a_file(
 ) -> None:
     """The egress's shape written to a file: a source's text track is a
     subtitle track of any container but NUT, its rows written as WebVTT in
-    WebM beside the picture's NUT, its heartbeats dropped before the muxer."""
+    WebM beside the picture's NUT, its heartbeats dropped before the muxer.
+    The source never ends, so the run is live and its muxer holds the
+    picture back for a cue a tenth of a second at most."""
     argv = _plan_argv(
         f"COPY (SELECT s.video[1], s.data[1] FROM program() s) TO '{path}'", monkeypatch
     )
@@ -760,6 +762,7 @@ def test_a_sources_cue_rows_are_a_subtitle_track_of_a_file(
     assert _formats(muxer) == ["webm", "nut"]
     assert muxer[muxer.index("0:s:0") + 1 : muxer.index("0:s:0") + 3] == ["-c:1", codec]
     assert muxer[muxer.index("-bsf:1") + 1] == "noise=drop=not(duration)"
+    assert muxer[muxer.index("-max_interleave_delta") + 1] == "100000"
 
 
 def test_a_sources_cue_rows_stay_a_data_stream_of_a_nut(

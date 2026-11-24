@@ -481,6 +481,10 @@ MANIFEST_MAP_OPTION: dict[str, str] = {"hls": "var_stream_map", "dash": "adaptat
 # before its muxer: what drops a cue stream's heartbeats.
 SUBTITLE_BSF_OPTION = "subtitle_bsf"
 
+# The internal option bounding how long a muxer holds packets back to
+# interleave them, in microseconds: a live run's output fed by a cue stream.
+INTERLEAVE_OPTION = "max_interleave_delta"
+
 # Where an hls destination's segments put a cue time of zero, in MPEG-TS
 # ticks (90 kHz), per segment type: what the X-TIMESTAMP-MAP of each WebVTT
 # segment says. The mpegts muxer starts every timestamp twice ffmpeg's
@@ -609,6 +613,14 @@ _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         doc="The bitstream filters a subtitle stream passes before the muxer.",
         flag="-bsf",
         per_stream=True,
+    ),
+    INTERLEAVE_OPTION: SinkOptionSpec(
+        name=INTERLEAVE_OPTION,
+        scope="container",
+        type="int",
+        doc="How long the muxer holds packets back to interleave them, in microseconds.",
+        flag="-max_interleave_delta",
+        per_stream=False,
     ),
     # An hls destination with a subtitle rendition is written over HTTP to
     # the relay, which writes its files: the muxer PUTs each one.

@@ -1665,7 +1665,7 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:a:0 -ar:0 16000 -ac:0 1 -c:0 pcm_f32le -f
   '{"language": "es", "language_to": "en"}' -f webm pipe:1 | ffmpeg -i \
   tests/fixtures/av.mp4 -f webm -i pipe:0 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map \
   1:s:0 -metadata:s:2 language=eng -c:2 mov_text -bsf:2 'noise=drop=not(duration)' \
-  -max_interleave_delta 100000 subbed.mp4
+  subbed.mp4
 ```
 
 The module asked for 16kHz mono, so the feeding ffmpeg conforms the stream before the pcm edge - nothing in the query says so. The sidecar writes the cues as WebVTT in WebM on its own output, and the far ffmpeg encodes them per container: `mov_text` here because the destination is mp4, copied through untouched for mkv. `-metadata:s:2 language=eng` is the computed tag - `language_to` first, `language` when no conversion is asked for. Swap the destination for `'words.ndjson'` and drop the streams to get the rows themselves instead of a track.
@@ -2439,8 +2439,7 @@ $ ffrwd compile -f query.sql
   '<named pipe sidecar0-ffmpeg0 ffrwd.cues#2 read>' -f webm -i \
   '<named pipe sidecar0-ffmpeg0 ffrwd.cues#3 read>' -map 0:v:0 -c:0 copy -map 1:s:0 -c:1 \
   copy -metadata:s:1 title=speech -map 2:s:0 -c:2 copy -metadata:s:2 title=translated \
-  -bsf:1 'noise=drop=not(duration)' -bsf:2 'noise=drop=not(duration)' \
-  -max_interleave_delta 100000 spoken.mkv
+  -bsf:1 'noise=drop=not(duration)' -bsf:2 'noise=drop=not(duration)' spoken.mkv
 2. ffmpeg: ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f \
   nut pipe:1
 3. sidecar: ffrwd-wasm -f nut -i pipe:0 -m \
@@ -2739,8 +2738,7 @@ ffmpeg -i tests/fixtures/av.mp4 -map 0:v:0 -c:0 rawvideo -pix_fmt:0 rgba -f nut 
   captions=../sidecar/modules/target/wasm32-wasip2/release/captions.wasm -filter_complex \
   '[0:v]captions[n1];[n1]rowmerge=max_distance=0[out0]' -map '[out0]' -f webm pipe:1 | \
   ffmpeg -i tests/fixtures/av.mp4 -f webm -i pipe:0 -map 0:v:0 -c:0 copy -map 1:s:0 -c:1 \
-  copy -metadata:s:1 title=speech -bsf:1 'noise=drop=not(duration)' \
-  -max_interleave_delta 100000 merged.mkv
+  copy -metadata:s:1 title=speech -bsf:1 'noise=drop=not(duration)' merged.mkv
 ```
 
 `rowmerge` is a node the host provides, like the `rowfilter` a run-time

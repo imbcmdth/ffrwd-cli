@@ -3012,7 +3012,7 @@ def test_the_recipe_renders_every_argv() -> None:
             "-map", "0:v:0", "-c:0", "copy",
             "-map", "0:a:0", "-c:1", "copy",
             "-map", "1:s:0", "-metadata:s:2", "language=eng", "-c:2", "mov_text",
-            "-bsf:2", "noise=drop=not(duration)", "-max_interleave_delta", "100000",
+            "-bsf:2", "noise=drop=not(duration)",
             "subbed.mp4",
         ],
         "ffmpeg1": [
@@ -7295,7 +7295,7 @@ def test_the_rows_module_recipe_renders_every_argv() -> None:
             "-map", "0:v:0", "-c:0", "copy",
             "-map", "0:a:0", "-c:1", "copy",
             "-map", "1:s:0", "-c:2", "copy",
-            "-bsf:2", "noise=drop=not(duration)", "-max_interleave_delta", "100000",
+            "-bsf:2", "noise=drop=not(duration)",
             "out.mkv",
         ],
         "ffmpeg1": [
