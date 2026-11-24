@@ -684,6 +684,31 @@ def test_a_url_input_between_two_files_leaves_a_gap_in_the_indexes(
     assert _uploaded(served) == {"0": b"first bytes", "2": b"second bytes"}
 
 
+def test_a_lavfi_graph_is_neither_declared_nor_uploaded(
+    served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lavfi graph is made where the query runs: the submit declares only
+    the file beside it, which keeps index 0, and the graph stays in the
+    query as written."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "in.mp4").write_bytes(b"media bytes")
+    _submit_accepted(served, 0)
+    clock = "color=c=black:size=1280x720:rate=30"
+    text = (
+        f"COPY (SELECT a.video[1], c.video[1] FROM input('in.mp4') a, "
+        f"input('{clock}', format => 'lavfi') c) TO 'out.mp4'"
+    )
+
+    remote.submit_run(_query(text), None, _run_args())
+
+    _headers, body = served.sent_to(JOBS_URL)
+    assert body is not None
+    payload = json.loads(body)
+    assert payload["inputs"] == [{"path": "in.mp4", "kind": "file", "bytes": 11}]
+    assert f"input('{clock}', format => 'lavfi')" in payload["query"]
+    assert _uploaded(served) == {"0": b"media bytes"}
+
+
 def test_a_packed_package_is_put_to_the_entry_its_digest_keys(
     served: _Served, logged_in: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

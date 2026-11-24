@@ -566,13 +566,20 @@ def _inputs(text: str) -> tuple[list[dict[str, object]], list[tuple[int, str]]]:
     one path are one declaration and one upload. `index` is a file entry's
     position in the payload's inputs, which is what the answer signs its URL
     against. Any "://" spec passes through untouched: a live rtmp/udp/srt
-    input is the runner's to open, never existence-checked here.
+    input is the runner's to open, never existence-checked here. A lavfi
+    graph is made where the query runs, so it is neither declared nor
+    uploaded, and the runner reads it from the query as written.
     """
+    generated = {
+        str(options[""])
+        for options in input_options(text)
+        if "" in options and str(options.get("format", "")).lower() == "lavfi"
+    }
     entries: list[dict[str, object]] = []
     uploads: list[tuple[int, str]] = []
     seen: set[str] = set()
     for spec in input_specs(text):
-        if spec.path in seen:
+        if spec.path in seen or spec.path in generated:
             continue
         seen.add(spec.path)
         if is_url(spec.path):
