@@ -6957,6 +6957,7 @@ class _Lowerer:
         )
         if options.get("hls_segment_type") == "fmp4":
             options.setdefault("hls_fmp4_init_filename", "init.mp4")
+            options["hls_segment_options"] = HLS_FMP4_CLOCK
         if self.manifest_subtitles:
             self._derive_subtitles(options, path, raw)
         return f"{prefix}%v/index.m3u8"
@@ -6997,8 +6998,6 @@ class _Lowerer:
         )
         segments = "fmp4" if options.get("hls_segment_type") == "fmp4" else "mpegts"
         self.cue_mpegts = HLS_CUE_MPEGTS[segments]
-        if segments == "fmp4":
-            options["hls_segment_options"] = HLS_FMP4_CLOCK
 
     def _derive_segment(
         self, options: dict[str, object], path: str | None, raw: RawSink

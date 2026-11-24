@@ -493,12 +493,13 @@ INTERLEAVE_OPTION = "max_interleave_delta"
 # decode time is written on it (HLS_FMP4_CLOCK).
 HLS_CUE_MPEGTS: dict[str, int] = {"mpegts": 126_000, "fmp4": 0}
 
-# What an hls destination's fmp4 segments are written with when cues ride
-# beside them: each fragment's decode time on the stream's own clock. By
-# default the mp4 muxer starts every track's decode times at zero and puts
-# the clock's start in the init segment's edit list, which a browser's
-# media source ignores, so a stream that starts well above zero, as a live
-# join does, plays from zero while its cues keep the clock.
+# What an hls destination's fmp4 segments are written with: each
+# fragment's decode time on the stream's own clock. By default the mp4
+# muxer starts every track's decode times at zero and puts where each
+# track's clock starts in the init segment's edit list, which a browser's
+# media source ignores. A stream that starts well above zero, as a live
+# join does, would play from zero while its cues keep the clock, and a
+# sound that starts later than its picture would play that much early.
 HLS_FMP4_CLOCK = "movflags=+frag_discont"
 
 # Options that were sink options and are SELECT columns now, with the spelling

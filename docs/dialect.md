@@ -2230,8 +2230,14 @@ Under a manifest format the compiler owns what the format needs:
   playlists and segments are laid out under `%v` directories beside
   it, the init segment named - every path consistent, each overridable
   through `master_pl_name` / `hls_segment_filename` /
-  `hls_fmp4_init_filename`, none required. dash's muxer already writes
-  everything beside the `.mpd`.
+  `hls_fmp4_init_filename`, none required. fmp4 segments write each
+  fragment's decode time on the stream's own clock
+  (`-hls_segment_options movflags=+frag_discont`), rather than from zero
+  with where each track starts in an edit list, which a browser's media
+  source ignores: a stream that starts well above zero, as a live join
+  does, plays on its own times, and its sound on its picture even where
+  the two tracks start apart. dash's muxer already writes everything
+  beside the `.mpd`.
 - **The variant map.** `var_stream_map` / `adaptation_sets` is a
   transcription of the rows - `v:N`/`a:N` in output order, an `agroup`
   binding the demuxed shape, names from the streams (height for video,
@@ -2259,12 +2265,10 @@ Under a manifest format the compiler owns what the format needs:
 Each WebVTT segment opens with an `X-TIMESTAMP-MAP` that puts its cue
 times on the media's timestamps: `MPEGTS:126000,LOCAL:00:00:00.000`
 under MPEG-TS segments, whose timestamps start 1.4 s after the cues'
-(twice ffmpeg's `-muxdelay`), and `MPEGTS:0` under fmp4 segments, which
-keep the cues' clock: each fragment's decode time is written on that clock
-(`-hls_segment_options movflags=+frag_discont`), rather than from zero with
-the clock's start in an edit list that a browser's media source ignores. A
-player places each cue on the picture it was written against, however far
-above zero the stream's clock starts, as it does for a live join. ffmpeg's hls muxer writes no map, so such a destination
+(twice ffmpeg's `-muxdelay`), and `MPEGTS:0` under fmp4 segments, whose
+decode times are the cues' clock (see Layout). A player places each cue on
+the picture it was written against, however far above zero the stream's
+clock starts. ffmpeg's hls muxer writes no map, so such a destination
 is written through the relay: the muxer sends each file over HTTP
 (`-method PUT`, its paths spelled `ffrwd:hls:<mpegts>/<path>`, which a run
 resolves to the relay's loopback address), and the relay writes it in

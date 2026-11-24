@@ -319,12 +319,17 @@ def test_the_hls_layout_is_derived_beside_the_master() -> None:
     assert unit.options["master_pl_name"] == "master.m3u8"
     assert unit.options["hls_segment_filename"] == "out/%v/segment_%d.m4s"
     assert unit.options["hls_fmp4_init_filename"] == "init.mp4"
+    # Each fragment's decode time on the stream's own clock: by default it
+    # starts at zero, with where each track starts in an edit list that a
+    # browser's media source ignores.
+    assert unit.options["hls_segment_options"] == "movflags=+frag_discont"
 
 
 def test_mpegts_segments_take_the_ts_extension_and_no_init() -> None:
     unit = _unit(_demuxed(_HLS))
     assert unit.options["hls_segment_filename"] == "out/%v/segment_%d.ts"
     assert "hls_fmp4_init_filename" not in unit.options
+    assert "hls_segment_options" not in unit.options
 
 
 def test_a_written_layout_option_pre_empts_the_derivation() -> None:
@@ -452,10 +457,6 @@ def test_fmp4_segments_keep_the_cues_clock(monkeypatch: pytest.MonkeyPatch) -> N
     )
     assert unit.cue_mpegts == 0
     assert unit.options["subtitle_codec"] == ["copy"]
-    # Each fragment's decode time on the clock the cues keep: by default it
-    # starts at zero, with the clock's start in an edit list a browser's
-    # media source ignores.
-    assert unit.options["hls_segment_options"] == "movflags=+frag_discont"
 
 
 def test_two_languages_ride_two_rungs_named_by_title_or_language(

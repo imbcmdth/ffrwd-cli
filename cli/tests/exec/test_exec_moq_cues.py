@@ -92,6 +92,16 @@ COPY (SELECT s.video, s.audio, s.data[1] AS captions
 ) TO :'master'
 """
 
+# The cluster's piece with no captions: the picture and the sound alone.
+_PLAIN_HLS = """
+COPY (SELECT s.video, s.audio
+  FROM ffrwd.moq.subscribe(:'subscribe_relay', :'subscribe_broadcast', :'subscribe_cert',
+                           reconnect_s => 0) s
+) TO :'master' WITH (format 'hls', hls_time 4, hls_segment_type 'fmp4', hls_list_size 150,
+  hls_start_number_source 'epoch', hls_fmp4_init_filename :'init',
+  hls_flags 'delete_segments+program_date_time+independent_segments+temp_file')
+"""
+
 
 def _relay_binary() -> str | None:
     named = os.environ.get("MOQ_RELAY")
@@ -304,7 +314,8 @@ def _run_piece(
             cwd=tmp_path, timeout=120,
         )  # fmt: skip
         assert compiled.returncode == 0, compiled.stderr[-3000:]
-        assert "-max_interleave_delta 100000" in compiled.stdout, compiled.stdout
+        if "captions" in piece:
+            assert "-max_interleave_delta 100000" in compiled.stdout, compiled.stdout
         run = _spawn(
             _ffrwd("run", "-q", "-y", *said),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env, cwd=tmp_path,
@@ -432,3 +443,99 @@ def test_a_live_programs_captions_reach_a_file_as_a_subtitle_track(
     )  # fmt: skip
     assert extracted.returncode == 0, extracted.stderr
     _check_said(_cues(extracted.stdout))
+
+
+def _children(data: bytes) -> list[tuple[bytes, bytes]]:
+    """Each box at the top of `data`: its kind and its body."""
+    found = []
+    at = 0
+    while at + 8 <= len(data):
+        size = int.from_bytes(data[at : at + 4], "big")
+        if size < 8:
+            break
+        found.append((data[at + 4 : at + 8], data[at + 8 : at + size]))
+        at += size
+    return found
+
+
+def _track_clocks(init: Path) -> list[tuple[int, list[int]]]:
+    """Each track of an fMP4 init segment: its timescale and the media time
+    of each entry of its edit list, -1 for an empty edit."""
+    moov = next(body for kind, body in _children(init.read_bytes()) if kind == b"moov")
+    tracks = []
+    for kind, trak in _children(moov):
+        if kind != b"trak":
+            continue
+        mdia = next(body for kind, body in _children(trak) if kind == b"mdia")
+        mdhd = next(body for kind, body in _children(mdia) if kind == b"mdhd")
+        scale = int.from_bytes(mdhd[20:24] if mdhd[0] == 1 else mdhd[12:16], "big")
+        media: list[int] = []
+        for kind, edts in _children(trak):
+            if kind != b"edts":
+                continue
+            for kind, elst in _children(edts):
+                count = int.from_bytes(elst[4:8], "big")
+                wide = elst[0] == 1
+                step = 20 if wide else 12
+                for n in range(count):
+                    entry = elst[8 + n * step :]
+                    value = entry[8:16] if wide else entry[4:8]
+                    media.append(int.from_bytes(value, "big", signed=True))
+        tracks.append((scale, media))
+    return tracks
+
+
+def _decode_times(segment: Path) -> list[int]:
+    """Each track fragment's decode time in an fMP4 segment, in track order."""
+    moof = next(body for kind, body in _children(segment.read_bytes()) if kind == b"moof")
+    times = []
+    for kind, traf in _children(moof):
+        if kind != b"traf":
+            continue
+        tfdt = next(body for kind, body in _children(traf) if kind == b"tfdt")
+        times.append(int.from_bytes(tfdt[4:12] if tfdt[0] == 1 else tfdt[4:8], "big"))
+    return times
+
+
+def _first_decode(path: Path, spec: str) -> float:
+    """The first packet's decode time of stream `spec` in `path`, as ffprobe
+    reads it, edit list and all."""
+    args = [
+        "ffprobe", "-v", "error", "-select_streams", spec, "-read_intervals", "%+#1",
+        "-show_entries", "packet=dts_time", "-of", "json", str(path),
+    ]  # fmt: skip
+    result = subprocess.run(args, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    return float(json.loads(result.stdout)["packets"][0]["dts_time"])
+
+
+def test_a_live_programs_picture_and_sound_keep_its_clock_in_fmp4_hls(
+    tmp_path: Path, programs: dict[str, Path]
+) -> None:
+    """The cluster's piece with no captions, joined 20 s in. subscribe's
+    picture and sound start a moment apart at a join, and a browser's media
+    source places each track by its fragments' decode times, ignoring the
+    init segment's edit list: with each track's decode times from zero and
+    its start in an empty edit, the sound plays as much early as it started
+    late. Each track's decode times are the program's clock instead, with
+    no empty edit."""
+    hls = tmp_path / "hls"
+    hls.mkdir()
+    _run_piece(
+        tmp_path, programs["1080p"], _PLAIN_HLS, hls / "master.m3u8", "init=init.mp4", joins=20
+    )
+    variant = next(path for path in hls.iterdir() if path.is_dir())
+    init = variant / "init.mp4"
+    playlist = (variant / "index.m3u8").read_text(encoding="utf-8")
+    first = variant / next(line for line in playlist.splitlines() if line.endswith(".m4s"))
+    joined = tmp_path / "first.mp4"
+    joined.write_bytes(init.read_bytes() + first.read_bytes())
+    clocks = _track_clocks(init)
+    assert len(clocks) == 2
+    assert all(-1 not in media for _, media in clocks), clocks
+    times = _decode_times(first)
+    for (scale, media), ticks, spec in zip(clocks, times, ("v:0", "a:0")):
+        shift = media[0] / scale if media else 0.0
+        decoded = _first_decode(joined, spec)
+        assert decoded > 15, (spec, decoded)
+        assert abs(ticks / scale - shift - decoded) < 0.01, (spec, ticks / scale, decoded)

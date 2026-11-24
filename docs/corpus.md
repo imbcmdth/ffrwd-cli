@@ -2160,7 +2160,7 @@ ffmpeg -i tests/fixtures/ladder/master.m3u8 -map 0:v:0 -map 0:v:1 -map 0:a:0 -ma
   -sc_threshold:0 0 -sc_threshold:1 0 -var_stream_map \
   'v:0,a:0,name:1080p v:1,a:1,name:720p' -master_pl_name master.m3u8 \
   -hls_segment_filename out/%v/segment_%d.m4s -hls_fmp4_init_filename init.mp4 \
-  out/%v/index.m3u8
+  -hls_segment_options movflags=+frag_discont out/%v/index.m3u8
 ```
 
 Reach for this to repackage or re-encode someone else's ladder into
