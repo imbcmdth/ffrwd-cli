@@ -489,8 +489,17 @@ INTERLEAVE_OPTION = "max_interleave_delta"
 # ticks (90 kHz), per segment type: what the X-TIMESTAMP-MAP of each WebVTT
 # segment says. The mpegts muxer starts every timestamp twice ffmpeg's
 # -muxdelay late, 0.7 s by default, and the WebVTT muxer beside it does not;
-# an fmp4 segment keeps the clock the cues are on.
+# an fmp4 segment keeps the clock the cues are on, once each fragment's
+# decode time is written on it (HLS_FMP4_CLOCK).
 HLS_CUE_MPEGTS: dict[str, int] = {"mpegts": 126_000, "fmp4": 0}
+
+# What an hls destination's fmp4 segments are written with when cues ride
+# beside them: each fragment's decode time on the stream's own clock. By
+# default the mp4 muxer starts every track's decode times at zero and puts
+# the clock's start in the init segment's edit list, which a browser's
+# media source ignores, so a stream that starts well above zero, as a live
+# join does, plays from zero while its cues keep the clock.
+HLS_FMP4_CLOCK = "movflags=+frag_discont"
 
 # Options that were sink options and are SELECT columns now, with the spelling
 # that replaced each. Named separately so the rejection can say where to go.
@@ -645,6 +654,16 @@ _INTERNAL_SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         per_stream=False,
         value_template="1",
         false_template="0",
+    ),
+    # The options each segment's own muxer takes: an hls destination's fmp4
+    # segments written on the stream's clock.
+    "hls_segment_options": SinkOptionSpec(
+        name="hls_segment_options",
+        scope="container",
+        type="str",
+        doc="The options of each segment's own muxer, as key=value:key=value.",
+        flag="-hls_segment_options",
+        per_stream=False,
     ),
     "segment_format_options": SinkOptionSpec(
         name="segment_format_options",

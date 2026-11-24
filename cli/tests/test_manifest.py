@@ -421,6 +421,8 @@ def test_a_subtitle_column_is_a_rendition_the_variants_name(
     segments = argv[argv.index("-hls_segment_filename") + 1]
     assert segments == "ffrwd:hls:126000/out/%v/segment_%d.ts"
     assert argv[argv.index("-c:2") + 1] == "webvtt"
+    # MPEG-TS segments carry the clock in their own timestamps.
+    assert "-hls_segment_options" not in argv
     # A file's subtitle track is read whole and beats no heartbeats.
     assert "-bsf:2" not in argv and "-max_interleave_delta" not in argv
 
@@ -450,6 +452,10 @@ def test_fmp4_segments_keep_the_cues_clock(monkeypatch: pytest.MonkeyPatch) -> N
     )
     assert unit.cue_mpegts == 0
     assert unit.options["subtitle_codec"] == ["copy"]
+    # Each fragment's decode time on the clock the cues keep: by default it
+    # starts at zero, with the clock's start in an edit list a browser's
+    # media source ignores.
+    assert unit.options["hls_segment_options"] == "movflags=+frag_discont"
 
 
 def test_two_languages_ride_two_rungs_named_by_title_or_language(

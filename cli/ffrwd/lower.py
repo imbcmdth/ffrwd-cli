@@ -460,6 +460,7 @@ from ffrwd.sink import (
     CODEC_PARAMS_FLAGS,
     COLOR_OPTIONS,
     HLS_CUE_MPEGTS,
+    HLS_FMP4_CLOCK,
     INTERLEAVE_OPTION,
     MANIFEST_DEFAULT_SEGMENT,
     MANIFEST_FORMATS,
@@ -6996,6 +6997,8 @@ class _Lowerer:
         )
         segments = "fmp4" if options.get("hls_segment_type") == "fmp4" else "mpegts"
         self.cue_mpegts = HLS_CUE_MPEGTS[segments]
+        if segments == "fmp4":
+            options["hls_segment_options"] = HLS_FMP4_CLOCK
 
     def _derive_segment(
         self, options: dict[str, object], path: str | None, raw: RawSink

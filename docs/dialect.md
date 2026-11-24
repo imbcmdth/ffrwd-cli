@@ -2260,8 +2260,11 @@ Each WebVTT segment opens with an `X-TIMESTAMP-MAP` that puts its cue
 times on the media's timestamps: `MPEGTS:126000,LOCAL:00:00:00.000`
 under MPEG-TS segments, whose timestamps start 1.4 s after the cues'
 (twice ffmpeg's `-muxdelay`), and `MPEGTS:0` under fmp4 segments, which
-keep the cues' clock. A player places each cue on the picture it was
-written against. ffmpeg's hls muxer writes no map, so such a destination
+keep the cues' clock: each fragment's decode time is written on that clock
+(`-hls_segment_options movflags=+frag_discont`), rather than from zero with
+the clock's start in an edit list that a browser's media source ignores. A
+player places each cue on the picture it was written against, however far
+above zero the stream's clock starts, as it does for a live join. ffmpeg's hls muxer writes no map, so such a destination
 is written through the relay: the muxer sends each file over HTTP
 (`-method PUT`, its paths spelled `ffrwd:hls:<mpegts>/<path>`, which a run
 resolves to the relay's loopback address), and the relay writes it in
